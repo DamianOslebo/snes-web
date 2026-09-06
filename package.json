@@ -1,0 +1,22 @@
+{
+  "name": "snes-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Client-side SNES emulator with a 65C816 debugger, memory introspection, and save states.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "core:build": "bash core/build.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10",
+    "vitest": "^2.1.4"
+  }
+}
