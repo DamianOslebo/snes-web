@@ -1,4 +1,5 @@
 import { createCore } from './core/snes-core';
+import { looksLikeSnesRom } from './core/rom-check';
 import { SYSTEM_UNSUPPORTED, unsupportedCoprocessors } from './core/types';
 import { DEFAULT_ROM } from './config';
 import { CanvasRenderer } from './runtime/renderer';
@@ -96,6 +97,12 @@ async function boot(): Promise<void> {
   // coprocessor mask, then draw + resume audio + run.
   const loadRomBytes = async (name: string, rom: Uint8Array): Promise<void> => {
     setStatus(`loading ${name}…`);
+    if (!looksLikeSnesRom(rom)) {
+      throw new Error(
+        `"${name}" (${rom.length} bytes) does not look like a SNES ROM ` +
+        `(no $0080 vector at $7FC0/$7FFC)`,
+      );
+    }
     await core.loadRom(rom);
     // This build can't run carts with these coprocessors (v1 scope): report
     // it instead of silently running the wrong thing.
@@ -114,7 +121,14 @@ async function boot(): Promise<void> {
   ui.romInput.addEventListener('change', async () => {
     const file = ui.romInput.files?.[0];
     if (!file) return;
-    await loadRomBytes(file.name, new Uint8Array(await file.arrayBuffer()));
+    try {
+      await loadRomBytes(file.name, new Uint8Array(await file.arrayBuffer()));
+    } catch (err) {
+      // Surface load failures in the status bar instead of an unhandled
+      // rejection with the status stuck at "loading …".
+      setRunning(false);
+      setStatus(`⚠️ ${file.name}: ${(err as Error).message}`);
+    }
   });
 
   // --- focus mode + fullscreen -------------------------------------------
@@ -169,7 +183,23 @@ async function boot(): Promise<void> {
     try {
       const res = await fetch(DEFAULT_ROM.url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      await loadRomBytes(DEFAULT_ROM.name, new Uint8Array(await res.arrayBuffer()));
+      // A dev-server SPA fallback for a missing asset returns 200 + HTML,
+      // which sails past `res.ok` and would otherwise reach the core as an
+      // opaque "failed to load ROM".
+      if (/text\/html/i.test(res.headers.get('content-type') ?? '')) {
+        throw new Error(
+          `server returned an HTML page for ${DEFAULT_ROM.url} — ` +
+          `the ROM file is probably missing from this checkout`,
+        );
+      }
+      const rom = new Uint8Array(await res.arrayBuffer());
+      if (!looksLikeSnesRom(rom)) {
+        throw new Error(
+          `${DEFAULT_ROM.name} (${rom.length} bytes) does not look like a SNES ROM ` +
+          `— check the file in this checkout (size, sha256sum)`,
+        );
+      }
+      await loadRomBytes(DEFAULT_ROM.name, rom);
     } catch (err) {
       setRunning(false);
       setStatus(`⚠️ default ROM failed to load: ${(err as Error).message}`);
