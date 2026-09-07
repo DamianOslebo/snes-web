@@ -18,8 +18,18 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
+  // A Cloudflare tunnel forwards the public Host header (e.g.
+  // snes.summers-home-lab.net), which Vite 5.4's default check —
+  // localhost and IP addresses only — would reject with "Blocked request".
+  // The leading-dot entry is Vite's wildcard form: the domain plus any
+  // subdomain of it. (Use `allowedHosts: true` to allow any host, e.g. a
+  // *.trycloudflare.com quick tunnel.)
   server: {
     port: 5173,
+    allowedHosts: ['.summers-home-lab.net'],
+  },
+  preview: {
+    allowedHosts: ['.summers-home-lab.net'],
   },
   build: {
     outDir: 'dist',
