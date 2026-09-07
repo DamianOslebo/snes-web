@@ -87,10 +87,39 @@ function loadFactory(): Promise<Factory> {
   });
 }
 
+/** Compact first/last-byte fingerprint for comparing the ROM in transit to the file on disk. */
+function romFingerprint(rom: Uint8Array): string {
+  const hex = (off: number, n: number): string =>
+    Array.from(rom.subarray(off, off + n))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join(' ');
+  return `${rom.length} B, first [${hex(0, 8)}], last [${hex(Math.max(0, rom.length - 8), 8)}]`;
+}
+
 export async function createWasmCore(): Promise<SnesCore> {
   const factory = await loadFactory();
-  const M = await factory({ locateFile: (f: string) => `/core/build/${f}` });
-  return new WasmCore(M);
+  // Capture the core's C-side printf (S9xMessage → "Unable to load ROM", the
+  // ROM scoring banner, "ROM is corrupt or invalid", …) so a load failure can
+  // quote the real reason instead of an opaque guess. Still mirror to the
+  // console so the DevTools story is unchanged.
+  const coreLog: string[] = [];
+  const sink = (msg: string): void => {
+    coreLog.push(msg);
+    if (coreLog.length > 200) coreLog.shift();
+    console.log(msg);
+  };
+  // NOTE the hook names: this emscripten build resolves stdout as
+  // `if (Module["print"]) out = Module["print"]` — passing `out`/`err` (the
+  // old names) is silently ignored and C-side messages vanish. Hook both
+  // spellings so a capture works across emscripten versions.
+  const M = await factory({
+    locateFile: (f: string) => `/core/build/${f}`,
+    print: sink,
+    printErr: sink,
+    out: sink,
+    err: sink,
+  });
+  return new WasmCore(M, coreLog);
 }
 
 export class WasmCore implements SnesCore {
@@ -98,12 +127,14 @@ export class WasmCore implements SnesCore {
   readonly isMock = false;
 
   private readonly M: S9xModule;
+  private coreLog: string[];
   private scratchPtr = 0;
   private scratchSize = 0;
   onBreakpoint?: (hit: BreakpointHit) => void;
 
-  constructor(M: S9xModule) {
+  constructor(M: S9xModule, coreLog: string[] = []) {
     this.M = M;
+    this.coreLog = coreLog;
     // Wire the shim's C-side breakpoint callback into this instance.
     (M as unknown as Record<string, unknown>)._s9xBreakpoint = (bank: number, addr: number) => {
       this.onBreakpoint?.({ bank: bank & 0xff, addr: addr & 0xffff, registers: this.readRegisters() });
@@ -117,9 +148,30 @@ export class WasmCore implements SnesCore {
   async loadRom(rom: Uint8Array): Promise<void> {
     const M = this.M;
     const ptr = M._malloc(rom.length);
+    const logStart = this.coreLog.length;
     try {
       M.HEAPU8.set(rom, ptr);
-      if (M._core_load_rom(ptr, rom.length) !== 0) throw new Error('core failed to load ROM');
+      // core/shim/s9x_shim.c `core_load_rom` returns 1 on success, 0 on
+      // failure — so a *successful* load returns 1 and only a *failure*
+      // returns 0. (The original check was `!== 0`, which threw on the
+      // success value and masked every working load as "core failed".)
+      if (M._core_load_rom(ptr, rom.length) === 0) {
+        // The shim's S9xMessage → printf already explains the rejection
+        // ("Unable to load ROM", "ROM is corrupt or invalid", the scoring
+        // banner). Quote only the lines THIS attempt printed, plus a
+        // first/last-byte fingerprint so we can tell "different/corrupted
+        // file" apart from "core genuinely rejected these bytes".
+        const coreMsg = this.coreLog
+          .slice(logStart)
+          .map((l) => l.trim())
+          .filter(Boolean)
+          .join(' | ');
+        throw new Error(
+          `core failed to load ROM (${rom.length} bytes)` +
+            (coreMsg ? ` — core: ${coreMsg}` : '') +
+            ` [${romFingerprint(rom)}]`,
+        );
+      }
     } finally {
       M._free(ptr);
     }

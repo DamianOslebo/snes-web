@@ -175,12 +175,25 @@ static int initOnce(void) {
     Settings.NormalControls = TRUE;
     CPU.Flags = 0;
 
-    if (!Init() || !S9xInitAPU()) return 0;
+    /* Every failure path prints: core_load_rom returns 0 to the app either
+       way, and the app quotes these lines on the next load failure, so the
+       status bar says *which* step failed instead of "core failed". */
+    if (!Init()) {
+        S9xMessage(S9X_MSG_ERROR, S9X_CATEGORY_EXTERNAL, "core init failed: Init()");
+        return 0;
+    }
+    if (!S9xInitAPU()) {
+        S9xMessage(S9X_MSG_ERROR, S9X_CATEGORY_EXTERNAL, "core init failed: S9xInitAPU()");
+        return 0;
+    }
     S9xInitSound();
 
     GFX.Pitch  = MAX_SNES_WIDTH * sizeof(uint16_t);
     GFX.Screen = (uint16_t *)calloc((size_t)GFX.Pitch * 512, 1);
-    if (!GFX.Screen) return 0;
+    if (!GFX.Screen) {
+        S9xMessage(S9X_MSG_ERROR, S9X_CATEGORY_EXTERNAL, "core init failed: calloc(GFX.Screen)");
+        return 0;
+    }
     S9xGraphicsInit();
 
     S9xUnmapAllControls();
@@ -188,8 +201,15 @@ static int initOnce(void) {
     S9xSetController(1, CTL_JOYPAD, 1, 0, 0, 0);
 
     g_video = (unsigned char *)calloc(VIDEO_BYTES, 1);
+    if (!g_video) {
+        S9xMessage(S9X_MSG_ERROR, S9X_CATEGORY_EXTERNAL, "core init failed: calloc(g_video)");
+        return 0;
+    }
     g_audio = (int16_t *)calloc(AUDIO_CAP_SAMPLES, sizeof(int16_t));
-    if (!g_video || !g_audio) return 0;
+    if (!g_audio) {
+        S9xMessage(S9X_MSG_ERROR, S9X_CATEGORY_EXTERNAL, "core init failed: calloc(g_audio)");
+        return 0;
+    }
 
     g_inited = 1;
     return 1;
