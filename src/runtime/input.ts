@@ -31,6 +31,7 @@ export class InputManager {
   private readonly core: SnesCore;
   private down = new Set<string>();
   private gamepadMask = 0;
+  private touchMask = 0;
 
   /** Set by focus mode (see main.ts) to dedicate the keyboard to the game. */
   captureKeys = false;
@@ -77,7 +78,18 @@ export class InputManager {
   };
 
   private apply(): void {
-    this.core.setController(1, this.keyboardMask() | this.gamepadMask);
+    this.core.setController(1, this.keyboardMask() | this.gamepadMask | this.touchMask);
+  }
+
+  /**
+   * Set the on-screen controller's button mask (see touch.ts). Composed with
+   * keyboard + gamepad in apply(); only pushes when it actually changes so a
+   * resting finger doesn't spam the core.
+   */
+  setTouchMask(mask: number): void {
+    if (mask === this.touchMask) return;
+    this.touchMask = mask;
+    this.apply();
   }
 
   private keyboardMask(): number {

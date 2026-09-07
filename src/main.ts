@@ -5,6 +5,7 @@ import { DEFAULT_ROM } from './config';
 import { CanvasRenderer } from './runtime/renderer';
 import { AudioEngine } from './runtime/audio';
 import { InputManager } from './runtime/input';
+import { TouchController } from './runtime/touch';
 import { FrameLoop } from './runtime/frame-loop';
 import { buildUi } from './ui/app';
 import { mountDebug } from './debug/debugger';
@@ -49,6 +50,19 @@ async function boot(): Promise<void> {
 
   const input = new InputManager(core);
   input.attach(document.body);
+
+  // --- touch devices -----------------------------------------------------
+  // A coarse primary pointer (or legacy ontouchstart) means the keyboard
+  // gamepad model above won't exist, so we surface an on-screen controller
+  // and auto-enter focus mode. `?focus=0` opts out (e.g. to use the debugger
+  // on a phone). Desktop with a fine pointer gets no touch UI.
+  const isTouch =
+    typeof window !== 'undefined' &&
+    (window.matchMedia?.('(pointer: coarse)')?.matches === true || 'ontouchstart' in window);
+  const autoFocus =
+    isTouch && new URLSearchParams(location.search).get('focus') !== '0';
+  const touch = isTouch ? new TouchController((mask) => input.setTouchMask(mask)) : null;
+  if (touch) ui.root.appendChild(touch.root);
 
   const loop = new FrameLoop(() => {
     core.frame();
@@ -116,6 +130,9 @@ async function boot(): Promise<void> {
     await audio.resume();
     setRunning(true);
     setStatus(`${tag} · running ${name}`);
+    // On a touch device, drop straight into focus mode: chrome away, canvas
+    // filling the viewport, on-screen controller visible.
+    if (autoFocus) setFocused(true);
   };
 
   ui.romInput.addEventListener('change', async () => {
@@ -141,6 +158,7 @@ async function boot(): Promise<void> {
     focused = on;
     input.captureKeys = on;
     ui.root.classList.toggle('focused', on);
+    touch?.setEnabled(on);
     if (on) {
       (document.activeElement as HTMLElement | null)?.blur();
       if (core.ready) {
@@ -155,6 +173,12 @@ async function boot(): Promise<void> {
   };
   ui.focusBtn.addEventListener('click', () => setFocused(!focused));
   ui.fullscreenBtn.addEventListener('click', toggleFullscreen);
+  // Touch escape hatch for focus mode (Esc/F1 don't exist on a phone).
+  ui.exitFocusBtn.addEventListener('click', () => {
+    setFocused(false);
+    if (document.fullscreenElement) document.exitFullscreen();
+    ui.exitFocusBtn.blur();
+  });
   document.addEventListener('fullscreenchange', () => {
     const fs = document.fullscreenElement === ui.root;
     ui.fullscreenBtn.textContent = fs ? '⛶ Exit fullscreen' : '⛶ Fullscreen';
@@ -213,6 +237,7 @@ async function boot(): Promise<void> {
     await audio.resume();
     setRunning(true);
     setStatus(`${tag} · mock test pattern running (press ⏭ to step, ⏸ to pause)`);
+    if (autoFocus) setFocused(true);
   }
 
   (window as unknown as Record<string, unknown>).__snes = { core, debug };

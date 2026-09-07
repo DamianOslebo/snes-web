@@ -14,6 +14,7 @@ export interface Ui {
   saveBtn: HTMLButtonElement;
   focusBtn: HTMLButtonElement;
   fullscreenBtn: HTMLButtonElement;
+  exitFocusBtn: HTMLButtonElement;
   debug: HTMLElement;
 }
 
@@ -77,9 +78,14 @@ export function buildUi(mount: HTMLElement): Ui {
   root.appendChild(el('div', 'focus-hint',
     'F1 exit focus · F fullscreen · Z A X S buttons · Q L · E R · Enter Start · Shift Select · arrows D-pad'));
 
+  // Exit-focus button: the touch affordance for leaving focus mode (Esc/F1 are
+  // keyboard-only). Shown only while focused; also handy on desktop.
+  const exitFocusBtn = el('button', 'exit-focus', '✕ Exit');
+  root.appendChild(exitFocusBtn);
+
   mount.appendChild(root);
 
-  return { root, canvas, status, romInput, playBtn, pauseBtn, stepBtn, saveBtn, focusBtn, fullscreenBtn, debug };
+  return { root, canvas, status, romInput, playBtn, pauseBtn, stepBtn, saveBtn, focusBtn, fullscreenBtn, exitFocusBtn, debug };
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -136,6 +142,12 @@ const CSS = `
 .focus-hint { display: none; position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%);
   color: #8a8a92; font-size: 12px; white-space: nowrap; z-index: 10; }
 .shell.focused .focus-hint { display: block; }
+
+/* Exit-focus: the touch escape hatch for focus mode (Esc/F1 are keyboard-only). */
+.exit-focus { display: none; position: fixed; top: 8px; left: 50%; transform: translateX(-50%);
+  z-index: 40; background: rgba(28,28,38,.7); color: #e8e8ea; border: 1px solid #3a3a44;
+  border-radius: 999px; padding: 6px 14px; cursor: pointer; font: inherit; touch-action: manipulation; }
+.shell.focused .exit-focus { display: inline-block; }
 
 /* --- fullscreen: same scaling, shell paints its own background ---------- */
 .shell:fullscreen { padding: 0; background: #000; overflow: auto; }
