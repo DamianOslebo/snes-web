@@ -7,7 +7,7 @@ import { InputManager } from './runtime/input';
 import { FrameLoop } from './runtime/frame-loop';
 import { buildUi } from './ui/app';
 import { mountDebug } from './debug/debugger';
-import workletUrl from './runtime/worklet.ts?url';
+import workletSource from './runtime/worklet.js?raw';
 
 async function boot(): Promise<void> {
   const mountEl = document.getElementById('app');
@@ -25,8 +25,24 @@ async function boot(): Promise<void> {
   const renderer = new CanvasRenderer(ui.canvas);
   // Match the AudioContext to the core's native SPU rate (32040 Hz for
   // snes9x) so the worklet's 1:1 drain plays at the right pitch.
+  //
+  // AudioWorklet is a secure-context-only API: on a plain-HTTP origin that
+  // isn't localhost (e.g. a LAN IP), Chrome/Edge leave
+  // `AudioContext.audioWorklet` undefined, so there is no audio at all.
+  // Fail loudly with the remedy instead of silently running mute.
+  if (typeof AudioContext === 'undefined') {
+    throw new Error('AudioContext is not available in this browser');
+  }
   const audioCtx = new AudioContext({ sampleRate: core.audioRate() });
-  const audio = new AudioEngine(audioCtx, workletUrl);
+  if (!audioCtx.audioWorklet) {
+    throw new Error(
+      'AudioWorklet is unavailable because this page is not on a secure origin. ' +
+      'Open it at http://localhost:<port> (localhost counts as a secure context), ' +
+      'or add this exact origin (scheme://host:port) to ' +
+      'chrome://flags/#unsafely-treat-insecure-origin-as-secure and relaunch the browser.',
+    );
+  }
+  const audio = new AudioEngine(audioCtx, workletSource);
   await audio.start();
   await audio.suspend(); // hold audio until the user starts the emulator
 
@@ -36,7 +52,7 @@ async function boot(): Promise<void> {
   const loop = new FrameLoop(() => {
     core.frame();
     renderer.draw(core.lastVideo());
-    audio.push(core.drainAudio());
+    audio.push(core.drainAudio()); // keep draining so the C-side buffer stays bounded
     input.pollGamepad();
   }, 60);
 
