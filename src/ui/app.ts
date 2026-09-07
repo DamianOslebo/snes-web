@@ -14,6 +14,7 @@ export interface Ui {
   saveBtn: HTMLButtonElement;
   focusBtn: HTMLButtonElement;
   fullscreenBtn: HTMLButtonElement;
+  bindingsBtn: HTMLButtonElement;
   exitFocusBtn: HTMLButtonElement;
   debug: HTMLElement;
 }
@@ -56,7 +57,12 @@ export function buildUi(mount: HTMLElement): Ui {
   const saveBtn = el('button', 'btn', '💾 Save state');
   const focusBtn = el('button', 'btn', '🎮 Focus');
   const fullscreenBtn = el('button', 'btn', '⛶ Fullscreen');
-  for (const b of [playBtn, pauseBtn, stepBtn, saveBtn, focusBtn, fullscreenBtn]) {
+  // Only meaningful once a gamepad is detected; main.ts reveals it then
+  // (onGamepadChange) — it opens the binding-config page.
+  const bindingsBtn = el('button', 'btn', '🎮 Controller');
+  bindingsBtn.hidden = true;
+  bindingsBtn.title = 'Configure controller button bindings';
+  for (const b of [playBtn, pauseBtn, stepBtn, saveBtn, focusBtn, fullscreenBtn, bindingsBtn]) {
     transport.appendChild(b);
   }
   // Keep the keyboard for the game: a clicked button would otherwise retain
@@ -85,7 +91,7 @@ export function buildUi(mount: HTMLElement): Ui {
 
   mount.appendChild(root);
 
-  return { root, canvas, status, romInput, playBtn, pauseBtn, stepBtn, saveBtn, focusBtn, fullscreenBtn, exitFocusBtn, debug };
+  return { root, canvas, status, romInput, playBtn, pauseBtn, stepBtn, saveBtn, focusBtn, fullscreenBtn, bindingsBtn, exitFocusBtn, debug };
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -101,6 +107,7 @@ function el<K extends keyof HTMLElementTagNameMap>(
 
 const CSS = `
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 .shell { color-scheme: light dark; color: #e8e8ea; font: 14px/1.4 ui-sans-serif, system-ui, sans-serif;
   min-height: 100vh; padding: 16px; background: #0d0d10; }
 .header { display: flex; align-items: baseline; gap: 16px; margin-bottom: 16px; }

@@ -1,4 +1,5 @@
 import { BTN, type SnesCore } from '../core/types';
+import { loadBindings, maskFromBindings, type Bindings } from './gamepad-bindings';
 
 /** Keyboard → SNES button. Arrow keys + Z/X/A/S + Q/E (L/R) + Enter/Shift. */
 const KEYMAP: Record<string, number> = {
@@ -32,24 +33,67 @@ export class InputManager {
   private down = new Set<string>();
   private gamepadMask = 0;
   private touchMask = 0;
+  private anyGamepad = false; // whether a gamepad was connected on the last check
+
+  /** gamepad → SNES mapping, loaded from storage (see gamepad-bindings.ts). */
+  private bindings: Bindings;
 
   /** Set by focus mode (see main.ts) to dedicate the keyboard to the game. */
   captureKeys = false;
 
-  constructor(core: SnesCore) {
+  /**
+   * Fired whenever the "is any gamepad connected?" state flips. Lets the app
+   * prefer a (Bluetooth) gamepad over the on-screen touch controller and swap
+   * back when the pad is unplugged (see main.ts).
+   */
+  onGamepadChange?: (connected: boolean) => void;
+
+  constructor(core: SnesCore, bindings?: Bindings) {
     this.core = core;
+    // Load the stored mapping (default when none exists) so the emulator uses
+    // the user's bindings as soon as it boots.
+    this.bindings = bindings ?? loadBindings();
+  }
+
+  /** Swap in a new gamepad → SNES mapping (e.g. after the config page saves). */
+  setBindings(bindings: Bindings): void {
+    this.bindings = bindings;
   }
 
   attach(el: HTMLElement): void {
     el.addEventListener('keydown', this.onKeyDown, { passive: false });
     el.addEventListener('keyup', this.onKeyUp, { passive: false });
     window.addEventListener('blur', this.onBlur);
+    // A Bluetooth controller pairing/unpairing while the page is open fires
+    // here; we use it to swap the on-screen touch controller on/off. (A pad
+    // already connected before the page loaded is picked up by the poll.)
+    window.addEventListener('gamepadconnected', this.onGamepadEvent);
+    window.addEventListener('gamepaddisconnected', this.onGamepadEvent);
   }
 
   detach(el: HTMLElement): void {
     el.removeEventListener('keydown', this.onKeyDown);
     el.removeEventListener('keyup', this.onKeyUp);
     window.removeEventListener('blur', this.onBlur);
+    window.removeEventListener('gamepadconnected', this.onGamepadEvent);
+    window.removeEventListener('gamepaddisconnected', this.onGamepadEvent);
+  }
+
+  private onGamepadEvent = (): void => {
+    this.emitGamepadPresence(this.anyConnectedGamepad() !== undefined);
+  };
+
+  /** Report a change in "is any gamepad connected?" to onGamepadChange. */
+  private emitGamepadPresence(present: boolean): void {
+    if (present === this.anyGamepad) return;
+    this.anyGamepad = present;
+    this.onGamepadChange?.(present);
+  }
+
+  /** First connected gamepad, or undefined if none (or on non-browser). */
+  private anyConnectedGamepad(): Gamepad | undefined {
+    if (typeof navigator === 'undefined' || !navigator.getGamepads) return undefined;
+    return Array.from(navigator.getGamepads()).find((g): g is Gamepad => g !== null && g.connected);
   }
 
   private onKeyDown = (e: KeyboardEvent): void => {
@@ -100,24 +144,12 @@ export class InputManager {
 
   /** Sample connected gamepads and apply. Call once per emulated frame. */
   pollGamepad(): void {
-    if (typeof navigator === 'undefined' || !navigator.getGamepads) return;
-    const gp = Array.from(navigator.getGamepads()).find((g) => g !== null && g.connected);
+    const gp = this.anyConnectedGamepad();
+    this.emitGamepadPresence(gp !== undefined);
     if (!gp) return;
-    let mask = 0;
-    // Gamepad mapping: standard button indices.
-    const b = gp.buttons;
-    if (b[0]?.pressed) mask |= BTN.B;
-    if (b[1]?.pressed) mask |= BTN.Y;
-    if (b[2]?.pressed) mask |= BTN.SELECT;
-    if (b[3]?.pressed) mask |= BTN.START;
-    if (b[9]?.pressed) mask |= BTN.UP;
-    if (b[10]?.pressed) mask |= BTN.DOWN;
-    if (b[11]?.pressed) mask |= BTN.LEFT;
-    if (b[12]?.pressed) mask |= BTN.RIGHT;
-    if (b[4]?.pressed) mask |= BTN.A;
-    if (b[5]?.pressed) mask |= BTN.X;
-    if (b[6]?.pressed) mask |= BTN.L;
-    if (b[7]?.pressed) mask |= BTN.R;
+    // The mapping is data (see gamepad-bindings.ts), configurable from the
+    // on-screen "Controller" page; maskFromBindings resolves it for this pad.
+    const mask = maskFromBindings(gp, this.bindings);
     if (mask !== this.gamepadMask) {
       this.gamepadMask = mask;
       this.apply();

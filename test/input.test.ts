@@ -50,3 +50,34 @@ describe('InputManager touch mask', () => {
     expect(calls.length).toBe(n);
   });
 });
+
+describe('InputManager gamepad presence (Bluetooth → touch fallback)', () => {
+  // The node test env has no real Gamepad API; stub getGamepads to simulate a
+  // pad appearing and disappearing, and assert the presence callback that
+  // main.ts uses to swap the on-screen touch controller on/off.
+  const g = globalThis as Record<string, unknown>;
+  const nav = (g.navigator ?? (g.navigator = {})) as { getGamepads?: () => (Gamepad | null)[] };
+
+  it('fires onGamepadChange(true) when a pad connects, (false) when it drops', () => {
+    const { core } = recordingCore();
+    const input = new InputManager(core);
+    const events: boolean[] = [];
+    input.onGamepadChange = (c) => events.push(c);
+
+    const original = nav.getGamepads;
+    try {
+      nav.getGamepads = () => [{ connected: true, buttons: [] } as unknown as Gamepad];
+      input.pollGamepad();
+      expect(events).toEqual([true]);
+
+      input.pollGamepad(); // same state → no duplicate event
+      expect(events).toEqual([true]);
+
+      nav.getGamepads = () => [null]; // pad unplugged
+      input.pollGamepad();
+      expect(events).toEqual([true, false]);
+    } finally {
+      nav.getGamepads = original;
+    }
+  });
+});

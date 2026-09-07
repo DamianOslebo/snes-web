@@ -39,8 +39,12 @@ Two layers: a compiled emulator core behind a C ABI, wrapped by a TypeScript app
 **`src/runtime/`** — the render/audio/input loop, all core-agnostic:
 - `renderer.ts` (2D canvas `putImageData` of the 256×224 RGBA frame),
 - `audio.ts` + `worklet.ts` (AudioWorklet queue fed by `drainAudio()`; no SharedArrayBuffer),
-- `input.ts` (keyboard + Gamepad → `setController`),
+- `input.ts` (keyboard + Gamepad + on-screen touch → one composed mask to `setController`),
+- `gamepad-bindings.ts` (configurable gamepad→SNES mapping: button **or** axis+dir per action, persisted to localStorage; applied via `maskFromBindings`). Defaults match the standard Gamepad API layout, so a fresh install behaves as before.
+- `touch.ts` (on-screen SNES controller: per-pointer tracking so buttons can be held together; the mobile focus-mode fallback when no gamepad is connected),
 - `frame-loop.ts` (fixed-timestep 60 Hz `requestAnimationFrame` driver).
+
+Gamepad presence drives UX (all in `main.ts`): the on-screen touch pad is the **fallback** (hidden while a pad is connected, re-shown on unplug), and the "🎮 Controller" transport button appears only when a pad is present. It opens the binding-config page — a standalone `?bindings=1` route (`src/ui/bindings.ts`) that does not boot the core/audio; each SNES action is assigned by pressing a button/axis, saved immediately, and re-read by `InputManager` on the next emulator boot.
 
 **`src/debug/`** — the debugger, a TS layer over the core's debug ABI:
 - `disasm.ts` — bank-aware 65C816 disassembler.

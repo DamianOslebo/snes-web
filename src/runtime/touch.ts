@@ -173,8 +173,8 @@ const CSS = `
 .tc-face { right: 14px; bottom: 18px; width: calc(var(--tc) * 3 + 10px); height: calc(var(--tc) * 3 + 10px); }
 .tc-face .tc-x { left: 50%; top: 0; transform: translateX(-50%); }
 .tc-face .tc-y { left: 0; top: 50%; transform: translateY(-50%); }
-.tc-face .tc-b { right: 0; top: 50%; transform: translateY(-50%); }
-.tc-face .tc-a { left: 50%; bottom: 0; transform: translateX(-50%); }
+.tc-face .tc-a { right: 0; top: 50%; transform: translateY(-50%); }
+.tc-face .tc-b { left: 50%; bottom: 0; transform: translateX(-50%); }
 `;
 
 /** Inject the overlay stylesheet once per document (idempotent). */

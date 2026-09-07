@@ -8,12 +8,23 @@ import { InputManager } from './runtime/input';
 import { TouchController } from './runtime/touch';
 import { FrameLoop } from './runtime/frame-loop';
 import { buildUi } from './ui/app';
+import { mountBindings } from './ui/bindings';
 import { mountDebug } from './debug/debugger';
 import workletSource from './runtime/worklet.js?raw';
 
 async function boot(): Promise<void> {
   const mountEl = document.getElementById('app');
   if (!mountEl) throw new Error('#app mount point missing');
+
+  // Controller-binding config page (?bindings=1), reached from the
+  // "Controller" button. A standalone view: no core, no audio — it only needs
+  // a pad once the user starts assigning. Binding state lives in localStorage
+  // and is re-read by InputManager on the next emulator boot.
+  if (new URLSearchParams(location.search).get('bindings') === '1') {
+    mountBindings(mountEl);
+    return;
+  }
+
   const ui = buildUi(mountEl);
 
   const core = await createCore();
@@ -51,11 +62,15 @@ async function boot(): Promise<void> {
   const input = new InputManager(core);
   input.attach(document.body);
 
-  // --- touch devices -----------------------------------------------------
+  // --- touch + gamepad controllers ---------------------------------------
   // A coarse primary pointer (or legacy ontouchstart) means the keyboard
   // gamepad model above won't exist, so we surface an on-screen controller
   // and auto-enter focus mode. `?focus=0` opts out (e.g. to use the debugger
   // on a phone). Desktop with a fine pointer gets no touch UI.
+  //
+  // A connected (Bluetooth) gamepad is the PRIMARY controller; the on-screen
+  // touch pad is the FALLBACK — shown only in focus mode and only while no
+  // gamepad is connected, and re-shown automatically if the pad is unplugged.
   const isTouch =
     typeof window !== 'undefined' &&
     (window.matchMedia?.('(pointer: coarse)')?.matches === true || 'ontouchstart' in window);
@@ -63,6 +78,28 @@ async function boot(): Promise<void> {
     isTouch && new URLSearchParams(location.search).get('focus') !== '0';
   const touch = isTouch ? new TouchController((mask) => input.setTouchMask(mask)) : null;
   if (touch) ui.root.appendChild(touch.root);
+
+  // `focused` is declared here (not where setFocused is defined below) so the
+  // gamepad handler and syncTouch can read it before that section runs.
+  let focused = false;
+  let gamepad = false; // true while a gamepad is connected
+  const syncTouch = (): void => {
+    if (!touch) return;
+    // Overlay only in focus mode, and only when no gamepad is driving the pad.
+    touch.setEnabled(focused && !gamepad);
+  };
+  input.onGamepadChange = (connected) => {
+    gamepad = connected;
+    syncTouch();
+    // The binding config is only useful with a pad attached: reveal the
+    // "Controller" button on connect, hide it again on unplug.
+    ui.bindingsBtn.hidden = !connected;
+  };
+  // A pad paired before the page loaded never fires `gamepadconnected`, so
+  // read it now to start in the right mode (touch overlay hidden) instead of
+  // flashing the touch pad for a frame once the frame loop begins.
+  input.pollGamepad();
+  syncTouch();
 
   const loop = new FrameLoop(() => {
     core.frame();
@@ -153,12 +190,11 @@ async function boot(): Promise<void> {
   // consumes every keydown/keyup), hides the chrome, scales the canvas to the
   // viewport, and auto-runs. F1 toggles it, Esc exits. Fullscreen (F, or the
   // button) is the browser's, applied to the whole shell.
-  let focused = false;
   const setFocused = (on: boolean): void => {
     focused = on;
     input.captureKeys = on;
     ui.root.classList.toggle('focused', on);
-    touch?.setEnabled(on);
+    syncTouch();
     if (on) {
       (document.activeElement as HTMLElement | null)?.blur();
       if (core.ready) {
@@ -173,6 +209,14 @@ async function boot(): Promise<void> {
   };
   ui.focusBtn.addEventListener('click', () => setFocused(!focused));
   ui.fullscreenBtn.addEventListener('click', toggleFullscreen);
+  // Opens the binding-config page (a standalone ?bindings=1 view). "Back to
+  // game" there strips the param, so the emulator reboots and InputManager
+  // picks up the freshly saved mapping from localStorage.
+  ui.bindingsBtn.addEventListener('click', () => {
+    const url = new URL(location.href);
+    url.searchParams.set('bindings', '1');
+    location.href = url.toString();
+  });
   // Touch escape hatch for focus mode (Esc/F1 don't exist on a phone).
   ui.exitFocusBtn.addEventListener('click', () => {
     setFocused(false);
