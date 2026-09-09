@@ -28,56 +28,74 @@ describe('65C816 disassembler', () => {
     // A2 00     LDX #$00
     // E8        INX
     // CA        DEX
-    // D0 FA 00  BNE +$00FA   (16-bit relative → $00:8101)
+    // D0 02     BNE +2        (8-bit relative → $00:8008, target = pc+2+2)
     // A9 FF     LDA #$FF
-    // 85 00 02  STA $0200
-    // 40        RTS          (65C816: RTS is $40 and RTI is $60 — swapped
-    //                         relative to the 6502)
+    // 8D 00 02  STA $0200     (absolute, 3 bytes)
+    // 40        RTS           (65C816: RTS is $40 and RTI is $60 — swapped
+    //                          relative to the 6502)
     // (Same program the MockCore seeds at $00:8000.)
-    const bytes = new Uint8Array([0xa2, 0x00, 0xe8, 0xca, 0xd0, 0xfa, 0x00, 0xa9, 0xff, 0x85, 0x00, 0x02, 0x40]);
+    const bytes = new Uint8Array([0xa2, 0x00, 0xe8, 0xca, 0xd0, 0x02, 0xa9, 0xff, 0x8d, 0x00, 0x02, 0x40]);
     const r = readerFrom(bytes);
     const ins = disassembleRange(PC, r, 7);
 
     expect(ins.map((i) => i.mnemonic)).toEqual(['LDX', 'INX', 'DEX', 'BNE', 'LDA', 'STA', 'RTS']);
-    expect(ins.map((i) => i.operand)).toEqual(['#$00', '', '', '$00:8101', '#$ff', '$0200', '']);
-    expect(ins.map((i) => i.size)).toEqual([2, 1, 1, 3, 2, 3, 1]);
+    expect(ins.map((i) => i.operand)).toEqual(['#$00', '', '', '$00:8008', '#$ff', '$0200', '']);
+    expect(ins.map((i) => i.size)).toEqual([2, 1, 1, 2, 2, 3, 1]);
     expect(ins.map((i) => i.illegal)).toEqual([false, false, false, false, false, false, false]);
   });
 
-  it('computes 16-bit relative branch targets (forward and backward)', () => {
+  it('computes 8-bit relative branch targets (forward and backward)', () => {
     const hex4 = (n: number): string => (n & 0xffff).toString(16).padStart(4, '0');
-    // BRA +$10 → target = pc + 3 + 0x10
-    let bytes = new Uint8Array([0x80, 0x10, 0x00]);
-    expect(disassemble(PC, readerFrom(bytes)).operand).toBe(`$00:${hex4(PC + 3 + 0x10)}`);
-    // BRA -$04 (0xfffc) → target = pc + 3 - 4 = pc - 1
-    bytes = new Uint8Array([0x80, 0xfc, 0xff]);
-    expect(disassemble(PC, readerFrom(bytes)).operand).toBe(`$00:${hex4(PC + 3 - 4)}`);
+    // BRA +$10 → target = pc + 2 + 0x10
+    let bytes = new Uint8Array([0x80, 0x10]);
+    expect(disassemble(PC, readerFrom(bytes)).operand).toBe(`$00:${hex4(PC + 2 + 0x10)}`);
+    // BRA -4 (0xfc) → target = pc + 2 - 4 = pc - 2
+    bytes = new Uint8Array([0x80, 0xfc]);
+    expect(disassemble(PC, readerFrom(bytes)).operand).toBe(`$00:${hex4(PC + 2 - 4)}`);
+  });
+
+  it('computes 16-bit relative BRL targets', () => {
+    const hex4 = (n: number): string => (n & 0xffff).toString(16).padStart(4, '0');
+    // BRL +$0010 (82 10 00) → target = pc + 3 + 0x10
+    const bytes = new Uint8Array([0x82, 0x10, 0x00]);
+    const ins = disassemble(PC, readerFrom(bytes));
+    expect(ins.mnemonic).toBe('BRL');
+    expect(ins.operand).toBe(`$00:${hex4(PC + 3 + 0x10)}`);
+    expect(ins.size).toBe(3);
   });
 
   it('decodes banked (long) addressing as bank:addr', () => {
-    // LDA $C0:0301 → AF 01 03 C0
-    const bytes = new Uint8Array([0xaf, 0x01, 0x03, 0xc0]);
+    // JSL $C0:0301 → 22 01 03 C0
+    const bytes = new Uint8Array([0x22, 0x01, 0x03, 0xc0]);
     const ins = disassemble(PC, readerFrom(bytes));
-    expect(ins.mnemonic).toBe('LDA');
+    expect(ins.mnemonic).toBe('JSL');
     expect(ins.operand).toBe('$c0:0301');
     expect(ins.size).toBe(4);
   });
 
-  it('decodes the C816 extra stack ops', () => {
+  it('decodes the C816 extra stack and register-transfer ops', () => {
     const cases: [number, string][] = [
       [0x48, 'PHA'],
       [0x68, 'PLA'],
       [0x4b, 'PHK'],
       [0x8b, 'PHB'],
       [0xab, 'PLB'],
-      [0xcd, 'PHD'],
-      [0xad, 'PLD'],
+      [0x0b, 'PHD'],
+      [0x2b, 'PLD'],
+      [0x5a, 'PHY'],
+      [0x7a, 'PLY'],
       [0xda, 'PHX'],
       [0xfa, 'PLX'],
-      [0x2b, 'TSK'],
+      [0x1b, 'TCS'],
       [0x3b, 'TSC'],
-      [0x02, 'REP'],
-      [0x03, 'SEP'],
+      [0x5b, 'TCD'],
+      [0x7b, 'TDC'],
+      [0x9b, 'TXY'],
+      [0xbb, 'TYX'],
+      [0xeb, 'XBA'],
+      [0xfb, 'XCE'],
+      [0xc2, 'REP'],
+      [0xe2, 'SEP'],
     ];
     for (const [op, mnem] of cases) {
       const r = readerFrom(new Uint8Array([op, 0]));
@@ -102,9 +120,9 @@ describe('65C816 disassembler', () => {
       expect(def!.mnem).toBe(mnem);
       expect(def!.mode).toBe(mode);
     };
-    expectOp(0x00, 'BRK', 'imp');
-    expectOp(0x20, 'JSR', 'long');
-    expectOp(0x4c, 'JMP', 'long');
+    expectOp(0x00, 'BRK', 'imm'); // 1-byte dummy operand; core consumes 2 bytes
+    expectOp(0x20, 'JSR', 'abs');
+    expectOp(0x4c, 'JMP', 'abs');
     expectOp(0x60, 'RTI', 'imp');
     expectOp(0x24, 'BIT', 'zp');
     expectOp(0x2e, 'BIT', 'absx');
@@ -115,10 +133,13 @@ describe('65C816 disassembler', () => {
     expectOp(0xca, 'DEX', 'imp');
     expectOp(0xc8, 'INY', 'imp');
     expectOp(0xe8, 'INX', 'imp');
-    expectOp(0xa5, 'LDA', 'abs');
-    expectOp(0x85, 'STA', 'abs');
-    expectOp(0x11, 'ORA', 'indy');
-    expectOp(0x2f, 'AND', 'long');
+    expectOp(0xa5, 'LDA', 'zp');
+    expectOp(0x85, 'STA', 'zp');
+    expectOp(0xad, 'LDA', 'abs');
+    expectOp(0xbd, 'LDA', 'absy');
+    expectOp(0x01, 'ORA', 'indy');
+    expectOp(0x11, 'ORA', 'indx');
+    expectOp(0x2d, 'AND', 'abs');
     expectOp(0x69, 'ADC', 'imm');
     expectOp(0xc9, 'CMP', 'imm');
   });

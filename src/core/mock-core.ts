@@ -50,16 +50,16 @@ export class MockCore implements SnesCore {
   onBreakpoint?: (hit: BreakpointHit) => void;
 
   // Ordered (addr, byte-length) sequence the mock PC walks through.
-  // Same program the disassembler test decodes (65C816: branches are
-  // 16-bit relative, so BNE is 3 bytes).
+  // Same program the disassembler test decodes. 65C816 branches are 8-bit
+  // relative (opcode + 1 offset byte = 2 total), so BNE is 2 bytes here.
   private readonly seq = [
     { a: 0x8000, l: 2 }, // LDX #$00
     { a: 0x8002, l: 1 }, // INX
     { a: 0x8003, l: 1 }, // DEX
-    { a: 0x8004, l: 3 }, // BNE +$00FA
-    { a: 0x8007, l: 2 }, // LDA #$FF
-    { a: 0x8009, l: 3 }, // STA $0200
-    { a: 0x800c, l: 1 }, // RTS
+    { a: 0x8004, l: 2 }, // BNE +2
+    { a: 0x8006, l: 2 }, // LDA #$FF
+    { a: 0x8008, l: 3 }, // STA $0200
+    { a: 0x800b, l: 1 }, // RTS
   ];
 
   constructor() {
@@ -70,10 +70,11 @@ export class MockCore implements SnesCore {
   }
 
   private seedProgram(): void {
-    // A2 00 / E8 / CA / D0 FA 00 / A9 FF / 85 00 02 / 40
-    // (85 is STA abs; 8D would be STA abs,Y. $40 is RTS on the 65C816 —
-    // the C816 swaps RTS/RTI vs the 6502.)
-    const bytes = [0xa2, 0x00, 0xe8, 0xca, 0xd0, 0xfa, 0x00, 0xa9, 0xff, 0x85, 0x00, 0x02, 0x40];
+    // A2 00 / E8 / CA / D0 02 / A9 FF / 8D 00 02 / 40
+    //   LDX #$00  INX  DEX  BNE +2  LDA #$FF  STA $0200  RTS
+    // BNE is 8-bit relative (2 bytes), STA $0200 is absolute (3 bytes).
+    // $40 is RTS on the 65C816 — the C816 swaps RTS/RTI vs the 6502.
+    const bytes = [0xa2, 0x00, 0xe8, 0xca, 0xd0, 0x02, 0xa9, 0xff, 0x8d, 0x00, 0x02, 0x40];
     for (let i = 0; i < bytes.length; i++) this.mem[0][0x8000 + i] = bytes[i];
   }
 
