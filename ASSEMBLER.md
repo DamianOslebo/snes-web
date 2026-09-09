@@ -1,12 +1,20 @@
 # 65C816 Assembler — progress & TODO
 
-Status: **assembler + tests done.** The shared opcode foundation and the
-assembler itself are built and green (66 tests across the suite, typecheck
-clean). **Nothing here is committed yet** — all of it is uncommitted
-working-tree changes. Remaining: UI integration (undecided) and the commit
-split.
+Status: **done, committed, and wired into the debugger.** The shared opcode
+foundation, the assembler, and the debugger's Assembler panel are built and
+green (66 tests across the suite; typecheck and production build clean).
 
-## Done (uncommitted)
+Commits, in order:
+
+- `1b06b5a` — the foundation: `src/asm/opcode.ts`, `src/debug/disasm.ts`,
+  `test/disasm.test.ts`, `src/core/mock-core.ts`
+- `37f78c1` — the assembler: `src/asm/assembler.ts`, `test/asm.test.ts`,
+  plus the BRK addition to `MASK_OPS`
+- (3rd commit) — the Assembler panel in `src/debug/debugger.ts`
+
+## Done
+
+### `src/asm/opcode.ts` (new) — single source of truth
 
 ### `src/asm/opcode.ts` (new) — single source of truth
 
@@ -111,23 +119,32 @@ a branch-heavy program (labels, `BRL`, self-referential `BNE +0`).
 - MockCore's seed program re-encoded to match (BNE is now 2 bytes,
   `STA $0200` is `8D 00 02`). `mock-core.test.ts` still passes.
 
-## TODO
+## Assembler panel (debugger) — `src/debug/debugger.ts`
 
-1. **UI integration** — undecided. Natural home is a debugger panel
-   (paste source → assembled bytes + per-line listing → write to core
-   memory via the core ABI), but the surface and the "write bytes into a
-   memory region" path through `SnesCore` are not designed yet. The
-   assembler's `lines`/`modeTrace` result shape was designed with that
-   listing view in mind. **Needs a user decision before building.**
-2. **Commit** — split the work:
-   - commit 1, the shared foundation: `src/asm/opcode.ts`,
-     `src/debug/disasm.ts`, `test/disasm.test.ts`,
-     `src/core/mock-core.ts`;
-   - commit 2, the assembler: `src/asm/assembler.ts`, `test/asm.test.ts`,
-     `ASSEMBLER.md` (plus the BRK addition to `MASK_OPS`).
-   - `src/ui/input-test.ts` + the `?inputtest=1` route in `src/main.ts` are
-     a *separate* task (Backbone/Android input probe) sitting uncommitted
-     in the same tree — commit or shelve separately, not with these.
+The UI: a panel between Memory and Save states.
+
+- Paste 65C816 source into a textarea (pre-filled with a small loop) and
+  pick a bank/addr — default WRAM `$7E:8000`, because bank `$00` is ROM
+  and unwritable on hardware.
+- **Assemble** → either a per-line listing (address, bytes, source — from
+  the assembler's `lines` result) or the line-numbered errors; the Write
+  button stays disabled until an assemble succeeds.
+- **Write** → `SnesCore.writeMem(bank, addr, bytes)` copies the bytes into
+  the live core (works on both the wasm core and the mock), then the
+  Memory panel jumps to the written block. For that, `buildMemToolbar`
+  now returns its region-select + offset widgets.
+
+## Not done
+
+- **Executing the written code is not wired up.** The core ABI exposes
+  registers read-only — there is no PC setter — so the panel can place
+  code in WRAM but cannot make the CPU start there. That would be a shim
+  addition, and per the three-way sync rule it would need to be added to
+  `wasm-core.ts` and `core/build.sh`'s `EXPORTED_FUNCTIONS` at the same
+  time.
+- `src/ui/input-test.ts` + the `?inputtest=1` route in `src/main.ts` are
+  a *separate* uncommitted task (Backbone/Android input probe) — commit
+  or shelve separately, not with this work.
 
 ## Verify
 
