@@ -1,8 +1,11 @@
 # 65C816 Assembler — progress & TODO
 
-Status: **done, committed, and wired into the debugger.** The shared opcode
-foundation, the assembler, and the debugger's Assembler panel are built and
-green (66 tests across the suite; typecheck and production build clean).
+Status: **done, committed, and wired as a full page.** The shared opcode
+foundation and the assembler are committed and green (66 tests across the
+suite; typecheck and production build clean). The 65C816 editor lives on its
+own full page — `?asm=1`, reached from the "⌨ Assembler" transport button —
+because a debugger panel was too cramped to write and review code in. The
+old panel has been removed from the debugger.
 
 Commits, in order:
 
@@ -10,11 +13,12 @@ Commits, in order:
   `test/disasm.test.ts`, `src/core/mock-core.ts`
 - `37f78c1` — the assembler: `src/asm/assembler.ts`, `test/asm.test.ts`,
   plus the BRK addition to `MASK_OPS`
-- (3rd commit) — the Assembler panel in `src/debug/debugger.ts`
+- (this change) — the full-page assembler: new `src/ui/assembler.ts`
+  (`mountAssembler`), the `?asm=1` route + `asmBtn` handler in `src/main.ts`,
+  the "⌨ Assembler" button in `src/ui/app.ts`, and the Assembler panel
+  **removed** from `src/debug/debugger.ts`
 
 ## Done
-
-### `src/asm/opcode.ts` (new) — single source of truth
 
 ### `src/asm/opcode.ts` (new) — single source of truth
 
@@ -119,25 +123,39 @@ a branch-heavy program (labels, `BRL`, self-referential `BNE +0`).
 - MockCore's seed program re-encoded to match (BNE is now 2 bytes,
   `STA $0200` is `8D 00 02`). `mock-core.test.ts` still passes.
 
-## Assembler panel (debugger) — `src/debug/debugger.ts`
+## Assembler page — `src/ui/assembler.ts` (`?asm=1`)
 
-The UI: a panel between Memory and Save states.
+A dedicated full page (not a debugger panel) — full-width editor on the left,
+live assembled listing on the right — enough room to actually author and
+review code. Reached from the "⌨ Assembler" transport button, which sets
+`?asm=1`; `main.ts` routes it **before** the full emulator boot.
 
-- Paste 65C816 source into a textarea (pre-filled with a small loop) and
-  pick a bank/addr — default WRAM `$7E:8000`, because bank `$00` is ROM
-  and unwritable on hardware.
-- **Assemble** → either a per-line listing (address, bytes, source — from
-  the assembler's `lines` result) or the line-numbered errors; the Write
-  button stays disabled until an assemble succeeds.
+- **Boots only a core** (no audio, no renderer): the page needs
+  `writeMem`/`readMem`, and the full boot path throws on a non-secure origin
+  (no `AudioWorklet`), so the assembler stays usable anywhere the emulator
+  might not. The default ROM loads best-effort so the real core is `ready`;
+  on the mock the writes always land in its banked RAM.
+- Paste 65C816 source (pre-filled with a small loop) and pick a bank/addr —
+  default WRAM `$7E:8000`, because bank `$00` is ROM and unwritable on
+  hardware.
+- **Assemble** (or live-assemble as you type, 300 ms debounce) → a per-line
+  listing (address, bytes, source — from the assembler's `lines` result) or
+  the line-numbered errors; Write stays disabled until an assemble succeeds.
 - **Write** → `SnesCore.writeMem(bank, addr, bytes)` copies the bytes into
-  the live core (works on both the wasm core and the mock), then the
-  Memory panel jumps to the written block. For that, `buildMemToolbar`
-  now returns its region-select + offset widgets.
+  the live core (wasm core and mock both work), then `readMem` confirms the
+  bytes actually landed (✓ / MISMATCH) and renders a hex dump.
+- **Read back** → hex-dumps the current memory at the target, independent of
+  a successful assemble.
+- "← Back to game" strips the param and reboots the emulator.
+
+The debugger's old Assembler panel (and its `buildMemToolbar` return-value
+change that only the panel needed) is gone — `src/debug/debugger.ts` is back
+to its five core panels.
 
 ## Not done
 
 - **Executing the written code is not wired up.** The core ABI exposes
-  registers read-only — there is no PC setter — so the panel can place
+  registers read-only — there is no PC setter — so the page can place
   code in WRAM but cannot make the CPU start there. That would be a shim
   addition, and per the three-way sync rule it would need to be added to
   `wasm-core.ts` and `core/build.sh`'s `EXPORTED_FUNCTIONS` at the same

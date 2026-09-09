@@ -9,6 +9,7 @@ import { TouchController } from './runtime/touch';
 import { FrameLoop } from './runtime/frame-loop';
 import { buildUi } from './ui/app';
 import { mountBindings } from './ui/bindings';
+import { mountAssembler } from './ui/assembler';
 import { mountDebug } from './debug/debugger';
 import workletSource from './runtime/worklet.js?raw';
 
@@ -22,6 +23,15 @@ async function boot(): Promise<void> {
   // and is re-read by InputManager on the next emulator boot.
   if (new URLSearchParams(location.search).get('bindings') === '1') {
     mountBindings(mountEl);
+    return;
+  }
+
+  // Assembler page (?asm=1), reached from the "Assembler" button. A standalone
+  // editor for 65C816 — unlike the bindings page it boots a core (no
+  // audio/renderer) so Write / Read-back can reach the live memory. The default
+  // ROM loads best-effort inside mountAssembler so the real core is ready.
+  if (new URLSearchParams(location.search).get('asm') === '1') {
+    await mountAssembler(mountEl, await createCore());
     return;
   }
 
@@ -215,6 +225,13 @@ async function boot(): Promise<void> {
   ui.bindingsBtn.addEventListener('click', () => {
     const url = new URL(location.href);
     url.searchParams.set('bindings', '1');
+    location.href = url.toString();
+  });
+  // Opens the 65C816 assembler page (?asm=1). "Back to game" there strips the
+  // param, so the emulator reboots with whatever state it had.
+  ui.asmBtn.addEventListener('click', () => {
+    const url = new URL(location.href);
+    url.searchParams.set('asm', '1');
     location.href = url.toString();
   });
   // Touch escape hatch for focus mode (Esc/F1 don't exist on a phone).

@@ -1,18 +1,19 @@
 import type { MemoryRegion, SnesCore } from '../core/types';
 import { MEMORY_REGIONS } from '../core/types';
-import { assemble } from '../asm/assembler';
 import { disassembleRange, makeCoreReader } from './disasm';
 import { findBytes, parseHexBytes, toHexRows, HEX_COLS } from './memory-view';
 import { SaveStateManager, type DebugHandle } from './savestate';
 
 /**
- * The in-app debugger. Fills the `#debug` slot with six panels:
+ * The in-app debugger. Fills the `#debug` slot with five panels:
  *   1. Registers   (A X Y S P PC DBR DPR + decoded flags)
  *   2. Disassembly (window around the current PC, 65C816)
  *   3. Memory      (region selector + hex dump + byte search)
- *   4. Assembler   (paste 65C816 source → assemble → write to WRAM/SRAM)
- *   5. Save states (capture, restore, diff)
- *   6. Breakpoints (add / remove)
+ *   4. Save states (capture, restore, diff)
+ *   5. Breakpoints (add / remove)
+ *
+ * The 65C816 assembler lives on its own full page (src/ui/assembler.ts,
+ * ?asm=1), not here — the panel was too cramped to write/review code in.
  *
  * The heavy lifting lives in the pure modules (../asm, ./disasm,
  * ./memory-view, ./savestate); this file is only DOM + wiring, so it returns
@@ -51,12 +52,7 @@ export function mountDebug(container: HTMLElement, core: SnesCore): DebugHandle 
   const memPanel = panel('Memory', container);
   const memToolbar = memPanel('toolbar');
   const memBody = memPanel('body');
-  const memSel = buildMemToolbar(memToolbar);
-
-  const asmPanel = panel('Assembler', container);
-  const asmToolbar = asmPanel('toolbar');
-  const asmBody = asmPanel('body');
-  buildAsmPanel(asmToolbar, asmBody, memSel);
+  buildMemToolbar(memToolbar);
 
   const savePanel = panel('Save states', container);
   const saveToolbar = savePanel('toolbar');
@@ -197,7 +193,7 @@ export function mountDebug(container: HTMLElement, core: SnesCore): DebugHandle 
   }
 
   // --- build toolbars ---------------------------------------------------
-  function buildMemToolbar(bar: HTMLElement): { sel: HTMLSelectElement; off: HTMLInputElement } {
+  function buildMemToolbar(bar: HTMLElement): void {
     const sel = document.createElement('select');
     sel.className = 'memsel';
     MEMORY_REGIONS.forEach((r) => {
@@ -265,117 +261,6 @@ export function mountDebug(container: HTMLElement, core: SnesCore): DebugHandle 
       renderMem();
     });
     bar.appendChild(find);
-
-    // The Assembler panel needs these to jump the view to a written block.
-    return { sel, off };
-  }
-
-  function buildAsmPanel(
-    bar: HTMLElement,
-    body: HTMLElement,
-    memSel: { sel: HTMLSelectElement; off: HTMLInputElement },
-  ): void {
-    body.style.maxHeight = '380px';
-
-    const bankIn = document.createElement('input');
-    bankIn.className = 'asmbank';
-    bankIn.placeholder = 'bank (hex)';
-    bankIn.value = '7e'; // WRAM — bank $00 is ROM and unwritable on hardware
-    bar.appendChild(bankIn);
-
-    const addrIn = document.createElement('input');
-    addrIn.className = 'asmaddr';
-    addrIn.placeholder = 'addr (hex)';
-    addrIn.value = '8000';
-    bar.appendChild(addrIn);
-
-    const asmBtn = btn('Assemble', doAssemble);
-    bar.appendChild(asmBtn);
-    const write = btn('Write', doWrite);
-    write.disabled = true;
-    bar.appendChild(write);
-
-    const stat = document.createElement('div');
-    stat.className = 'asmstat dim';
-    stat.textContent = 'Assemble, then Write copies the bytes into the live core.';
-    body.appendChild(stat);
-
-    const ta = document.createElement('textarea');
-    ta.className = 'asmsrc';
-    ta.rows = 8;
-    ta.spellcheck = false;
-    ta.value = ASM_EXAMPLE;
-    body.appendChild(ta);
-
-    const out = document.createElement('div');
-    out.className = 'asmout';
-    body.appendChild(out);
-
-    let last: { bytes: Uint8Array; bank: number; addr: number } | null = null;
-
-    function target(): { bank: number; addr: number } | string {
-      const bank = parseInt(bankIn.value || '0', 16);
-      const addr = parseInt(addrIn.value || '0', 16);
-      if (!Number.isFinite(bank) || bank < 0 || bank > 0xff) return 'bank must be hex $00–$FF (e.g. 7e)';
-      if (!Number.isFinite(addr) || addr < 0 || addr > 0xffff) return 'addr must be hex $0000–$FFFF (e.g. 8000)';
-      return { bank, addr };
-    }
-
-    const fmtTarget = (bank: number, addr: number): string =>
-      `$${bank.toString(16).padStart(2, '0').toUpperCase()}:${addr.toString(16).padStart(4, '0').toUpperCase()}`;
-
-    function doAssemble(): void {
-      const t = target();
-      if (typeof t === 'string') {
-        stat.className = 'asmstat err';
-        stat.textContent = t;
-        write.disabled = true;
-        return;
-      }
-      const r = assemble(ta.value, (t.bank << 16) | t.addr);
-      if (!r.ok) {
-        last = null;
-        write.disabled = true;
-        stat.className = 'asmstat err';
-        stat.textContent = r.errors.map((e) => `line ${e.line}: ${e.message}`).join(' · ');
-        out.innerHTML = '';
-        return;
-      }
-      last = { bytes: r.bytes, bank: t.bank, addr: t.addr };
-      write.disabled = false;
-      stat.className = 'asmstat';
-      stat.textContent = `${r.bytes.length} bytes at ${fmtTarget(t.bank, t.addr)} — press “Write” to copy them into live memory.`;
-      const rows = r.lines
-        .map((l) => {
-          const addr = (r.origin + l.offset) >>> 0;
-          const hex = l.bytes.map((b) => b.toString(16).padStart(2, '0')).join(' ');
-          const text = l.label ? `${l.label}:` : `${l.mnemonic} ${l.operand}`.trim();
-          return `<div class="arow"><span class="a">${addr.toString(16).padStart(6, '0').toUpperCase()}</span><span class="b">${hex}</span><span class="m">${escapeHtml(text)}</span></div>`;
-        })
-        .join('');
-      out.innerHTML =
-        '<div class="arow dh"><span class="a">addr</span><span class="b">bytes</span><span class="m">source</span></div>' + rows;
-    }
-
-    function doWrite(): void {
-      if (!last) return;
-      const { bytes, bank, addr } = last;
-      core.writeMem(bank, addr, bytes);
-      // Jump the Memory panel to the block we just wrote, if it is one of
-      // the browsable regions.
-      const region = MEMORY_REGIONS.find(
-        (rg) => rg.bank === bank && addr >= rg.base && addr + bytes.length <= rg.base + rg.size,
-      );
-      if (region) {
-        state.region = region;
-        state.offset = Math.max(0, addr - region.base);
-        memSel.sel.value = region.name;
-        memSel.off.value = state.offset.toString(16);
-        renderMem();
-      }
-      stat.className = 'asmstat';
-      stat.textContent = `Wrote ${bytes.length} bytes to ${fmtTarget(bank, addr)} — the Memory panel is pointing at it.`;
-    }
   }
 
   function buildSaveToolbar(bar: HTMLElement): void {
@@ -480,20 +365,6 @@ function btn(label: string, fn: () => void): HTMLButtonElement {
 
 const EXTRA_CSS = `
 .debug .body { max-height: 240px; overflow: auto; }
-.debug .asmsrc { width: 100%; min-height: 120px; resize: vertical; background: #141418; color: #e8e8ea;
-  border: 1px solid #33333c; border-radius: 4px; padding: 6px 8px;
-  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.debug .asmstat { font: 12px ui-monospace, monospace; color: #e8e8ea; }
-.debug .asmstat.dim { color: #8a8a92; }
-.debug .asmstat.err { color: #ff8a8a; }
-.debug .arow {
-  display: grid; grid-template-columns: 70px 130px 1fr; gap: 8px;
-  align-items: baseline; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-.debug .arow.dh { color: #8a8a92; border-bottom: 1px solid #2a2a30; }
-.debug .arow .a { color: #8a8a92; }
-.debug .arow .b { color: #9ad0ff; }
-.debug .arow .m { color: #d8d8dc; white-space: pre-wrap; }
 .debug .panel { display: flex; flex-direction: column; gap: 6px; }
 .debug .toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .debug .toolbar select, .debug .toolbar input { max-width: 160px; }
@@ -513,15 +384,3 @@ const EXTRA_CSS = `
 .debug .slot .restore { background: #1c1c22; color: #e8e8ea; border: 1px solid #33333c;
   border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 12px; }
 `;
-
-/** Pre-fill for the Assembler panel — a small, self-contained loop. */
-const ASM_EXAMPLE = [
-  '; Count A up to $10, then store it in WRAM $10.',
-  '; Targets WRAM $7E:8000 by default — Assemble, then Write.',
-  'LDA #$00',
-  'again: INCA',
-  'CMP #$10',
-  'BNE again',
-  'STA $10',
-  'RTS',
-].join('\n');
