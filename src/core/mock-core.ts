@@ -70,11 +70,11 @@ export class MockCore implements SnesCore {
   }
 
   private seedProgram(): void {
-    // A2 00 / E8 / CA / D0 02 / A9 FF / 8D 00 02 / 40
+    // A2 00 / E8 / CA / D0 02 / A9 FF / 8D 00 02 / 60
     //   LDX #$00  INX  DEX  BNE +2  LDA #$FF  STA $0200  RTS
     // BNE is 8-bit relative (2 bytes), STA $0200 is absolute (3 bytes).
-    // $40 is RTS on the 65C816 — the C816 swaps RTS/RTI vs the 6502.
-    const bytes = [0xa2, 0x00, 0xe8, 0xca, 0xd0, 0x02, 0xa9, 0xff, 0x8d, 0x00, 0x02, 0x40];
+    // $60 is RTS on the 65C816 (RTI is $40) — the same as the 6502.
+    const bytes = [0xa2, 0x00, 0xe8, 0xca, 0xd0, 0x02, 0xa9, 0xff, 0x8d, 0x00, 0x02, 0x60];
     for (let i = 0; i < bytes.length; i++) this.mem[0][0x8000 + i] = bytes[i];
   }
 

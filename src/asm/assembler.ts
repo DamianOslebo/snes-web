@@ -240,6 +240,15 @@ function parseOperand(num: number, mnem: string, s: string): Operand {
     return { kind: 'imm', value: v & 0xffff };
   }
 
+  // Stack-relative: (S) or (S)+$NN — a single 8-bit offset added to S. The
+  // disassembler prints this form, so parsing it is what round-trips.
+  if (/^\(S\)/.test(t) || /^\(S\)\+/.test(t)) {
+    requireMode(num, mnem, 'sr');
+    const v = t.length > 3 ? parseNum(num, t.slice(4), '(S) offset') : 0;
+    if (v > 0xff) throw new AsmFail(num, `(S) offset $${hex(v, 4)} does not fit in a byte`);
+    return { kind: 'addr', mode: 'sr', value: v & 0xff };
+  }
+
   // Indirect: (abs) | (zp,X) | (zp),Y — the ,Y of the third form sits OUTSIDE
   // the parens, so match on the opening paren and accept both closings.
   if (t[0] === '(' && (t.endsWith(')') || t.endsWith('),Y'))) {
@@ -314,10 +323,13 @@ function parseOperand(num: number, mnem: string, s: string): Operand {
   if (/^\$[0-9a-fA-F]+$/.test(t)) hexDigits = t.length - 1;
   else if (/^0[xX][0-9a-fA-F]+$/.test(t)) hexDigits = t.length - 2;
   const wide = hexDigits === -1 ? v > 0xff : hexDigits >= 3;
-  // 65C816 has no zp,Y form, so an indexed-Y operand is always absolute,Y.
+  // Indexed Y is zero-page,Y when written 2-digit ($10,Y) and absolute,Y when
+  // written 3-4-digit ($0010,Y) — exactly the way indexed X classifies. The
+  // 65C816 has a zp,Y form only on LDX/STX; requireMode below rejects a
+  // zero-page,Y operand for any mnemonic that lacks it (e.g. an ALU op).
   const mode: AddrMode =
-    indexed === 'y' ? 'absy'
-    : indexed === 'x' ? (wide ? 'absx' : 'zpx')
+    indexed === 'x' ? (wide ? 'absx' : 'zpx')
+    : indexed === 'y' ? (wide ? 'absy' : 'zpy')
     : (wide ? 'abs' : 'zp');
   requireMode(num, mnem, mode);
   return { kind: 'addr', mode, value: v & 0xffff, indexed };
@@ -353,8 +365,9 @@ function requireMode(num: number, mnem: string, mode: AddrMode): void {
 
 function describeMode(mode: AddrMode): string {
   return { imp: 'implied', imm: 'immediate', zp: 'zero-page', zpx: 'zero-page,X',
-           abs: 'absolute', absx: 'absolute,X', absy: 'absolute,Y', ind: 'indirect',
-           indx: 'indexed-indirect', indy: 'indexed-indirect,Y', rel: 'relative branch',
+           zpy: 'zero-page,Y', abs: 'absolute', absx: 'absolute,X', absy: 'absolute,Y',
+           ind: 'indirect', indx: 'indexed-indirect', indy: 'indexed-indirect,Y',
+           sr: 'stack-relative (S)', rel: 'relative branch',
            rel16: '16-bit branch', long: 'long (banked)' }[mode];
 }
 
@@ -411,8 +424,9 @@ function sizeOfLine(ln: Line, origin: number, labelOffset: Map<string, number>):
       const lo = labelOffset.get(op.label!);
       if (lo === undefined) return 3;             // worst case; layout reports the error
       const abs = (origin + lo) & 0xffff;
-      if (op.indexed === 'y') return 3;           // 65C816 has no zp,Y
-      return abs <= 0xff ? 2 : 3;                 // zp/zpx or abs/absx
+      // Indexed (,X / ,Y) or plain: 2 bytes if the value fits zero page
+      // (zp/zpx/zpy), 3 otherwise (abs/absx/absy).
+      return abs <= 0xff ? 2 : 3;
     }
   }
   return 0;
@@ -499,8 +513,12 @@ function encodeLine(ln: Line, origin: number, labelOffset: Map<string, number>, 
       if (lo === undefined) throw new AsmFail(ln.num, `undefined label "${op.label}"`);
       const abs = (origin + lo) & 0xffff;
       addr = abs;
-      mode = op.indexed === 'y' ? 'absy'          // 65C816 has no zp,Y
-           : op.indexed === 'x' ? (abs <= 0xff ? 'zpx' : 'absx')
+      // Classify by resolved width, symmetric for ,X and ,Y: 2-digit (≤$FF)
+      // → zero-page form, else absolute. A label that lands in the zero page
+      // with an index becomes zp,X or zp,Y; requireMode rejects any mnemonic
+      // that lacks that form.
+      mode = op.indexed === 'x' ? (abs <= 0xff ? 'zpx' : 'absx')
+           : op.indexed === 'y' ? (abs <= 0xff ? 'zpy' : 'absy')
            : (abs <= 0xff ? 'zp' : 'abs');
       requireMode(ln.num, mnem, mode);
     } else {
@@ -529,8 +547,10 @@ function encodeLine(ln: Line, origin: number, labelOffset: Map<string, number>, 
     }
     case 'zp':
     case 'zpx':
+    case 'zpy':
     case 'indx':
     case 'indy':
+    case 'sr':
       out.push(addr & 0xff);
       break;
     case 'abs':

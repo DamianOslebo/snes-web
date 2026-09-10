@@ -1,7 +1,7 @@
 # 65C816 Assembler — progress & TODO
 
 Status: **done, committed, and wired as a full page.** The shared opcode
-foundation and the assembler are committed and green (66 tests across the
+foundation and the assembler are committed and green (69 tests across the
 suite; typecheck and production build clean). The 65C816 editor lives on its
 own full page — `?asm=1`, reached from the "⌨ Assembler" transport button —
 because a debugger panel was too cramped to write and review code in. The
@@ -26,9 +26,17 @@ One canonical 65C816 (SNES 5A22) opcode table read by **both** the
 disassembler and the assembler, so decode and encode can never drift apart.
 
 - Every entry cross-checked against snes9x's `S9xOpcodesM1X1` /
-  `S9xOpLengthsM1X1` tables. Opcodes we're not certain about are left out
-  and decode as `??` — per the CLAUDE.md safety principle (safe-`??` over
-  mislabeling). One known deliberate omission: `STZ` absolute (`$92`).
+  `S9xOpLengthsM1X1` dispatch + length tables and WDC "Programming the 65816"
+  Ch.19 (the flat $00–$FF instruction matrix). Opcodes we're not certain
+  about are left out and decode as `??` — per the CLAUDE.md safety principle
+  (safe-`??` over mislabeling). The deliberate omissions (all decode as `??`):
+  the implied-indexed-indirect ALU family (obscure + mode-fragile), WDM
+  ($42 — WDC-proprietary, not on SNES 5A22 silicon), MVP/MVN ($44/$54 — rare
+  block moves), and the Absolute-Indexed-Long exotic family.
+- Confirmed, not guessed: the return opcodes are **`RTS`=`$60` and `RTI`=`$40`
+  — identical to the 6502, no 65C816 swap** (WDC Ch.19 matrix: "40 RTI",
+  "60 RTS"). This was the source of an earlier false "C816 swaps RTS/RTI"
+  claim that had leaked into the mock seed and a couple of test comments.
 - Collision detection: registering the same opcode byte twice throws.
 - Exports:
   - `OPCODES` — decode table (byte → `{mnem, mode}`)
@@ -59,6 +67,10 @@ This also **fixed real mislabels** in the old table:
   `$2B`), `TSK` at `$2B` was wrong (that's `PLD`), `REP`/`SEP` were
   `$02`/`$03` (now `$C2`/`$E2`), and the C816 transfers (`TCS`/`TCD`/`TDC`,
   `TXY`, `TYX`, `XBA`, `XCE`, `PHY`/`PLY`) are now covered.
+- Extended to the full 5A22 set the old table lacked: the `(S)` stack-relative
+  ALU family, zero-page,Y (`LDX`/`STX` only), `STZ` absolute + absolute,X,
+  the `ROL` memory forms, `TSB`/`TRB`, `BIT` immediate + zero-page,X,
+  `DEC`/`INC` absolute,X, and the long/stack-control ops `PER`/`PEA`/`PEI`.
 
 ### `src/asm/assembler.ts` (new) — the assembler
 
@@ -66,11 +78,12 @@ This also **fixed real mislabels** in the old table:
 testable on its own.
 
 - **Syntax:** every shared-table instruction in every mode it supports;
-  immediates `#$NN`/`#$NNNN`; addresses `$NN`/`$NNNN` with optional `,X`/`,Y`;
-  indirects `($NN)`, `($NN,X)`, `($NN),Y`; banked `$C0:0301`; branch labels,
-  `$bank:addr` targets, and explicit offsets `+$NN`/`-$NN`; directives
-  `.byte`/`.db`, `.word`/`.dw`, `.ascii`/`.asciz`/`.text`; comments `;` and
-  `//`.
+  immediates `#$NN`/`#$NNNN`; addresses `$NN`/`$NNNN` with optional `,X`/`,Y`
+  (`,`Y is only valid where the table allows it — `LDX`/`STX` zero-page,Y);
+  indirects `($NN)`, `($NN,X)`, `($NN),Y`; stack-relative `(S)` / `(S)+$NN`;
+  banked `$C0:0301`; branch labels, `$bank:addr` targets, and explicit
+  offsets `+$NN`/`-$NN`; directives `.byte`/`.db`, `.word`/`.dw`,
+  `.ascii`/`.asciz`/`.text`; comments `;` and `//`.
 - **Labels:** two-pass resolution — the second pass is a fixed-point sweep
   over label offsets that is *monotone* (offsets only shrink from the
   worst-case seed, so termination is guaranteed; a 10,000-pass cap throws
@@ -100,7 +113,7 @@ testable on its own.
   label) and `modeTrace` the per-line a16/x16/y16 state — both ready to
   drive a listing UI.
 
-### `test/asm.test.ts` (new) — 19 tests, all green
+### `test/asm.test.ts` (new) — 20 tests, all green
 
 Known-vector encoding of every addressing form; width-as-written
 classification; forward/backward label branches (8-bit and BRL); the
@@ -113,13 +126,15 @@ And the payoff of the shared table — **assemble → disassemble →
 reassemble → byte-identical**: the round-trip helper runs the assembled
 bytes through `disassembleRange`, then reassembles each instruction's
 *disassembler text* at that instruction's own address and demands
-byte-identity with the original output. Covers all 12 addressing forms and
-a branch-heavy program (labels, `BRL`, self-referential `BNE +0`).
+byte-identity with the original output. Covers all 12 addressing forms, a
+branch-heavy program (labels, `BRL`, self-referential `BNE +0`), and a
+13-instruction pass over the extended set — `(S)`, zero-page,Y, `STZ`
+absolute/absolute,X, `ROL`, `TSB`/`TRB`, `BIT #imm`, `PER`, and `WAI`/`STP`.
 
 ### `test/disasm.test.ts` + `src/core/mock-core.ts` — updated, passing
 
 - Disasm tests rewritten to the corrected encodings; new BRL test and
-  expanded C816 stack/register-transfer coverage (7 tests, all green).
+  expanded C816 stack/register-transfer coverage (9 tests, all green).
 - MockCore's seed program re-encoded to match (BNE is now 2 bytes,
   `STA $0200` is `8D 00 02`). `mock-core.test.ts` still passes.
 
@@ -167,8 +182,8 @@ to its five core panels.
 ## Verify
 
 ```bash
-npx vitest run test/asm.test.ts      # 19 tests (incl. round-trips)
-npx vitest run test/disasm.test.ts   # 7 tests
-npx vitest run                       # full suite: 66 tests
+npx vitest run test/asm.test.ts      # 20 tests (incl. round-trips)
+npx vitest run test/disasm.test.ts   # 9 tests
+npx vitest run                       # full suite: 69 tests
 npm run typecheck
 ```

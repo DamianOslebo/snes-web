@@ -31,10 +31,10 @@ describe('65C816 disassembler', () => {
     // D0 02     BNE +2        (8-bit relative → $00:8008, target = pc+2+2)
     // A9 FF     LDA #$FF
     // 8D 00 02  STA $0200     (absolute, 3 bytes)
-    // 40        RTS           (65C816: RTS is $40 and RTI is $60 — swapped
-    //                          relative to the 6502)
+    // 60        RTS           (65C816: RTS is $60 and RTI is $40 — the same
+    //                          as the 6502, no swap)
     // (Same program the MockCore seeds at $00:8000.)
-    const bytes = new Uint8Array([0xa2, 0x00, 0xe8, 0xca, 0xd0, 0x02, 0xa9, 0xff, 0x8d, 0x00, 0x02, 0x40]);
+    const bytes = new Uint8Array([0xa2, 0x00, 0xe8, 0xca, 0xd0, 0x02, 0xa9, 0xff, 0x8d, 0x00, 0x02, 0x60]);
     const r = readerFrom(bytes);
     const ins = disassembleRange(PC, r, 7);
 
@@ -73,6 +73,22 @@ describe('65C816 disassembler', () => {
     expect(ins.size).toBe(4);
   });
 
+  it('formats the (S) stack-relative and zero-page,Y operands', () => {
+    // (S) is a 1-byte offset: ORA (S)+$10 → 03 10 (2 bytes).
+    let ins = disassemble(PC, readerFrom(new Uint8Array([0x03, 0x10])));
+    expect(ins.mnemonic).toBe('ORA');
+    expect(ins.operand).toBe('(S)+$10');
+    expect(ins.size).toBe(2);
+    // LDX zero-page,Y → b6 10 (2 bytes); the 4-digit form is absolute,Y → 3 bytes.
+    ins = disassemble(PC, readerFrom(new Uint8Array([0xb6, 0x10])));
+    expect(ins.operand).toBe('$10,Y');
+    expect(ins.size).toBe(2);
+    ins = disassemble(PC, readerFrom(new Uint8Array([0xb9, 0x10, 0x00])));
+    expect(ins.mnemonic).toBe('LDA');
+    expect(ins.operand).toBe('$0010,Y');
+    expect(ins.size).toBe(3);
+  });
+
   it('decodes the C816 extra stack and register-transfer ops', () => {
     const cases: [number, string][] = [
       [0x48, 'PHA'],
@@ -106,11 +122,64 @@ describe('65C816 disassembler', () => {
   });
 
   it('flags illegal / undocumented opcodes with size 1', () => {
-    // $4E is not a defined instruction in our table.
-    const ins = disassemble(PC, readerFrom(new Uint8Array([0x4e, 0, 0])));
+    // $12 is an "implied-index indirect" slot we deliberately leave out of the
+    // table (obscure + mode-fragile), so it must decode as ?? rather than a
+    // guessed mnemonic — the safe-?? principle (see CLAUDE.md).
+    const ins = disassemble(PC, readerFrom(new Uint8Array([0x12, 0, 0])));
     expect(ins.illegal).toBe(true);
     expect(ins.size).toBe(1);
     expect(ins.mnemonic).toBe('??');
+  });
+
+  it('decodes the corrected + extended 65C816 set', () => {
+    const expectOp = (op: number, mnem: string, mode: string): void => {
+      const def = OPCODES[op];
+      expect(def, `opcode $${op.toString(16)}`).toBeTruthy();
+      expect(def!.mnem).toBe(mnem);
+      expect(def!.mode).toBe(mode);
+    };
+    // returns — RTS=$60 and RTI=$40, exactly as on the 6502 (no swap).
+    expectOp(0x40, 'RTI', 'imp');
+    expectOp(0x60, 'RTS', 'imp');
+    // system control
+    expectOp(0xcb, 'WAI', 'imp');
+    expectOp(0xdb, 'STP', 'imp');
+    // 0x26/0x2e are ROL (zp / abs), not BIT — the old table mislabeled both.
+    expectOp(0x26, 'ROL', 'zp');
+    expectOp(0x2e, 'ROL', 'abs');
+    expectOp(0x06, 'ASL', 'zp');
+    expectOp(0x46, 'LSR', 'zp');
+    expectOp(0x66, 'ROR', 'zp');
+    // BIT zp,X and BIT #imm are real 65C816; 0x89 is not "STA #imm".
+    expectOp(0x34, 'BIT', 'zpx');
+    expectOp(0x89, 'BIT', 'imm');
+    // test-and-set / test-and-reset
+    expectOp(0x04, 'TSB', 'zp');
+    expectOp(0x0c, 'TSB', 'abs');
+    expectOp(0x14, 'TRB', 'zp');
+    expectOp(0x1c, 'TRB', 'abs');
+    // LDX/STX zero-page,Y (the only zp,Y forms); LDY/STX-Y absolute stays absy.
+    expectOp(0xb6, 'LDX', 'zpy');
+    expectOp(0x96, 'STX', 'zpy');
+    expectOp(0xbe, 'LDX', 'absy');
+    // STZ absolute + absolute,X; DEC/INC absolute,X.
+    expectOp(0x9c, 'STZ', 'abs');
+    expectOp(0x9e, 'STZ', 'absx');
+    expectOp(0xde, 'DEC', 'absx');
+    expectOp(0xfe, 'INC', 'absx');
+    // the corrected abs-X / abs-Y assignment on the ALU grid.
+    expectOp(0xbd, 'LDA', 'absx');
+    expectOp(0xb9, 'LDA', 'absy');
+    expectOp(0x01, 'ORA', 'indx');
+    expectOp(0x11, 'ORA', 'indy');
+    // (S) stack-relative ALU — a 1-byte offset.
+    expectOp(0x03, 'ORA', 'sr');
+    expectOp(0xa3, 'LDA', 'sr');
+    // 65C816 long / stack control.
+    expectOp(0x5c, 'JMP', 'long');
+    expectOp(0x62, 'PER', 'rel16');
+    expectOp(0xf4, 'PEA', 'abs');
+    expectOp(0xd4, 'PEI', 'zp');
   });
 
   it('covers the 6502-compatible core ops', () => {
@@ -123,9 +192,9 @@ describe('65C816 disassembler', () => {
     expectOp(0x00, 'BRK', 'imm'); // 1-byte dummy operand; core consumes 2 bytes
     expectOp(0x20, 'JSR', 'abs');
     expectOp(0x4c, 'JMP', 'abs');
-    expectOp(0x60, 'RTI', 'imp');
+    expectOp(0x60, 'RTS', 'imp');
     expectOp(0x24, 'BIT', 'zp');
-    expectOp(0x2e, 'BIT', 'absx');
+    expectOp(0x2e, 'ROL', 'abs');
     expectOp(0xa2, 'LDX', 'imm');
     expectOp(0xc0, 'CPY', 'imm');
     expectOp(0xe0, 'CPX', 'imm');
@@ -136,9 +205,10 @@ describe('65C816 disassembler', () => {
     expectOp(0xa5, 'LDA', 'zp');
     expectOp(0x85, 'STA', 'zp');
     expectOp(0xad, 'LDA', 'abs');
-    expectOp(0xbd, 'LDA', 'absy');
-    expectOp(0x01, 'ORA', 'indy');
-    expectOp(0x11, 'ORA', 'indx');
+    expectOp(0xbd, 'LDA', 'absx');
+    expectOp(0xb9, 'LDA', 'absy');
+    expectOp(0x01, 'ORA', 'indx');
+    expectOp(0x11, 'ORA', 'indy');
     expectOp(0x2d, 'AND', 'abs');
     expectOp(0x69, 'ADC', 'imm');
     expectOp(0xc9, 'CMP', 'imm');

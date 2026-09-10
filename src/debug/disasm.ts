@@ -59,6 +59,8 @@ function formatOperand(mode: AddrMode, pc: number, r: MemReader): string {
       return `$${zp(pc + 1)}`;
     case 'zpx':
       return `$${zp(pc + 1)},X`;
+    case 'zpy':
+      return `$${zp(pc + 1)},Y`;
     case 'abs':
       return `$${abs(pc + 1)}`;
     case 'absx':
@@ -83,6 +85,9 @@ function formatOperand(mode: AddrMode, pc: number, r: MemReader): string {
       return `($${zp(pc + 1)},X)`;
     case 'indy':
       return `($${zp(pc + 1)}),Y`;
+    case 'sr':
+      // Stack-relative: the operand is a single 8-bit offset added to S.
+      return `(S)+$${zp(pc + 1)}`;
   }
 }
 
