@@ -7,7 +7,7 @@ import { SaveStateManager, type DebugHandle } from './savestate';
 /**
  * The in-app debugger. Fills the `#debug` slot with five panels:
  *   1. Registers   (A X Y S P PC DBR DPR + decoded flags)
- *   2. Disassembly (window around the current PC, 65C816)
+ *   2. Disassembly (16 insns at the current PC — or a jumped-to address — 65C816)
  *   3. Memory      (region selector + hex dump + byte search)
  *   4. Save states (capture, restore, diff)
  *   5. Breakpoints (add / remove)
@@ -39,6 +39,9 @@ export function mountDebug(container: HTMLElement, core: SnesCore): DebugHandle 
   container.appendChild(style);
 
   const state: PState = { region: MEMORY_REGIONS[0], offset: 0 };
+  // Where the disasm window is pinned. null = follow the live PC (the default);
+  // a number = disassemble from that 24-bit address, held across refreshes.
+  let disAddr: number | null = null;
   let bplist = new Set<string>(); // "bank:addr"
   core.listBreakpoints().forEach((b) => bplist.add(key(b.bank, b.addr)));
 
@@ -47,7 +50,9 @@ export function mountDebug(container: HTMLElement, core: SnesCore): DebugHandle 
   const regBody = regPanel('body');
 
   const disPanel = panel('Disassembly', container);
+  const disToolbar = disPanel('toolbar');
   const disBody = disPanel('body');
+  buildDisToolbar(disToolbar);
 
   const memPanel = panel('Memory', container);
   const memToolbar = memPanel('toolbar');
@@ -84,15 +89,18 @@ export function mountDebug(container: HTMLElement, core: SnesCore): DebugHandle 
   function renderDisasm(): void {
     const r = core.readRegisters();
     const pc = r.pc & 0xffffff;
-    const ins = disassembleRange(pc, reader, DISASM_LINES);
-    const bytes = core.readMem(pc >>> 16, pc & 0xffff, Math.max(1, ins.reduce((a, i) => a + i.size, 0)));
+    const start = disAddr ?? pc; // pinned address, else follow the live PC
+    const ins = disassembleRange(start, reader, DISASM_LINES);
+    const bytes = core.readMem(start >>> 16, start & 0xffff, Math.max(1, ins.reduce((a, i) => a + i.size, 0)));
     const rows = ins
       .map((i, n) => {
         const off = ins.slice(0, n).reduce((a, x) => a + x.size, 0);
         const hex = Array.from(bytes.slice(off, off + i.size))
           .map((b) => b.toString(16).padStart(2, '0'))
           .join(' ');
-        const cls = n === 0 ? 'row cur' : 'row';
+        // Highlight the instruction at the real PC, even when the window is
+        // pinned elsewhere — the "cur" row means "where the CPU is", not row 0.
+        const cls = i.addr === pc ? 'row cur' : 'row';
         return `<div class="${cls}"><span class="a">${i.addr.toString(16).padStart(6, '0').toUpperCase()}</span><span class="b">${hex}</span><span class="m ${i.illegal ? 'il' : ''}">${i.mnemonic}</span><span class="o">${i.operand}</span></div>`;
       })
       .join('');
@@ -180,6 +188,19 @@ export function mountDebug(container: HTMLElement, core: SnesCore): DebugHandle 
     return { bank, addr };
   }
 
+  // A 24-bit disassembly target: either `bank:addr` (e.g. `C0:0301`) or a
+  // 1–6 digit hex address (e.g. `8000` → bank $00, offset $8000). The leading
+  // `$` is optional. Returns null on anything that isn't a valid address so
+  // the caller can just refocus and let the user fix it.
+  function parseDisAddr(input: string): number | null {
+    const t = input.trim().toLowerCase().replace(/\$/g, '');
+    const m1 = /^([0-9a-f]{1,2}):([0-9a-f]{1,4})$/.exec(t);
+    if (m1) return ((parseInt(m1[1], 16) << 16) | parseInt(m1[2], 16)) & 0xffffff;
+    const m2 = /^[0-9a-f]{1,6}$/.exec(t);
+    if (m2) return parseInt(m2[0], 16) & 0xffffff;
+    return null;
+  }
+
   function setBreakpoint(bank: number, addr: number): void {
     core.setBreakpoint(bank, addr);
     bplist.add(key(bank, addr));
@@ -193,6 +214,37 @@ export function mountDebug(container: HTMLElement, core: SnesCore): DebugHandle 
   }
 
   // --- build toolbars ---------------------------------------------------
+  function buildDisToolbar(bar: HTMLElement): void {
+    const input = document.createElement('input');
+    input.className = 'disin';
+    input.placeholder = 'addr (hex) or bank:addr';
+    input.spellcheck = false;
+    bar.appendChild(input);
+
+    bar.appendChild(
+      btn('Go', () => {
+        const a = parseDisAddr(input.value);
+        if (a === null) {
+          input.focus(); // leave the (invalid) text so it can be corrected
+          return;
+        }
+        disAddr = a;
+        input.value = a.toString(16);
+        renderDisasm();
+      }),
+    );
+
+    // "PC" drops the pin and re-syncs the field to the live program counter,
+    // returning the window to follow the CPU.
+    bar.appendChild(
+      btn('PC', () => {
+        disAddr = null;
+        input.value = (core.readRegisters().pc & 0xffffff).toString(16);
+        renderDisasm();
+      }),
+    );
+  }
+
   function buildMemToolbar(bar: HTMLElement): void {
     const sel = document.createElement('select');
     sel.className = 'memsel';
