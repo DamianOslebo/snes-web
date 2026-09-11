@@ -6,27 +6,40 @@
  * `core.loadRom` → render/audio), rather than `core.writeMem` into RAM (a dead
  * end, since the core ABI exposes the PC read-only and there is no PC setter).
  *
- * Layout (256 KB LoROM — the size and shape this emulator's reference ROM uses):
+ * Layout (256 KB LoROM — the size and shape this emulator's reference ROM in
+ * `test/cpu_test/` uses). The SNES cart header does NOT start at file offset
+ * $0000 — snes9x reads it at file offset **$7FB0** (`core/memmap.c`:
+ * `RomHeader = Memory.ROM + 0x7FB0`), and its load gate (memmap.c:1949) rejects
+ * a ROM whose `ROMSize` byte — `RomHeader[0x27]` = file **$7FD7** — is outside
+ * $07–$1E, or whose `SRAMSize` (`RomHeader[0x28]` = file $7FD8) exceeds 16. So
+ * the header bytes below are placed at their real file offsets, mirroring the
+ * known-working reference ROM field-for-field:
  *
- *   $0000–$00FF   standard SFC header (Mapper 0, no S-RAM, clean checksums)
- *   $7FC0         12-byte ASCII game title
- *   $7FFC         reset vector → $8000 (bytes 00 80) — the CPU jumps here on
- *   $7FFE         NMI vector   → $8000 (bytes 00 80) reset; the reset vector
- *                                                     is what `looksLikeSnesRom`
- *                                                     checks for (00 80 at $7FFC)
+ *   $7FB0         cart header base (RomHeader[0x00])
+ *   $7FB2         ROM id (4 ASCII bytes, informational)
+ *   $7FC0         ROM name / 12-byte ASCII title (RomHeader[0x10])
+ *   $7FD5         ROMSpeed  (RomHeader[0x25]) = $30
+ *   $7FD6         ROMType   (RomHeader[0x26]) = $00
+ *   $7FD7         ROMSize   (RomHeader[0x27]) = $08  — MUST be in $07–$1E
+ *   $7FD8         SRAMSize  (RomHeader[0x28]) = $00  — MUST be ≤ $10
+ *   $7FD9         ROMRegion (RomHeader[0x29]) = $00
+ *   $7FDA         CompanyId (RomHeader[0x2A]) = $00
+ *   $7FDC–$7FDF   16-bit complement + ROM checksums (RomHeader[0x2C..0x2F])
+ *   $7FFC         reset vector → $8000 (bytes 00 80) — what `looksLikeSnesRom`
+ *                 checks for and where the CPU starts on a cold boot
+ *   $7FFE         NMI vector   → $8000 (bytes 00 80)
  *   $8000         entry point — the assembled code is copied here
  *
- * `$7FFC` holds the 16-bit reset vector in little-endian order, so the value
- * `$8000` is stored as the byte pair `00 80`. Under LoROM mapping the ROM bank
- * `$00` maps 1:1 to file offsets `$00000–$0FFFF`, so address `$8000` is file
- * offset `$8000` — where the code lives. This is exactly the shape of the
- * working reference ROM in `test/cpu_test/` (reset vector `00 80` at `$7FFC`,
- * code at `$8000`), so the emitted image goes through the same path.
+ * `$7FFC` holds the 16-bit reset vector little-endian, so `$8000` is stored as
+ * the byte pair `00 80`. Under LoROM the ROM bank `$00` maps 1:1 to file
+ * offsets `$00000–$0FFFF`, so address `$8000` is file offset `$8000` — where
+ * the code lives. That is exactly the reference ROM's shape (header at $7FB0
+ * with a valid ROMSize at $7FD7, code at $8000), so the emitted image passes
+ * both the app's gate and snes9x's InitROM gate.
  *
- * The reference ROM carries a non-standard header (`$07`=`$a2`) yet still
- * loads, so snes9x is lenient about the header bytes. A clean, checksum-
- * correct standard header is the safe subset and makes the emitted `.sfc` a
- * portable, well-formed image.
+ * snes9x does not verify the checksums (the reference ROM's are 0x0000/0xFFFF
+ * yet it loads), but a well-formed image carries correct ones, so we compute
+ * the standard 16-bit pair for portability.
  *
  * Pure TS, no DOM — unit-testable in the node env like the rest of `src/asm/`.
  */
@@ -37,12 +50,31 @@ export const ROM_SIZE = 0x40000;
 export const ROM_ENTRY = 0x8000;
 /** 16-bit entry address the reset/NMI vectors point at (== ROM_ENTRY under LoROM). */
 const ENTRY_ADDR = ROM_ENTRY;
-/** Title slot (12 ASCII bytes). */
-const TITLE_ADDR = 0x7fc0;
-/** Reset-vector slot (bytes 00 80 → $8000). */
-const RESET_VECTOR_ADDR = 0x7ffc;
-/** NMI-vector slot. */
-const NMI_VECTOR_ADDR = 0x7ffe;
+
+// SNES cart-header field addresses (absolute file offsets, header base $7FB0).
+const HDR_ROM_ID = 0x7fb2; // 4 ASCII bytes (informational)
+const HDR_ROM_NAME = 0x7fc0; // 12 ASCII bytes (the title)
+const HDR_ROM_SPEED = 0x7fd5; // RomHeader[0x25]
+const HDR_ROM_TYPE = 0x7fd6; // RomHeader[0x26]
+const HDR_ROM_SIZE = 0x7fd7; // RomHeader[0x27] — the InitROM gate byte
+const HDR_SRAM_SIZE = 0x7fd8; // RomHeader[0x28]
+const HDR_ROM_REGION = 0x7fd9; // RomHeader[0x29]
+const HDR_COMPANY_ID = 0x7fda; // RomHeader[0x2A]
+const HDR_COMP_CHKSUM = 0x7fdc; // RomHeader[0x2C..0x2D], low byte first
+const HDR_ROM_CHKSUM = 0x7fde; // RomHeader[0x2E..0x2F], low byte first
+const RESET_VECTOR_ADDR = 0x7ffc; // reset vector → $8000
+const NMI_VECTOR_ADDR = 0x7ffe; // NMI vector → $8000
+
+// Header field values mirroring the known-working reference ROM
+// (test/cpu_test/cputest-basic.sfc). ROMSize $08 is inside the $07–$1E range
+// InitROM requires and SRAMSize $00 is ≤ $10, so the corrupt-ROM gate passes.
+const ROM_SPEED = 0x30;
+const ROM_TYPE = 0x00;
+const ROM_SIZE_FIELD = 0x08;
+const SRAM_SIZE_FIELD = 0x00;
+const ROM_REGION_FIELD = 0x00;
+const COMPANY_ID_FIELD = 0x00;
+
 /**
  * The code runs from the entry ($8000) to the end of the ROM; the header,
  * title, and vectors all sit before $8000, so nothing is clobbered.
@@ -50,9 +82,6 @@ const NMI_VECTOR_ADDR = 0x7ffe;
 const MAX_CODE = ROM_SIZE - ROM_ENTRY;
 /** sessionStorage key the assembler page uses to hand a built ROM to the app. */
 export const ASM_ROM_KEY = 'snes-asm-rom';
-/** SFC header: fixed identification bytes. */
-const SFC_M1 = 0x33;
-const SFC_M2 = 0xff;
 
 export interface BuildRomOptions {
   /** 12-byte ASCII game title (padded/truncated to fit the header slot). */
@@ -60,9 +89,12 @@ export interface BuildRomOptions {
 }
 
 /**
- * Wrap `code` in a 256 KB LoROM SFC image: clean header, code at $8000,
- * reset/NMI vectors ($8000), title, and correct ROM + header checksums. The
- * result satisfies `looksLikeSnesRom` (the app's pre-load gate).
+ * Wrap `code` in a 256 KB LoROM SFC image: a cart header at its real $7FB0
+ * location (with a valid ROMSize byte at $7FD7 so snes9x's InitROM gate passes),
+ * the code at $8000, reset/NMI vectors at $8000, a 12-byte title at $7FC0, and
+ * standard 16-bit checksums at $7FDC–$7FDF. The result satisfies both
+ * `looksLikeSnesRom` (the app's pre-load gate) and snes9x's own corrupt-ROM
+ * check (memmap.c:1949).
  */
 export function buildRom(code: Uint8Array, opts: BuildRomOptions = {}): Uint8Array {
   if (code.length === 0) throw new Error('buildRom: empty program');
@@ -75,27 +107,23 @@ export function buildRom(code: Uint8Array, opts: BuildRomOptions = {}): Uint8Arr
 
   const rom = new Uint8Array(ROM_SIZE);
 
-  // --- SFC header ($0000–$00FF) ------------------------------------------
-  rom[0x00] = 0x00; // S-RAM size: 00 = none (Mapper 0)
-  const code4 = 'ASM1'; // game code (informational)
-  for (let i = 0; i < 4; i++) rom[0x01 + i] = code4.charCodeAt(i);
-  rom[0x05] = 0x21; // maker code '!'
-  rom[0x06] = 0x21; // (unofficial / no maker)
-  rom[0x07] = SFC_M1;
-  rom[0x08] = SFC_M2;
-  // $0009 ROM checksum and $000A header checksum are computed at the end.
-  rom[0x0b] = ENTRY_ADDR & 0xff;       // entry point $8000, low byte
-  rom[0x0c] = (ENTRY_ADDR >> 8) & 0xff; // high byte
-  rom[0x0d] = 0x01; // version 1 (LoROM, normal)
-  rom[0x0e] = 0x00; // target system: normal LoROM
-  rom[0x0f] = 0x00;
-
-  // --- title ($7FC0, 12 ASCII bytes, null-padded) ------------------------
-  const title = (opts.title ?? 'ASM 65C816').slice(0, 12);
-  for (let i = 0; i < title.length; i++) rom[TITLE_ADDR + i] = title.charCodeAt(i) & 0xff;
+  // --- cart header, at its real location (file offset $7FB0) -------------
+  // snes9x reads these fields relative to $7FB0; the ROMSize byte at $7FD7 is
+  // the load gate, so it is set to a valid value rather than left zero.
+  const id4 = 'ASM1'; // ROM id (4 ASCII bytes, informational)
+  for (let i = 0; i < 4; i++) rom[HDR_ROM_ID + i] = id4.charCodeAt(i);
+  const title = (opts.title ?? 'ASM 65C816').slice(0, 12); // ROM name, null-padded
+  for (let i = 0; i < title.length; i++) rom[HDR_ROM_NAME + i] = title.charCodeAt(i) & 0xff;
+  rom[HDR_ROM_SPEED] = ROM_SPEED;
+  rom[HDR_ROM_TYPE] = ROM_TYPE;
+  rom[HDR_ROM_SIZE] = ROM_SIZE_FIELD; // $08 — inside the required $07–$1E
+  rom[HDR_SRAM_SIZE] = SRAM_SIZE_FIELD; // $00 — no S-RAM, ≤ $10
+  rom[HDR_ROM_REGION] = ROM_REGION_FIELD;
+  rom[HDR_COMPANY_ID] = COMPANY_ID_FIELD;
+  // Checksum bytes ($7FDC–$7FDF) are computed at the end, below.
 
   // --- vectors ($7FFC reset → $8000, $7FFE NMI → $8000) ------------------
-  rom[RESET_VECTOR_ADDR] = ENTRY_ADDR & 0xff;       // low byte  → 00
+  rom[RESET_VECTOR_ADDR] = ENTRY_ADDR & 0xff; // low byte  → 00
   rom[RESET_VECTOR_ADDR + 1] = (ENTRY_ADDR >> 8) & 0xff; // high byte → 80
   rom[NMI_VECTOR_ADDR] = ENTRY_ADDR & 0xff;
   rom[NMI_VECTOR_ADDR + 1] = (ENTRY_ADDR >> 8) & 0xff;
@@ -103,31 +131,33 @@ export function buildRom(code: Uint8Array, opts: BuildRomOptions = {}): Uint8Arr
   // --- entry code ($8000) -------------------------------------------------
   rom.set(code, ROM_ENTRY);
 
-  // --- checksums (written last, once the rest of the image is final) -----
-  // Standard order: header checksum first (with the ROM-checksum byte still
-  // zero), then the ROM checksum (which includes the final header byte).
-  rom[0x0a] = headerChecksum(rom);
-  rom[0x09] = romChecksum(rom);
+  // --- 16-bit checksums, written last once the rest of the image is final -
+  writeChecksums(rom);
 
   return rom;
 }
 
-/** SFC ROM checksum: 0xFF − (sum of all image bytes except $0009), mod 256. */
-function romChecksum(rom: Uint8Array): number {
+/**
+ * Standard 16-bit SNES ROM checksum pair, written to $7FDC–$7FDF.
+ *
+ * `sum` is the sum of every byte in the image EXCEPT the four checksum bytes;
+ *   ROMChecksum           = (0x0000 − sum) & 0xFFFF
+ *   ROMComplementChecksum = (0xFFFF − sum) & 0xFFFF
+ * Both are stored little-endian (low byte at the lower address), matching
+ * snes9x's read order: `RomHeader[0x2C] + (RomHeader[0x2D] << 8)`.
+ */
+function writeChecksums(rom: Uint8Array): void {
   let sum = 0;
   for (let i = 0; i < rom.length; i++) {
-    if (i !== 0x09) sum = (sum + rom[i]) & 0xffffff;
+    if (i >= HDR_COMP_CHKSUM && i <= HDR_ROM_CHKSUM + 1) continue; // exclude the 4
+    sum = (sum + rom[i]) & 0xffff;
   }
-  return (0xff - (sum & 0xff)) & 0xff;
-}
-
-/** SFC header checksum: 0xFF − (sum of header bytes $0000–$007F except $000A). */
-function headerChecksum(rom: Uint8Array): number {
-  let sum = 0;
-  for (let i = 0; i < 0x80; i++) {
-    if (i !== 0x0a) sum = (sum + rom[i]) & 0xffffff;
-  }
-  return (0xff - (sum & 0xff)) & 0xff;
+  const romChk = (0x0000 - sum) & 0xffff;
+  const compChk = (0xffff - sum) & 0xffff;
+  rom[HDR_COMP_CHKSUM] = compChk & 0xff;
+  rom[HDR_COMP_CHKSUM + 1] = (compChk >> 8) & 0xff;
+  rom[HDR_ROM_CHKSUM] = romChk & 0xff;
+  rom[HDR_ROM_CHKSUM + 1] = (romChk >> 8) & 0xff;
 }
 
 // --- base64 helpers: the ROM→app handoff channel --------------------------

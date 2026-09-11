@@ -1,7 +1,7 @@
 # 65C816 Assembler — progress & TODO
 
-Status: **done, committed, and wired as a full page that emits a runnable ROM.**
-The shared opcode foundation and the assembler are committed and green (79
+Status: **done, committed, and wired as a full page that emits a *loadable* ROM.**
+The shared opcode foundation and the assembler are committed and green (80
 tests across the suite; typecheck and production build clean). The 65C816
 editor lives on its own full page — `?asm=1`, reached from the "⌨ Assembler"
 transport button — because a debugger panel was too cramped to write and review
@@ -13,6 +13,13 @@ to the emulator (`▶ Run in emulator`) or to the user (`⬇ Download .sfc`), so
 CPU *executes it from the reset vector on a cold boot* — the missing "run the
 assembled code" capability, achieved without any PC-setter ABI change.
 
+**Load-gate fix:** the cart header is now emitted at its real location
+(file offset `$7FB0`), with the `ROMSize` byte at `$7FD7` set to a valid value.
+An earlier revision wrote it at `$0000` and left `$7FD7` = `0`, so snes9x's
+`InitROM` (`core/memmap.c:1949`) rejected the ROM as corrupt and the `$8000`
+slot read as stray header bytes. Both symptoms are fixed — verified end-to-end
+against the emulator's own gate and the reference ROM's header.
+
 Commits, in order:
 
 - `1b06b5a` — the foundation: `src/asm/opcode.ts`, `src/debug/disasm.ts`,
@@ -23,12 +30,18 @@ Commits, in order:
   (`mountAssembler`), the `?asm=1` route + `asmBtn` handler in `src/main.ts`,
   the "⌨ Assembler" button in `src/ui/app.ts`, and the Assembler panel
   **removed** from `src/debug/debugger.ts`
-- (this change) — **the ROM path**: new `src/asm/rom.ts` (`buildRom`,
+- (committed) — **the ROM path**: new `src/asm/rom.ts` (`buildRom`,
   `bytesToBase64`/`base64ToBytes`, `ASM_ROM_KEY`) + `test/rom.test.ts`; the
   assembler page rewired to a core-free ROM builder (`▶ Run in emulator` +
   `⬇ Download .sfc`, the old Write/Read-back removed); the assembled-ROM handoff
   in `src/main.ts`; and the reset-vector doc fixed to say `$8000` in
   `src/core/rom-check.ts`.
+- (this fix) — **cart header at its real `$7FB0` location**: the header bytes
+  (title, `ROMSize`/`SRAMSize`, checksums) and the vectors were being written
+  at the wrong file offsets, leaving `$7FD7` (ROMSize) zero — which snes9x's
+  `InitROM` corrupt gate rejects and which is why `$8000` read as stray header
+  bytes. `src/asm/rom.ts` now emits the header at `$7FB0` with `ROMSize`=`$08`
+  at `$7FD7`, and `test/rom.test.ts` gains the gate + checksum checks.
 
 ## Done
 
@@ -156,16 +169,30 @@ absolute/absolute,X, `ROL`, `TSB`/`TRB`, `BIT #imm`, `PER`, and `WAI`/`STP`.
 LoROM** image the emulator reads and executes — not a RAM write. Pure TS, no
 DOM, unit-testable like the rest of `src/asm/`.
 
-- **Layout:** standard SFC header in `$0000–$00FF` (Mapper 0, no S-RAM, entry
-  `$8000`, version 1, LoROM target); 12-byte ASCII title at `$7FC0`
-  (default `"ASM 65C816"`); the **reset + NMI vectors at `$7FFC`/`$7FFE` both
-  point at `$8000`** (bytes `00 80`, little-endian — what
-  `looksLikeSnesRom` gates on); the code copied at file offset `$8000` (which is
-  24-bit address `$8000` under LoROM bank `$00`).
-- **Checksums:** standard two-step order — header checksum (`$0A`) computed
-  first with the ROM-checksum byte still zero, then ROM checksum (`$09`) last so
-  it includes the final header byte. The build tolerates them being wrong, but a
-  correct ROM carries them and it makes the downloaded `.sfc` portable.
+- **Layout:** the SNES cart header lives at file offset **`$7FB0`** — snes9x
+  reads it via `RomHeader = Memory.ROM + 0x7FB0` (`core/memmap.c`), *not* at
+  `$0000`. Written at their real offsets, mirroring the known-working reference
+  ROM field-for-field: ROM id at `$7FB2`, the 12-byte ASCII title at `$7FC0`
+  (default `"ASM 65C816"`), `ROMSpeed` `$7FD5`=`$30`, `ROMType` `$7FD6`=`$00`,
+  **`ROMSize` `$7FD7`=`$08`**, `SRAMSize` `$7FD8`=`$00`, `ROMRegion`
+  `$7FD9`=`$00`, `CompanyId` `$7FDA`=`$00`. The **reset + NMI vectors at
+  `$7FFC`/`$7FFE` both point at `$8000`** (bytes `00 80`, little-endian — what
+  `looksLikeSnesRom` gates on). The code is copied at file offset `$8000` (24-bit
+  address `$8000` under LoROM bank `$00`).
+- **Why the header is at `$7FB0`, not `$0000`:** snes9x's load gate
+  (`memmap.c:1949`) rejects a ROM whose `ROMSize` byte (`RomHeader[0x27]` = file
+  `$7FD7`) is outside `$07–$1E`, or whose `SRAMSize` (`RomHeader[0x28]` = file
+  `$7FD8`) exceeds `$10`. An earlier revision wrote the header at `$0000` and
+  left `$7FD7` = `$00`, so the emulator refused the ROM with "ROM is corrupt or
+  invalid" (and the code slot at `$8000` read as stray header bytes). Setting
+  `ROMSize`/`SRAMSize` at their real `$7FD7`/`$7FD8` positions fixes both the
+  load gate and the wrong bytes-at-`$8000` symptom.
+- **Checksums:** the standard 16-bit ROM + complement pair at `$7FDC–$7FDF`
+  (low byte first, matching snes9x's read order). `sum` is all bytes except the
+  four checksum bytes; `ROMChecksum = 0x0000 − sum`, `Complement = 0xFFFF − sum`
+  (mod `0x10000`). snes9x does not verify them (the reference ROM's are
+  `0000`/`FFFF` yet it loads), but a well-formed image carries correct ones, so
+  the downloaded `.sfc` is portable.
 - **Validation:** empty program and a program past the entry region
   (`> 0x38000` bytes) throw a clear error. No guessing.
 - **Handoff:** `bytesToBase64`/`base64ToBytes` carry the built ROM across the
@@ -173,12 +200,15 @@ DOM, unit-testable like the rest of `src/asm/`.
   URL, and one valid base64 string (a single `btoa` over a bounded binary build,
   not per-chunk `btoa` which leaves `=` padding mid-string).
 
-### `test/rom.test.ts` (new) — 10 tests, all green
+### `test/rom.test.ts` (new) — 11 tests, all green
 
 Exact 256 KB size; code byte-for-byte at the `$8000` entry; reset + NMI vectors
-`00 80` → `$8000`; the 12-byte title (default + custom); the standard header
-(entry bytes `00 80`); ROM + header checksums recomputing correctly;
-**`looksLikeSnesRom(buildRom(bytes)) === true`** (the critical load gate);
+`00 80` → `$8000`; the 12-byte title (default + custom); the cart header at
+`$7FB0` with `ROMSize`/`SRAMSize` at `$7FD7`/`$7FD8`; **a test that mirrors
+snes9x's `InitROM` corrupt-ROM gate** (`SRAMSize ≤ 16 && 7 ≤ ROMSize ≤ 30`);
+the 16-bit ROM + complement checksums at `$7FDC–$7FDF` recomputing correctly
+with the `complement + 1 ≡ ROMChecksum` relation;
+**`looksLikeSnesRom(buildRom(bytes)) === true`** (the app's load gate);
 rejection of an empty / oversized program; the base64 round-trip at every size
 the app uses; and the end-to-end *assemble → buildRom → gate* check on a
 cold-boot-safe program.
@@ -234,8 +264,8 @@ to its five core panels.
 ```bash
 npx vitest run test/asm.test.ts      # 20 tests (incl. round-trips)
 npx vitest run test/disasm.test.ts   # 9 tests
-npx vitest run test/rom.test.ts      # 10 tests (header, vectors, checksums, gate, base64)
-npx vitest run                       # full suite: 79 tests
+npx vitest run test/rom.test.ts      # 11 tests (header, vectors, checksums, gate, base64)
+npx vitest run                       # full suite: 80 tests
 npm run typecheck
 npm run build
 ```

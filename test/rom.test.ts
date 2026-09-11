@@ -50,31 +50,46 @@ describe('buildRom — layout', () => {
     expect(named[0x7fc0 + 5]).toBe(0);
   });
 
-  it('emits a clean standard SFC header (Mapper 0, entry $8000, LoROM)', () => {
+  it('emits the cart header at $7FB0 (snes9x reads RomHeader = ROM + 0x7FB0)', () => {
     const rom = buildRom(CODE);
-    expect(rom[0x00]).toBe(0x00); // no S-RAM (Mapper 0)
-    expect(rom[0x07]).toBe(0x33); // SFC_M1
-    expect(rom[0x08]).toBe(0xff); // SFC_M2
-    expect(rom[0x0b]).toBe(0x00); // entry $8000 (lo)
-    expect(rom[0x0c]).toBe(0x80); // entry (hi)
-    expect(rom[0x0d]).toBe(0x01); // version 1
-    expect(rom[0x0e]).toBe(0x00); // LoROM
+    // ROMName at $7FC0 (RomHeader[0x10])
+    expect(titleAt(rom, 0x7fc0, 10)).toBe('ASM 65C816');
+    // The header field group at $7FD5–$7FDA (RomHeader[0x25]–[0x2A])
+    expect(rom[0x7fd5]).toBe(0x30); // ROMSpeed
+    expect(rom[0x7fd6]).toBe(0x00); // ROMType
+    expect(rom[0x7fd7]).toBe(0x08); // ROMSize — the load-gate byte, valid in $07–$1E
+    expect(rom[0x7fd8]).toBe(0x00); // SRAMSize — no S-RAM
+    expect(rom[0x7fd9]).toBe(0x00); // ROMRegion
+    expect(rom[0x7fda]).toBe(0x00); // CompanyId
+    // And the old, wrong $0000 header bytes are gone (zero in a zero-filled ROM).
+    expect(rom[0x07]).toBe(0x00);
+    expect(rom[0x08]).toBe(0x00);
   });
 
-  it('computes correct ROM and header checksums (standard two-step order)', () => {
+  it('passes snes9x InitROM corrupt-ROM gate (memmap.c:1949)', () => {
+    // The gate: SRAMSize = ROM[0x7FD8]; ROMSize = ROM[0x7FD7]; reject if
+    // SRAMSize > 16 || ROMSize < 7 || ROMSize - 7 > 23.
     const rom = buildRom(CODE);
-    // ROM checksum ($09) = 0xFF − (sum of all image bytes except $09) & 0xFF.
-    // Computed LAST, so it includes the final header-checksum byte ($0A).
-    let sum = 0;
-    for (let i = 0; i < rom.length; i++) if (i !== 0x09) sum = (sum + rom[i]) & 0xffffff;
-    expect(rom[0x09]).toBe((0xff - (sum & 0xff)) & 0xff);
+    const romSize = rom[0x7fd7];
+    const sramSize = rom[0x7fd8];
+    expect(sramSize > 16 || romSize < 7 || romSize - 7 > 23).toBe(false);
+  });
 
-    // Header checksum ($0A) = 0xFF − (sum of header $00–$7F except $0A) & 0xFF.
-    // Computed FIRST, with the ROM-checksum byte ($09) still zero — hence $09 is
-    // excluded here (it is not part of the header-checksum input).
-    let hsum = 0;
-    for (let i = 0; i < 0x80; i++) if (i !== 0x0a && i !== 0x09) hsum = (hsum + rom[i]) & 0xffffff;
-    expect(rom[0x0a]).toBe((0xff - (hsum & 0xff)) & 0xff);
+  it('computes correct 16-bit ROM + complement checksums at $7FDC–$7FDF', () => {
+    const rom = buildRom(CODE);
+    // sum over every byte except the four checksum bytes ($7FDC–$7FDF)
+    let sum = 0;
+    for (let i = 0; i < rom.length; i++) {
+      if (i >= 0x7fdc && i <= 0x7fdf) continue;
+      sum = (sum + rom[i]) & 0xffff;
+    }
+    const romChk = (0x0000 - sum) & 0xffff;
+    const compChk = (0xffff - sum) & 0xffff;
+    // stored little-endian (low byte first)
+    expect(rom[0x7fde] | (rom[0x7fdf] << 8)).toBe(romChk);
+    expect(rom[0x7fdc] | (rom[0x7fdd] << 8)).toBe(compChk);
+    // standard relation: complement is one less (mod 0x10000), i.e. comp+1 ≡ rom
+    expect((compChk + 1) & 0xffff).toBe(romChk & 0xffff);
   });
 
   it('satisfies looksLikeSnesRom (the app pre-load gate)', () => {
