@@ -1,6 +1,5 @@
-import type { SnesCore } from '../core/types';
 import { assemble } from '../asm/assembler';
-import { DEFAULT_ROM } from '../config';
+import { buildRom, bytesToBase64, ASM_ROM_KEY, ROM_ENTRY, ROM_SIZE } from '../asm/rom';
 
 /**
  * The 65C816 assembler as its own page (opened via `?asm=1`, reached from the
@@ -8,17 +7,16 @@ import { DEFAULT_ROM } from '../config';
  * listing of the assembled machine code on the right — enough room to actually
  * write and review code, which the old cramped debugger panel was not.
  *
- * Like the bindings page it is a standalone view, but it DOES boot a core
- * (no audio, no renderer): Write and Read-back need `core.writeMem`/`readMem`.
- * The default ROM is loaded best-effort so the real core is in a ready state
- * and WRAM is usable; on the mock the writes always land in its banked RAM.
- *
- * Execution is intentionally NOT wired: the core ABI exposes the PC read-only,
- * so the page can place and inspect code in RAM but cannot make the CPU start
- * there. That is a documented open item (a PC-setter ABI addition), not a gap
- * hidden behind a button that does nothing.
+ * The output is a **runnable SFC ROM**, not a memory write: `Assemble` builds
+ * the machine code, `▶ Run in emulator` wraps it in a 256 KB LoROM image
+ * (clean header, reset vector → the code, correct checksums), hands it to the
+ * app via sessionStorage, and navigates so `main.ts` loads + runs it through
+ * the exact same pipeline a user-picked `.sfc` uses. `⬇ Download .sfc` writes
+ * the same image to disk. No core is booted here — the page is pure TS — so it
+ * stays usable on any origin (Run needs a secure origin only because the full
+ * emulator boots audio there).
  */
-export async function mountAssembler(container: HTMLElement, core: SnesCore): Promise<void> {
+export function mountAssembler(container: HTMLElement): void {
   document.title = '65C816 Assembler — SNES Web';
   container.innerHTML = '';
 
@@ -26,53 +24,34 @@ export async function mountAssembler(container: HTMLElement, core: SnesCore): Pr
   style.textContent = CSS;
   container.appendChild(style);
 
-  // --- core status: boot a ready core best-effort -----------------------
-  const status = el('div', 'asm-core');
-  status.textContent = `booting ${core.id}${core.isMock ? ' (mock)' : ''}…`;
-
-  try {
-    if (DEFAULT_ROM) {
-      const res = await fetch(DEFAULT_ROM.url);
-      if (res.ok && !/text\/html/i.test(res.headers.get('content-type') ?? '')) {
-        await core.loadRom(new Uint8Array(await res.arrayBuffer()));
-      }
-    } else if (core.isMock) {
-      await core.loadRom(new Uint8Array(0x10000)); // make the mock ready
-    }
-  } catch {
-    // Non-fatal: assembling is pure TS and the mock still accepts writes.
-  }
-  status.textContent = `${core.id}${core.isMock ? ' (mock)' : ''} · ${
-    core.ready ? 'ready' : 'no ROM — Write may not stick on the real core'
-  }`;
-
   // --- DOM ------------------------------------------------------------
   const root = el('div', 'asm-root');
   const head = el('div', 'asm-head');
   const title = el('h1', 'asm-title', '65C816 Assembler');
-  head.append(title, status);
+  head.append(title);
   root.append(head);
   root.append(el('p', 'asm-sub',
     'Write 65C816 on the left; the assembled bytes appear live on the right. ' +
-    'Assemble, then Write copies them into the core’s memory and Read-back confirms they landed.'));
+    'Assemble, then ▶ Run in emulator to load the result as a ROM, or ⬇ Download .sfc to save it.'));
 
   // --- toolbar ----------------------------------------------------------
   const bar = el('div', 'asm-bar');
-  const bankIn = num('bank', '7e', 'bank (hex)');
-  const addrIn = num('addr', '8000', 'addr (hex)');
-  const stat = el('div', 'asm-stat');
+  const entry = el('span', 'asm-entry',
+    `ROM entry $${addrHex(ROM_ENTRY)} · ${ROM_SIZE / 0x1000} KB LoROM · bank $00`);
   const assembleBtn = el('button', 'btn', 'Assemble');
   assembleBtn.type = 'button';
-  const writeBtn = el('button', 'btn primary', 'Write');
-  writeBtn.type = 'button';
-  writeBtn.disabled = true;
-  const readBtn = el('button', 'btn', 'Read back');
-  readBtn.type = 'button';
+  const runBtn = el('button', 'btn primary', '▶ Run in emulator');
+  runBtn.type = 'button';
+  runBtn.disabled = true;
+  const downloadBtn = el('button', 'btn', '⬇ Download .sfc');
+  downloadBtn.type = 'button';
+  downloadBtn.disabled = true;
   const clearBtn = el('button', 'btn', 'Clear');
   clearBtn.type = 'button';
+  const stat = el('div', 'asm-stat');
   const backBtn = el('button', 'btn back', '← Back to game');
   backBtn.type = 'button';
-  bar.append(bankIn, addrIn, assembleBtn, writeBtn, readBtn, clearBtn, stat, backBtn);
+  bar.append(entry, assembleBtn, runBtn, downloadBtn, clearBtn, stat, backBtn);
   root.append(bar);
 
   // --- editor + listing -----------------------------------------------
@@ -93,25 +72,17 @@ export async function mountAssembler(container: HTMLElement, core: SnesCore): Pr
   root.append(main);
 
   root.append(el('div', 'asm-foot',
-    'Execution is not wired: the core’s PC is read-only, so code can be written and inspected in RAM ' +
-    'but not started. Immediates widen after REP #$1 and narrow after SEP #$1; addresses classify as ' +
-    'zero-page ($4C) or absolute ($004C) by the width you write.'));
+    'Runs as a ROM: the code is placed at the entry ($' + addrHex(ROM_ENTRY) +
+    ') and the reset vector points there, so the CPU starts in your program on boot. ' +
+    'Immediates widen after REP #$1 and narrow after SEP #$1; addresses classify as ' +
+    'zero-page ($4C) or absolute ($004C) by the width you write. ' +
+    'A cold boot has no return address — end in an idle loop (WAI / BRA), not RTS.'));
 
   container.appendChild(root);
 
   // --- state ------------------------------------------------------------
   let last: ReturnType<typeof assemble> | null = null;
   let debounce = 0;
-
-  function target(): { bank: number; addr: number } | string {
-    const bank = parseInt(bankIn.value || '0', 16);
-    const addr = parseInt(addrIn.value || '0', 16);
-    if (!Number.isFinite(bank) || bank < 0 || bank > 0xff) return 'bank must be hex $00–$FF (e.g. 7e)';
-    if (!Number.isFinite(addr) || addr < 0 || addr > 0xffff) return 'addr must be hex $0000–$FFFF (e.g. 8000)';
-    return { bank, addr };
-  }
-  const fmt = (bank: number, addr: number): string =>
-    `$${bank.toString(16).padStart(2, '0').toUpperCase()}:${addr.toString(16).padStart(4, '0').toUpperCase()}`;
 
   function setStat(text: string, cls = ''): void {
     stat.className = `asm-stat ${cls}`.trim();
@@ -120,70 +91,78 @@ export async function mountAssembler(container: HTMLElement, core: SnesCore): Pr
 
   // --- assemble + render ------------------------------------------------
   function doAssemble(): void {
-    const t = target();
-    if (typeof t === 'string') {
-      setStat(t, 'err');
-      writeBtn.disabled = true;
-      return;
-    }
-    const r = assemble(src.value, (t.bank << 16) | t.addr);
+    const r = assemble(src.value, ROM_ENTRY);
     last = r;
     if (!r.ok) {
-      writeBtn.disabled = true;
+      runBtn.disabled = true;
+      downloadBtn.disabled = true;
       setStat(r.errors.map((e) => `line ${e.line}: ${e.message}`).join('  ·  '), 'err');
       renderErrors(r.errors);
       return;
     }
-    writeBtn.disabled = false;
-    setStat(`${r.bytes.length} byte${r.bytes.length === 1 ? '' : 's'} @ ${fmt(t.bank, t.addr)} — ready to Write`);
-    renderListing(r, t.bank, t.addr);
+    runBtn.disabled = false;
+    downloadBtn.disabled = false;
+    setStat(`${r.bytes.length} byte${r.bytes.length === 1 ? '' : 's'} @ $${addrHex(r.origin)} — ready`);
+    renderListing(r);
   }
 
-  function doWrite(): void {
+  // --- Run in emulator: build a ROM, hand it off, navigate to the app ---
+  function doRun(): void {
     if (!last || !last.ok) return;
-    const t = target();
-    if (typeof t === 'string') { setStat(t, 'err'); return; }
+    let rom: Uint8Array;
     try {
-      core.writeMem(t.bank, t.addr, last.bytes);
+      rom = buildRom(last.bytes);
     } catch (err) {
-      setStat(`write failed: ${(err as Error).message}`, 'err');
+      setStat(`build failed: ${(err as Error).message}`, 'err');
       return;
     }
-    // Confirm the bytes actually landed in the core (mock: RAM; wasm: S9xSetByte).
-    const back = core.readMem(t.bank, t.addr, last.bytes.length);
-    const ok = back.length === last.bytes.length &&
-      Array.from(last.bytes).every((b, i) => back[i] === b);
-    setStat(
-      ok
-        ? `Wrote ${last.bytes.length} bytes to ${fmt(t.bank, t.addr)} — read-back ✓`
-        : `Wrote ${last.bytes.length} bytes to ${fmt(t.bank, t.addr)} — read-back MISMATCH`,
-      ok ? '' : 'err',
-    );
-    renderMem(t.bank, t.addr, back);
+    try {
+      sessionStorage.setItem(ASM_ROM_KEY, bytesToBase64(rom));
+    } catch (err) {
+      setStat(`handoff failed: ${(err as Error).message}`, 'err');
+      return;
+    }
+    setStat('ROM built — loading it in the emulator…');
+    const url = new URL(location.href);
+    url.searchParams.delete('asm');
+    location.href = url.toString(); // main.ts reads ASM_ROM_KEY and runs it
   }
 
-  function doRead(): void {
-    const t = target();
-    if (typeof t === 'string') { setStat(t, 'err'); return; }
-    const n = last && last.ok ? Math.max(last.bytes.length, 1) : 0x40;
-    const bytes = core.readMem(t.bank, t.addr, n);
-    setStat(`Read ${bytes.length} bytes @ ${fmt(t.bank, t.addr)}`);
-    renderMem(t.bank, t.addr, bytes);
+  // --- Download: same ROM to disk as assembled.sfc -----------------------
+  function doDownload(): void {
+    if (!last || !last.ok) return;
+    let rom: Uint8Array;
+    try {
+      rom = buildRom(last.bytes);
+    } catch (err) {
+      setStat(`build failed: ${(err as Error).message}`, 'err');
+      return;
+    }
+    const blob = new Blob([rom.buffer as ArrayBuffer], { type: 'application/octet-stream' });
+    const a = document.createElement('a');
+    const objectUrl = URL.createObjectURL(blob);
+    a.href = objectUrl;
+    a.download = 'assembled.sfc';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    setStat(`Saved ${rom.length} bytes as assembled.sfc`);
   }
 
   // --- listings ---------------------------------------------------------
-  function renderListing(r: ReturnType<typeof assemble>, bank: number, addr: number): void {
+  function renderListing(r: ReturnType<typeof assemble>): void {
     const rows = r.lines
       .map((l) => {
         const a = (r.origin + l.offset) >>> 0;
         const bytes = l.bytes.map((b) => b.toString(16).padStart(2, '0')).join(' ');
         const text = l.label ? `${l.label}:` : `${l.mnemonic} ${l.operand}`.trim();
-        return `<div class="lrow"><span class="la">${a.toString(16).padStart(6, '0').toUpperCase()}</span>` +
+        return `<div class="lrow"><span class="la">${addrHex(a)}</span>` +
           `<span class="lb">${bytes || '·'}</span><span class="ls">${esc(text)}</span></div>`;
       })
       .join('');
     listing.innerHTML =
-      `<div class="lhead asm-listtitle">assembled · ${r.bytes.length} bytes @ ${fmt(bank, addr)}</div>` +
+      `<div class="lhead asm-listtitle">assembled · ${r.bytes.length} bytes @ $${addrHex(r.origin)}</div>` +
       `<div class="lrow lh"><span class="la">addr</span><span class="lb">bytes</span><span class="ls">source</span></div>` +
       (rows || '<div class="lrow"><span class="ls">— empty program —</span></div>');
   }
@@ -192,21 +171,6 @@ export async function mountAssembler(container: HTMLElement, core: SnesCore): Pr
     listing.innerHTML =
       '<div class="lhead asm-listtitle err">assembly errors</div>' +
       errs.map((e) => `<div class="lrow errrow"><span class="la">${e.line}</span><span class="ls">${esc(e.message)}</span></div>`).join('');
-  }
-
-  function renderMem(bank: number, addr: number, bytes: Uint8Array): void {
-    // Grouped hex dump: 8 bytes per row, offset + hex + ascii — the memory view.
-    const rows: string[] = [];
-    for (let i = 0; i < bytes.length; i += 8) {
-      const chunk = bytes.slice(i, i + 8);
-      const hex = Array.from(chunk).map((b) => b.toString(16).padStart(2, '0')).join(' ');
-      const asc = Array.from(chunk).map((b) => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '·')).join('');
-      const a = (addr + i) >>> 0;
-      rows.push(`<div class="lrow"><span class="la">${a.toString(16).padStart(6, '0').toUpperCase()}</span>` +
-        `<span class="lb">${hex.padEnd(23)}</span><span class="ls">${esc(asc)}</span></div>`);
-    }
-    listing.innerHTML =
-      `<div class="lhead asm-listtitle">memory @ ${fmt(bank, addr)} · ${bytes.length} bytes</div>` + rows.join('');
   }
 
   // --- editor behaviour -------------------------------------------------
@@ -234,13 +198,14 @@ export async function mountAssembler(container: HTMLElement, core: SnesCore): Pr
 
   // --- buttons ----------------------------------------------------------
   assembleBtn.addEventListener('click', () => { window.clearTimeout(debounce); doAssemble(); });
-  writeBtn.addEventListener('click', doWrite);
-  readBtn.addEventListener('click', doRead);
+  runBtn.addEventListener('click', doRun);
+  downloadBtn.addEventListener('click', doDownload);
   clearBtn.addEventListener('click', () => {
     src.value = '';
     refreshGutter();
     last = null;
-    writeBtn.disabled = true;
+    runBtn.disabled = true;
+    downloadBtn.disabled = true;
     setStat('cleared — type 65C816 to begin');
     listing.innerHTML = '<div class="lrow"><span class="ls">— nothing assembled yet —</span></div>';
     src.focus();
@@ -265,34 +230,34 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, te
   return node;
 }
 
-function num(cls: string, value: string, placeholder: string): HTMLInputElement {
-  const i = document.createElement('input');
-  i.className = cls;
-  i.value = value;
-  i.placeholder = placeholder;
-  return i;
+function addrHex(a: number): string {
+  return (a >>> 0).toString(16).padStart(6, '0').toUpperCase();
 }
 
 function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/** Prefill: a small, self-contained program that shows the main constructs. */
+/**
+ * Prefill: a small, **cold-boot-safe** program. A ROM entry is reached with
+ * an empty stack and the I-flag set, so it must not `RTS` (there is no valid
+ * return address to pop) — it ends parked in a `WAI` / `BRA loop` idle spin,
+ * the way a real 65C816 reset vector does.
+ */
 const EXAMPLE = [
-  '; 65C816 — count A up to $0A, store it in WRAM, then a 16-bit demo.',
-  '; Targets WRAM $7E:8000 by default. Assemble, then Write.',
-  '',
+  '; 65C816 — cold-boot-safe example. On reset the CPU lands here with an',
+  '; empty stack, so we must NOT RTS (nothing to return to); we park in WAI.',
+  ';',
+  '; Count A up to $0A, keep the count in zero page, then idle.',
   '        LDA #$00',
   'again:  INCA',
   '        CMP #$0A',
   '        BNE again',
-  '        STA $10              ; count now sits in WRAM $10',
+  '        STA $10              ; final count (=$0A) now sits in zero page $10',
   '',
-  '        ; 16-bit immediate after REP #$1 (A width bit), 8-bit after SEP',
-  '        REP #$1',
-  '        LDA #$0100',
-  '        SEP #$1',
-  '        RTS',
+  '; Idle loop: WAI waits for an interrupt, BRA spins so the PC never falls off.',
+  'loop:   WAI',
+  '        BRA loop',
 ].join('\n');
 
 const CSS = `
@@ -301,13 +266,11 @@ const CSS = `
   margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
 .asm-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
 .asm-title { font-size: 21px; margin: 0; font-weight: 650; }
-.asm-core { color: #8a8a92; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .asm-sub { color: #8a8a92; margin: 0; max-width: 900px; }
 
 .asm-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
   background: #141418; border: 1px solid #2a2a30; border-radius: 8px; padding: 8px 10px; }
-.asm-bar input { background: #0d0d10; border: 1px solid #33333c; color: #e8e8ea;
-  border-radius: 5px; padding: 4px 8px; font: 12px ui-monospace, monospace; width: 78px; }
+.asm-entry { color: #8a8a92; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; margin-right: 4px; }
 .btn { background: #1c1c22; color: #e8e8ea; border: 1px solid #33333c; border-radius: 6px;
   padding: 5px 12px; cursor: pointer; font: inherit; }
 .btn:hover { background: #26262e; }

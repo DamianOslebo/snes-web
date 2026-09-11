@@ -1,12 +1,12 @@
 /**
  * Cheap ROM sanity check, run before handing fetched/picked bytes to a core.
  *
- * Every SNES image the core can load has the 65C816 CPU-reset vector `0x0080`
- * at `$007FC0` (LoROM) or `$007FFC` (HiROM), possibly behind a 512-byte
- * ($0200) header — exactly the locations snes9x's own ROM scoring checks, so
- * this can reject a bad payload (an HTML page from a dev-server SPA fallback,
- * a truncated or CRLF-mangled file) without ever rejecting something the
- * core would accept.
+ * Every SNES image the core can load carries the 65C816 CPU-reset vector
+ * `00 80` (little-endian for the `$8000` entry) at file offset `$7FC0` or
+ * `$7FFC`, possibly behind a 512-byte (`$0200`) header — the same locations
+ * snes9x's own ROM scoring checks, so this can reject a bad payload (an HTML
+ * page from a dev-server SPA fallback, a truncated or CRLF-mangled file)
+ * without ever rejecting something the core would accept.
  */
 export function looksLikeSnesRom(b: Uint8Array): boolean {
   for (const header of [0x0000, 0x0200]) {

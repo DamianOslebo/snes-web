@@ -10,6 +10,7 @@ import { FrameLoop } from './runtime/frame-loop';
 import { buildUi } from './ui/app';
 import { mountBindings } from './ui/bindings';
 import { mountAssembler } from './ui/assembler';
+import { ASM_ROM_KEY, base64ToBytes } from './asm/rom';
 import { mountDebug } from './debug/debugger';
 import workletSource from './runtime/worklet.js?raw';
 
@@ -27,11 +28,11 @@ async function boot(): Promise<void> {
   }
 
   // Assembler page (?asm=1), reached from the "Assembler" button. A standalone
-  // editor for 65C816 — unlike the bindings page it boots a core (no
-  // audio/renderer) so Write / Read-back can reach the live memory. The default
-  // ROM loads best-effort inside mountAssembler so the real core is ready.
+  // 65C816 editor — like the bindings page it boots no core: it assembles to
+  // machine code and hands a built SFC ROM to the app (▶ Run) or the user
+  // (⬇ Download). No core/audio needed to author, so it works on any origin.
   if (new URLSearchParams(location.search).get('asm') === '1') {
-    await mountAssembler(mountEl, await createCore());
+    mountAssembler(mountEl);
     return;
   }
 
@@ -161,7 +162,7 @@ async function boot(): Promise<void> {
     if (!looksLikeSnesRom(rom)) {
       throw new Error(
         `"${name}" (${rom.length} bytes) does not look like a SNES ROM ` +
-        `(no $0080 vector at $7FC0/$7FFC)`,
+        `(no $8000 reset vector (00 80) at $7FC0/$7FFC)`,
       );
     }
     await core.loadRom(rom);
@@ -261,10 +262,29 @@ async function boot(): Promise<void> {
     }
   }, true);
 
+  // Assembled ROM: if the assembler page handed a built ROM through
+  // sessionStorage (▶ Run), load + run it through the exact same pipeline as a
+  // user-picked .sfc — it takes priority over the default ROM.
+  const asmB64 = sessionStorage.getItem(ASM_ROM_KEY);
+  let loadedAsm = false;
+  if (asmB64) {
+    // Clear before awaiting so a failed or slow load can't re-trigger it on the
+    // next boot; on failure we fall through to the default ROM below.
+    sessionStorage.removeItem(ASM_ROM_KEY);
+    try {
+      await loadRomBytes('assembled.sfc', base64ToBytes(asmB64));
+      loadedAsm = true;
+    } catch (err) {
+      setRunning(false);
+      setStatus(`⚠️ assembled ROM failed to load: ${(err as Error).message}`);
+    }
+  }
+
   // Default ROM: auto-loaded on boot (see src/config.ts). Works on both the
   // wasm core (which actually emulates it) and the mock (which ignores ROM
-  // contents and just becomes ready). "Load ROM…" replaces it any time.
-  if (DEFAULT_ROM) {
+  // contents and just becomes ready). "Load ROM…" replaces it any time. Skipped
+  // when an assembled ROM was just loaded above.
+  if (DEFAULT_ROM && !loadedAsm) {
     try {
       const res = await fetch(DEFAULT_ROM.url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
