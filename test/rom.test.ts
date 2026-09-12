@@ -5,6 +5,7 @@ import {
   base64ToBytes,
   ROM_SIZE,
   ROM_ENTRY,
+  CODE_OFFSET,
 } from '../src/asm/rom';
 import { looksLikeSnesRom } from '../src/core/rom-check';
 import { assemble } from '../src/asm/assembler';
@@ -22,9 +23,11 @@ describe('buildRom — layout', () => {
     expect(buildRom(CODE).length).toBe(ROM_SIZE);
   });
 
-  it('copies the code byte-for-byte at the entry ($8000)', () => {
+  it('copies the code byte-for-byte at file $0000 (== CPU $008000 under LoROM)', () => {
     const rom = buildRom(CODE);
-    expect(Array.from(rom.subarray(ROM_ENTRY, ROM_ENTRY + CODE.length))).toEqual(
+    // The reset target is CPU $008000 (bank $00), which under LoROM reads file
+    // offset $0000 — NOT file $8000 (a separate 32 KB block).
+    expect(Array.from(rom.subarray(CODE_OFFSET, CODE_OFFSET + CODE.length))).toEqual(
       Array.from(CODE),
     );
   });
@@ -98,7 +101,9 @@ describe('buildRom — layout', () => {
 
   it('rejects an empty program and one past the entry region', () => {
     expect(() => buildRom(new Uint8Array(0))).toThrow(/empty program/);
-    const tooBig = new Uint8Array(ROM_SIZE - ROM_ENTRY + 1); // one byte over MAX_CODE
+    // Code sits at file $0000 and must not run into the $7FB0 cart header, so
+    // the max is 0x7FB0 bytes; one byte over (0x7FB1) is rejected.
+    const tooBig = new Uint8Array(0x7fb1);
     expect(() => buildRom(tooBig)).toThrow(/entry region|bytes\)/);
   });
 });
@@ -125,8 +130,8 @@ describe('assemble → ROM → gate (integration)', () => {
     );
     const rom = buildRom(asm.bytes);
     expect(looksLikeSnesRom(rom)).toBe(true);
-    // and the code really is at the entry
-    expect(Array.from(rom.subarray(ROM_ENTRY, ROM_ENTRY + asm.bytes.length))).toEqual(
+    // and the code really is at file $0000 (== the CPU's cold-boot reset target)
+    expect(Array.from(rom.subarray(CODE_OFFSET, CODE_OFFSET + asm.bytes.length))).toEqual(
       Array.from(asm.bytes),
     );
   });

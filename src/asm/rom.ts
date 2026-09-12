@@ -25,17 +25,19 @@
  *   $7FD9         ROMRegion (RomHeader[0x29]) = $00
  *   $7FDA         CompanyId (RomHeader[0x2A]) = $00
  *   $7FDC–$7FDF   16-bit complement + ROM checksums (RomHeader[0x2C..0x2F])
- *   $7FFC         reset vector → $8000 (bytes 00 80) — what `looksLikeSnesRom`
+ *   $7FFC         reset vector → $008000 (bytes 00 80) — what `looksLikeSnesRom`
  *                 checks for and where the CPU starts on a cold boot
- *   $7FFE         NMI vector   → $8000 (bytes 00 80)
- *   $8000         entry point — the assembled code is copied here
+ *   $7FFE         NMI vector   → $008000 (bytes 00 80)
+ *   $0000         entry point — the assembled code is copied here (file $0000
+ *                 == CPU $008000 under LoROM)
  *
- * `$7FFC` holds the 16-bit reset vector little-endian, so `$8000` is stored as
- * the byte pair `00 80`. Under LoROM the ROM bank `$00` maps 1:1 to file
- * offsets `$00000–$0FFFF`, so address `$8000` is file offset `$8000` — where
- * the code lives. That is exactly the reference ROM's shape (header at $7FB0
- * with a valid ROMSize at $7FD7, code at $8000), so the emitted image passes
- * both the app's gate and snes9x's InitROM gate.
+ * `$7FFC` holds the 16-bit reset vector little-endian, so `$008000` is stored
+ * as the byte pair `00 80`. Under LoROM the file is mirrored in 32 KB blocks
+ * and the reset target CPU `$008000` (bank `$00`) reads file offset `$0000` —
+ * so the code lives at file `$0000`, NOT `$8000` (file `$8000` is a separate
+ * 32 KB block). That is exactly the reference ROM's shape (reset vector at
+ * file `$7FFC` → CPU `$008000`; entry code at file `$0000`), so the emitted
+ * image passes both the app's gate and snes9x's InitROM gate.
  *
  * snes9x does not verify the checksums (the reference ROM's are 0x0000/0xFFFF
  * yet it loads), but a well-formed image carries correct ones, so we compute
@@ -46,8 +48,22 @@
 
 /** ROM size: 256 KB LoROM. */
 export const ROM_SIZE = 0x40000;
-/** Entry point: code is placed at file offset $8000 (= 24-bit address $008000). */
+/**
+ * Entry ADDRESS: the CPU reset-vector address the code runs from, in bank `$00`
+ * (== `$008000`). This is the assembly ORIGIN — code is assembled as if it sits
+ * at this address, so branch labels and absolute addresses resolve correctly.
+ * It is an address, NOT a file offset (see `CODE_OFFSET` below).
+ */
 export const ROM_ENTRY = 0x8000;
+/**
+ * FILE offset where the assembled code is copied. Under SNES LoROM the file is
+ * mirrored in 32 KB blocks and the reset target CPU `$008000` (bank `$00`) reads
+ * file offset `$0000` — so the code lives at file `$0000`, NOT `$8000` (file
+ * `$8000` is a separate 32 KB block). This is the reference ROM's shape: its
+ * reset vector at file `$7FFC` points at CPU `$008000` and its entry code is at
+ * file `$0000`. An earlier revision wrongly placed the code at file `$8000`.
+ */
+export const CODE_OFFSET = 0x0000;
 /** 16-bit entry address the reset/NMI vectors point at (== ROM_ENTRY under LoROM). */
 const ENTRY_ADDR = ROM_ENTRY;
 
@@ -76,10 +92,12 @@ const ROM_REGION_FIELD = 0x00;
 const COMPANY_ID_FIELD = 0x00;
 
 /**
- * The code runs from the entry ($8000) to the end of the ROM; the header,
- * title, and vectors all sit before $8000, so nothing is clobbered.
+ * The code lives at file $0000 and must not run into the cart header (which
+ * starts at file $7FB0 — title at $7FC0, vectors at $7FFC–$7FFF). So the
+ * largest code that fits without clobbering the header is 0x7FB0 bytes
+ * (file $0000–$7FAF).
  */
-const MAX_CODE = ROM_SIZE - ROM_ENTRY;
+const MAX_CODE = 0x7fb0;
 /** sessionStorage key the assembler page uses to hand a built ROM to the app. */
 export const ASM_ROM_KEY = 'snes-asm-rom';
 
@@ -91,8 +109,9 @@ export interface BuildRomOptions {
 /**
  * Wrap `code` in a 256 KB LoROM SFC image: a cart header at its real $7FB0
  * location (with a valid ROMSize byte at $7FD7 so snes9x's InitROM gate passes),
- * the code at $8000, reset/NMI vectors at $8000, a 12-byte title at $7FC0, and
- * standard 16-bit checksums at $7FDC–$7FDF. The result satisfies both
+ * the code at file $0000 (== CPU $008000 under LoROM), reset/NMI vectors →
+ * $008000, a 12-byte title at $7FC0, and standard 16-bit checksums at
+ * $7FDC–$7FDF. The result satisfies both
  * `looksLikeSnesRom` (the app's pre-load gate) and snes9x's own corrupt-ROM
  * check (memmap.c:1949).
  */
@@ -101,7 +120,7 @@ export function buildRom(code: Uint8Array, opts: BuildRomOptions = {}): Uint8Arr
   if (code.length > MAX_CODE) {
     throw new Error(
       `buildRom: program is ${code.length} bytes but the entry region is ` +
-      `$${ROM_ENTRY.toString(16).padStart(4, '0')}–$${ROM_SIZE.toString(16).padStart(4, '0')} (max ${MAX_CODE} bytes)`,
+      `$${CODE_OFFSET.toString(16).padStart(4, '0')}–$${MAX_CODE.toString(16).padStart(4, '0')} (max ${MAX_CODE} bytes)`,
     );
   }
 
@@ -128,8 +147,8 @@ export function buildRom(code: Uint8Array, opts: BuildRomOptions = {}): Uint8Arr
   rom[NMI_VECTOR_ADDR] = ENTRY_ADDR & 0xff;
   rom[NMI_VECTOR_ADDR + 1] = (ENTRY_ADDR >> 8) & 0xff;
 
-  // --- entry code ($8000) -------------------------------------------------
-  rom.set(code, ROM_ENTRY);
+  // --- entry code (file $0000 == CPU $008000 under LoROM) -----------------
+  rom.set(code, CODE_OFFSET);
 
   // --- 16-bit checksums, written last once the rest of the image is final -
   writeChecksums(rom);

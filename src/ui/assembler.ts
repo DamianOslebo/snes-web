@@ -138,16 +138,28 @@ export function mountAssembler(container: HTMLElement): void {
       setStat(`build failed: ${(err as Error).message}`, 'err');
       return;
     }
-    const blob = new Blob([rom.buffer as ArrayBuffer], { type: 'application/octet-stream' });
-    const a = document.createElement('a');
+    // Copy into a fresh, exactly-sized view so the Blob is always `ROM_SIZE`
+    // bytes even if buildRom ever returned a subarray over a larger buffer.
+    const blob = new Blob([new Uint8Array(rom)], { type: 'application/octet-stream' });
+    if (blob.size !== ROM_SIZE) {
+      setStat(`download aborted: built ${blob.size} bytes, expected ${ROM_SIZE}`, 'err');
+      return;
+    }
     const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
     a.href = objectUrl;
     a.download = 'assembled.sfc';
+    a.style.display = 'none';
     document.body.appendChild(a);
     a.click();
-    a.remove();
-    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
-    setStat(`Saved ${rom.length} bytes as assembled.sfc`);
+    // Hold the anchor + blob until the download has actually read them.
+    // Revoking the object URL (or removing the anchor) too early is a common
+    // cause of a 0-byte / truncated file on mobile — give it a real window.
+    window.setTimeout(() => {
+      a.remove();
+      URL.revokeObjectURL(objectUrl);
+    }, 5000);
+    setStat(`Saved ${blob.size} bytes as assembled.sfc`);
   }
 
   // --- listings ---------------------------------------------------------

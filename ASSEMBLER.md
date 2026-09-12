@@ -20,6 +20,18 @@ An earlier revision wrote it at `$0000` and left `$7FD7` = `0`, so snes9x's
 slot read as stray header bytes. Both symptoms are fixed — verified end-to-end
 against the emulator's own gate and the reference ROM's header.
 
+**Code-offset fix (the "empty ROM / `BRK` at `$008000`" root cause):** the
+assembled code must sit at **file `$0000`**, not file `$8000`. Under SNES LoROM
+the file is mirrored in 32 KB blocks and the cold-boot reset target CPU
+`$008000` (bank `$00`) reads file offset `$0000`; file `$8000` is a *separate*
+32 KB block (CPU `$010000`). An earlier revision copied the code to file `$8000`,
+so on reset the CPU read the zero-filled file-`$0000` region and fell straight
+into `BRK` (`00 00`) while the real code sat in the wrong block — the "whole ROM
+is empty" / "no data at `$8000`" reports. `buildRom` now uses a distinct
+`CODE_OFFSET = 0x0000` (the file offset) separate from `ROM_ENTRY = 0x8000`
+(the *assembly origin address* the code is written against), and caps the code
+at `$7FB0` bytes so it can't run into the cart header.
+
 Commits, in order:
 
 - `1b06b5a` — the foundation: `src/asm/opcode.ts`, `src/debug/disasm.ts`,
@@ -42,6 +54,14 @@ Commits, in order:
   `InitROM` corrupt gate rejects and which is why `$8000` read as stray header
   bytes. `src/asm/rom.ts` now emits the header at `$7FB0` with `ROMSize`=`$08`
   at `$7FD7`, and `test/rom.test.ts` gains the gate + checksum checks.
+- (this fix) — **code at file `$0000`, not `$8000` (the "empty ROM" root
+  cause):** `buildRom` copied the assembled code to file offset `$8000`, but
+  under LoROM the reset target CPU `$008000` reads file `$0000` (file `$8000`
+  is a separate 32 KB block), so the CPU booted into the zero-filled region and
+  hit `BRK`. `src/asm/rom.ts` now copies the code to `CODE_OFFSET = 0x0000`
+  (a distinct constant from the `ROM_ENTRY = 0x8000` origin address) and caps
+  it at `$7FB0` bytes; `test/rom.test.ts` asserts the code at file `$0000` and
+  the new cap.
 
 ## Done
 
@@ -177,8 +197,10 @@ DOM, unit-testable like the rest of `src/asm/`.
   **`ROMSize` `$7FD7`=`$08`**, `SRAMSize` `$7FD8`=`$00`, `ROMRegion`
   `$7FD9`=`$00`, `CompanyId` `$7FDA`=`$00`. The **reset + NMI vectors at
   `$7FFC`/`$7FFE` both point at `$8000`** (bytes `00 80`, little-endian — what
-  `looksLikeSnesRom` gates on). The code is copied at file offset `$8000` (24-bit
-  address `$8000` under LoROM bank `$00`).
+  `looksLikeSnesRom` gates on). The code is copied at file offset **`$0000`**
+  (== CPU `$008000`, bank `$00`, under LoROM — the cold-boot reset target; file
+  `$8000` is a *separate* 32 KB block and where an earlier revision wrongly put
+  the code).
 - **Why the header is at `$7FB0`, not `$0000`:** snes9x's load gate
   (`memmap.c:1949`) rejects a ROM whose `ROMSize` byte (`RomHeader[0x27]` = file
   `$7FD7`) is outside `$07–$1E`, or whose `SRAMSize` (`RomHeader[0x28]` = file
@@ -193,8 +215,16 @@ DOM, unit-testable like the rest of `src/asm/`.
   (mod `0x10000`). snes9x does not verify them (the reference ROM's are
   `0000`/`FFFF` yet it loads), but a well-formed image carries correct ones, so
   the downloaded `.sfc` is portable.
+- **Code lives at file `$0000`, not `$8000`:** under SNES LoROM the file is
+  mirrored in 32 KB blocks and the reset target CPU `$008000` (bank `$00`) reads
+  file offset `$0000`. File `$8000` is a *separate* 32 KB block (CPU `$010000`).
+  An earlier revision copied the code to file `$8000`, so on reset the CPU read
+  the zero-filled file-`$0000` region (the `00 00` → `BRK` symptom) while the
+  real code sat in the wrong 32 KB block. The fix is `CODE_OFFSET = 0x0000` in
+  `buildRom`, distinct from the `ROM_ENTRY = 0x8000` *assembly origin address*.
 - **Validation:** empty program and a program past the entry region
-  (`> 0x38000` bytes) throw a clear error. No guessing.
+  (`> 0x7FB0` bytes — code at file `$0000` must not run into the `$7FB0` cart
+  header) throw a clear error. No guessing.
 - **Handoff:** `bytesToBase64`/`base64ToBytes` carry the built ROM across the
   page→app navigation via `sessionStorage` (key `ASM_ROM_KEY`) — too large for a
   URL, and one valid base64 string (a single `btoa` over a bounded binary build,
@@ -202,8 +232,9 @@ DOM, unit-testable like the rest of `src/asm/`.
 
 ### `test/rom.test.ts` (new) — 11 tests, all green
 
-Exact 256 KB size; code byte-for-byte at the `$8000` entry; reset + NMI vectors
-`00 80` → `$8000`; the 12-byte title (default + custom); the cart header at
+Exact 256 KB size; code byte-for-byte at file `$0000` (== CPU `$008000`);
+reset + NMI vectors `00 80` → `$8000`; the 12-byte title (default + custom);
+the cart header at
 `$7FB0` with `ROMSize`/`SRAMSize` at `$7FD7`/`$7FD8`; **a test that mirrors
 snes9x's `InitROM` corrupt-ROM gate** (`SRAMSize ≤ 16 && 7 ≤ ROMSize ≤ 30`);
 the 16-bit ROM + complement checksums at `$7FDC–$7FDF` recomputing correctly
@@ -226,8 +257,8 @@ review code. Reached from the "⌨ Assembler" transport button, which sets
   author or download. (Running the ROM is the *emulator's* job and still needs
   a secure origin for audio, exactly like any other ROM.)
 - Paste 65C816 source (pre-filled with a small, **cold-boot-safe** loop) — the
-  code is placed at the ROM entry `$8000`, where the reset vector points, so the
-  CPU starts there on boot.
+  code is assembled at CPU `$008000` and placed at file `$0000` (its LoROM image
+  of that address), where the reset vector points, so the CPU starts there on boot.
 - **Assemble** (or live-assemble as you type, 300 ms debounce) → a per-line
   listing (address, bytes, source — from the assembler's `lines` result) or
   the line-numbered errors; Run and Download stay disabled until an assemble
