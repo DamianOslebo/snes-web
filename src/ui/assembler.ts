@@ -1,5 +1,7 @@
 import { assemble } from '../asm/assembler';
-import { buildRom, bytesToBase64, ASM_ROM_KEY, ROM_ENTRY, ROM_SIZE } from '../asm/rom';
+import { buildRom, bytesToBase64, base64ToBytes, ASM_ROM_KEY, ROM_ENTRY, ROM_SIZE } from '../asm/rom';
+import type { AsmController } from '../agent/types';
+import { loadState, saveState } from '../agent/state-store';
 
 /**
  * The 65C816 assembler as its own page (opened via `?asm=1`, reached from the
@@ -16,9 +18,81 @@ import { buildRom, bytesToBase64, ASM_ROM_KEY, ROM_ENTRY, ROM_SIZE } from '../as
  * stays usable on any origin (Run needs a secure origin only because the full
  * emulator boots audio there).
  */
+
+// --- module-scope state (shared by the page and the agent's `asm_*` tools) ---
+//
+// Navigation is a full page reload, so the mounted page's closure is
+// ephemeral: the canonical state (source + `.incbin` data files) lives in
+// localStorage under ASM_STORE_KEY, and the page is just a live view over it.
+// The agent's controller (`makeAsmController`) reads/writes the same state and
+// re-renders through `asmRefresh` when the page happens to be on screen.
+
+const ASM_STORE_KEY = 'snes-web:asm:v1';
+
+/** The shape persisted under ASM_STORE_KEY (data files: name → base64). */
+interface AsmStore {
+  v: 1;
+  source: string;
+  files: Record<string, string>;
+}
+
+const isAsmStore = (v: unknown): v is AsmStore => {
+  const p = v as Record<string, unknown>;
+  return (
+    !!p &&
+    p.v === 1 &&
+    typeof p.source === 'string' &&
+    !!p.files &&
+    typeof p.files === 'object' &&
+    Object.values(p.files as Record<string, unknown>).every((f) => typeof f === 'string')
+  );
+};
+
+let asmLoaded = false;
+let asmSource = '';
+let asmIncludes: Record<string, Uint8Array> = {};
+let asmMounted = false;
+let asmRefresh: (() => void) | null = null;
+let asmSaveTimer = 0;
+
+/** Load the persisted state once per page load (idempotent). */
+function initAsmState(): void {
+  if (asmLoaded) return;
+  asmLoaded = true;
+  const stored = loadState(
+    localStorage,
+    ASM_STORE_KEY,
+    isAsmStore,
+    { v: 1, source: EXAMPLE, files: {} },
+  ).value;
+  asmSource = stored.source;
+  asmIncludes = {};
+  for (const [name, b64] of Object.entries(stored.files)) {
+    try {
+      asmIncludes[name] = base64ToBytes(b64);
+    } catch {
+      // Skip a corrupt entry — the assembler reports the missing `.incbin`.
+    }
+  }
+}
+
+/** Write the current state back to the store (never throws). */
+function asmPersist(): void {
+  const files: Record<string, string> = {};
+  for (const [name, bytes] of Object.entries(asmIncludes)) files[name] = bytesToBase64(bytes);
+  saveState(localStorage, ASM_STORE_KEY, { v: 1, source: asmSource, files });
+}
+
+/** Debounced save for high-frequency edits (typing in the editor). */
+function scheduleAsmPersist(): void {
+  window.clearTimeout(asmSaveTimer);
+  asmSaveTimer = window.setTimeout(asmPersist, 300);
+}
+
 export function mountAssembler(container: HTMLElement): void {
   document.title = '65C816 Assembler — SNES Web';
   container.innerHTML = '';
+  initAsmState(); // load the persisted source + data files (the page is a view)
 
   const style = document.createElement('style');
   style.textContent = CSS;
@@ -48,11 +122,25 @@ export function mountAssembler(container: HTMLElement): void {
   downloadBtn.disabled = true;
   const clearBtn = el('button', 'btn', 'Clear');
   clearBtn.type = 'button';
+  // 📦 Data files: .bin files the user can embed with `.incbin "name"` (e.g.
+  // the graphics editor's VRAM dump). Kept in page state, not persisted.
+  const filesBtn = el('button', 'btn', '📦 Data files…');
+  filesBtn.type = 'button';
+  filesBtn.title = 'Load .bin files to embed with .incbin (e.g. the graphics editor\'s VRAM dump)';
+  const binInput = document.createElement('input');
+  binInput.type = 'file';
+  binInput.accept = '.bin,.dat,.img,.rom';
+  binInput.multiple = true;
+  binInput.className = 'bin-input';
   const stat = el('div', 'asm-stat');
   const backBtn = el('button', 'btn back', '← Back to game');
   backBtn.type = 'button';
-  bar.append(entry, assembleBtn, runBtn, downloadBtn, clearBtn, stat, backBtn);
+  bar.append(entry, assembleBtn, runBtn, downloadBtn, clearBtn, filesBtn, binInput, stat, backBtn);
   root.append(bar);
+
+  // Loaded data files, one chip each (name + size + remove). Hidden when empty.
+  const incs = el('div', 'asm-incs');
+  root.append(incs);
 
   // --- editor + listing -----------------------------------------------
   const main = el('div', 'asm-main');
@@ -63,7 +151,7 @@ export function mountAssembler(container: HTMLElement): void {
   src.className = 'asm-src';
   src.spellcheck = false;
   src.wrap = 'off';
-  src.value = EXAMPLE;
+  src.value = asmSource; // module-scope store (agent + page share it; see makeAsmController)
   edWrap.append(gutter, src);
   main.append(edWrap);
 
@@ -76,22 +164,72 @@ export function mountAssembler(container: HTMLElement): void {
     ') and the reset vector points there, so the CPU starts in your program on boot. ' +
     'Immediates widen after REP #$1 and narrow after SEP #$1; addresses classify as ' +
     'zero-page ($4C) or absolute ($004C) by the width you write. ' +
+    'Load .bin files with 📦 Data files and embed them with .incbin "name" — ' +
+    'a label on the line is the data\'s CPU address, and labels after it point just past it. ' +
+    'Code + data must fit the 32 KB entry region (file $0000–$7FAF). ' +
     'A cold boot has no return address — end in an idle loop (WAI / BRA), not RTS.'));
 
   container.appendChild(root);
 
+  // Agent refresh seam: the controller re-renders through this when the page
+  // is on screen (a no-op otherwise — see makeAsmController).
+  asmMounted = true;
+  asmRefresh = () => {
+    src.value = asmSource;
+    refreshGutter();
+    renderIncludes();
+    doAssemble();
+  };
+
   // --- state ------------------------------------------------------------
   let last: ReturnType<typeof assemble> | null = null;
   let debounce = 0;
+  // The `.incbin` data files live in module scope (`asmIncludes`) so the
+  // agent's controller and the page always see the same set.
 
   function setStat(text: string, cls = ''): void {
     stat.className = `asm-stat ${cls}`.trim();
     stat.textContent = text;
   }
 
+  // --- data files (.incbin) ----------------------------------------------
+  function renderIncludes(): void {
+    const names = Object.keys(asmIncludes);
+    incs.innerHTML = names.map((n) => {
+      const sz = asmIncludes[n].length;
+      const kb = sz >= 1024 ? `${(sz / 1024).toFixed(1)} KB` : `${sz} B`;
+      return `<span class="inc-chip">${esc(n)} · ${kb}` +
+        `<button type="button" class="inc-x" data-inc="${esc(n)}" title="Remove ${esc(n)}">✕</button></span>`;
+    }).join('');
+  }
+
+  binInput.addEventListener('change', async () => {
+    const files = Array.from(binInput.files ?? []);
+    for (const f of files) {
+      asmIncludes[f.name] = new Uint8Array(await f.arrayBuffer());
+    }
+    // Reset so re-picking the same file re-fires `change`.
+    binInput.value = '';
+    scheduleAsmPersist();
+    renderIncludes();
+    doAssemble(); // any pending `.incbin "name"` now resolves
+  });
+
+  incs.addEventListener('click', (e) => {
+    const t = (e.target as HTMLElement).closest('.inc-x');
+    if (!t) return;
+    const name = t.getAttribute('data-inc');
+    if (name && name in asmIncludes) {
+      delete asmIncludes[name];
+      scheduleAsmPersist();
+      renderIncludes();
+      doAssemble(); // re-assemble: `.incbin "name"` will now fail loudly
+    }
+  });
+
   // --- assemble + render ------------------------------------------------
   function doAssemble(): void {
-    const r = assemble(src.value, ROM_ENTRY);
+    const r = assemble(src.value, ROM_ENTRY, asmIncludes);
     last = r;
     if (!r.ok) {
       runBtn.disabled = true;
@@ -167,7 +305,13 @@ export function mountAssembler(container: HTMLElement): void {
     const rows = r.lines
       .map((l) => {
         const a = (r.origin + l.offset) >>> 0;
-        const bytes = l.bytes.map((b) => b.toString(16).padStart(2, '0')).join(' ');
+        // A `.incbin` line can carry tens of KB — show a head of the bytes
+        // plus the total, never the full dump (it would wreck the DOM).
+        const isInc = l.mnemonic === '.incbin' || l.mnemonic === '.bin';
+        const shown = isInc && l.bytes.length > 16 ? l.bytes.slice(0, 16) : l.bytes;
+        const bytes =
+          shown.map((b) => b.toString(16).padStart(2, '0')).join(' ') +
+          (isInc && l.bytes.length > 16 ? ` … +${l.bytes.length - 16} more` : '');
         const text = l.label ? `${l.label}:` : `${l.mnemonic} ${l.operand}`.trim();
         return `<div class="lrow"><span class="la">${addrHex(a)}</span>` +
           `<span class="lb">${bytes || '·'}</span><span class="ls">${esc(text)}</span></div>`;
@@ -193,9 +337,11 @@ export function mountAssembler(container: HTMLElement): void {
   const syncScroll = (): void => { gutter.scrollTop = src.scrollTop; };
   src.addEventListener('scroll', syncScroll);
   src.addEventListener('input', () => {
+    asmSource = src.value; // the module-scope store is canonical
     refreshGutter();
     window.clearTimeout(debounce);
     debounce = window.setTimeout(doAssemble, 300); // live assemble as you type
+    scheduleAsmPersist();
   });
   // Tab inserts 4 spaces instead of moving focus off the editor.
   src.addEventListener('keydown', (e) => {
@@ -214,6 +360,8 @@ export function mountAssembler(container: HTMLElement): void {
   downloadBtn.addEventListener('click', doDownload);
   clearBtn.addEventListener('click', () => {
     src.value = '';
+    asmSource = '';
+    scheduleAsmPersist();
     refreshGutter();
     last = null;
     runBtn.disabled = true;
@@ -231,6 +379,96 @@ export function mountAssembler(container: HTMLElement): void {
   refreshGutter();
   doAssemble(); // render the example's listing up front
   src.focus();
+}
+
+/**
+ * The agent-facing controller for this page (the `asm_*` tools in
+ * `src/agent/tools.ts`). It works whether or not the page is mounted — it
+ * reads/writes the module-scope state (persisted to localStorage on every
+ * change) and re-renders through `asmRefresh` only while the page is on
+ * screen. `run()` is the workflow's sanctioned terminal action: it hands the
+ * built ROM to the emulator via sessionStorage and navigates (the chat panel
+ * itself never navigates on its own).
+ */
+export function makeAsmController(): AsmController {
+  const errorsText = (errs: { line: number; message: string }[]): string =>
+    errs.map((e) => `line ${e.line}: ${e.message}`).join('; ');
+
+  /** Re-render the mounted page after a controller edit (no-op when off). */
+  function refreshIfMounted(): void {
+    if (asmMounted && asmRefresh) asmRefresh();
+  }
+
+  return {
+    getSource(): string {
+      initAsmState();
+      return asmSource;
+    },
+    setSource(source: string): void {
+      initAsmState();
+      asmSource = source;
+      asmPersist();
+      refreshIfMounted();
+    },
+    appendSource(text: string): void {
+      initAsmState();
+      asmSource = asmSource.trim() ? `${asmSource.replace(/\s+$/, '')}\n\n${text}` : text;
+      asmPersist();
+      refreshIfMounted();
+    },
+    listDataFiles(): { name: string; bytes: number }[] {
+      initAsmState();
+      return Object.entries(asmIncludes).map(([name, b]) => ({ name, bytes: b.length }));
+    },
+    addDataFile(name: string, bytes: Uint8Array): void {
+      initAsmState();
+      asmIncludes[name] = bytes;
+      asmPersist();
+      refreshIfMounted();
+    },
+    removeDataFile(name: string): void {
+      initAsmState();
+      delete asmIncludes[name];
+      asmPersist();
+      refreshIfMounted();
+    },
+    assemble(): { ok: boolean; byteCount: number; errors: { line: number; message: string }[] } {
+      initAsmState();
+      const r = assemble(asmSource, ROM_ENTRY, asmIncludes);
+      return { ok: r.ok, byteCount: r.bytes.length, errors: r.errors };
+    },
+    buildRom(): { ok: boolean; bytes?: number; error?: string } {
+      initAsmState();
+      const r = assemble(asmSource, ROM_ENTRY, asmIncludes);
+      if (!r.ok) return { ok: false, error: errorsText(r.errors) };
+      try {
+        return { ok: true, bytes: buildRom(r.bytes).length };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message };
+      }
+    },
+    run(): { ok: boolean; error?: string } {
+      initAsmState();
+      const r = assemble(asmSource, ROM_ENTRY, asmIncludes);
+      if (!r.ok) return { ok: false, error: errorsText(r.errors) };
+      let rom: Uint8Array;
+      try {
+        rom = buildRom(r.bytes);
+      } catch (err) {
+        return { ok: false, error: (err as Error).message };
+      }
+      try {
+        sessionStorage.setItem(ASM_ROM_KEY, bytesToBase64(rom));
+      } catch (err) {
+        return { ok: false, error: (err as Error).message };
+      }
+      // Same handoff the page's own ▶ Run uses: main.ts loads ASM_ROM_KEY.
+      const url = new URL(location.href);
+      url.searchParams.delete('asm');
+      location.href = url.toString();
+      return { ok: true };
+    },
+  };
 }
 
 // --- helpers -------------------------------------------------------------
@@ -270,6 +508,13 @@ const EXAMPLE = [
   '; Idle loop: WAI waits for an interrupt, BRA spins so the PC never falls off.',
   'loop:   WAI',
   '        BRA loop',
+  '',
+  '; --- Embedding binary data (e.g. the graphics editor\'s VRAM .bin) ------',
+  '; Load the file with the 📦 Data files button, then uncomment:',
+  ';',
+  '; data:   .incbin "tiles.bin"          ; label = the data\'s CPU address',
+  ';        LDA data,X                   ; read byte $X of the data',
+  '; past:   NOP                        ; label just past the data',
 ].join('\n');
 
 const CSS = `
@@ -290,6 +535,15 @@ const CSS = `
 .btn.primary { background: #1d3350; border-color: #2b4a70; }
 .btn.primary:hover { background: #244163; }
 .btn.back { margin-left: auto; }
+.bin-input { display: none; }
+.asm-incs { display: flex; flex-wrap: wrap; gap: 6px; }
+.asm-incs:empty { display: none; }
+.inc-chip { display: inline-flex; align-items: center; gap: 8px; background: #141418;
+  border: 1px solid #2a2a30; border-radius: 999px; padding: 3px 4px 3px 10px;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: #9fd0ff; }
+.inc-x { background: none; border: none; cursor: pointer; font: inherit; padding: 0 4px;
+  color: #6a6a72; border-radius: 999px; line-height: 1; }
+.inc-x:hover { color: #ff8a8a; }
 .asm-stat { font: 12px ui-monospace, monospace; color: #9fd0ff; }
 .asm-stat.err { color: #ff8a8a; }
 .asm-stat:empty { flex: 0; }

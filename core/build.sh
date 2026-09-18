@@ -144,7 +144,8 @@ EXPORTED_FUNCTIONS='[
   "_core_breakpoint_bank",
   "_core_breakpoint_addr",
   "_core_sram_ptr",
-  "_core_wram_ptr"
+  "_core_wram_ptr",
+  "_core_vram_ptr"
 ]'
 
 SOURCES=("$SHIM")

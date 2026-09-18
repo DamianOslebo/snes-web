@@ -1,0 +1,171 @@
+/**
+ * `ollama` — a thin, injectable client for Ollama's HTTP API.
+ *
+ * The only place in the agent that does I/O. A `Transport` is a
+ * `post(url, body) → parsed JSON` function, so the node tests can substitute a
+ * fake (no network, no fetch) and pin the exact request shapes. The browser
+ * passes `fetchTransport` (native `fetch`, CORS to the Ollama host).
+ *
+ * Non-streaming by design: one `POST /api/chat` per agent step (the loop in
+ * loop.ts does the stepping), so the panel shows a single "thinking…" state
+ * and a Stop button that aborts the in-flight request.
+ *
+ * Pure except for `fetchTransport`, which is the only function that touches
+ * `fetch` — and it is only ever called from browser code.
+ */
+
+import type {
+  ChatRequest,
+  Message,
+  OllamaChatResponse,
+  OllamaTagResponse,
+  ToolCall,
+  ToolSpec,
+} from './types';
+
+/**
+ * A transport posts a JSON body to `url` and resolves with the parsed JSON
+ * response. `signal` (optional) aborts the request; reject with an
+ * `AbortError`-like error when aborted so callers can detect it.
+ */
+export interface Transport {
+  post(
+    url: string,
+    body: unknown,
+    signal?: AbortSignal,
+  ): Promise<unknown>;
+}
+
+/**
+ * Parse a tool call's `arguments`, which Ollama sends as a JSON object but
+ * which some frontends/proxies deliver as a JSON *string*. Always returns an
+ * object (never throws): a bad payload becomes `{}` so the caller can report a
+ * clean "bad arguments" tool result instead of crashing the loop.
+ */
+export function parseArgs(args: unknown): Record<string, unknown> {
+  if (args === null || args === undefined) return {};
+  if (typeof args === 'object' && !Array.isArray(args)) {
+    return args as Record<string, unknown>;
+  }
+  if (typeof args === 'string') {
+    const t = args.trim();
+    if (t === '') return {};
+    try {
+      const v: unknown = JSON.parse(t);
+      if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, unknown>;
+      return {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+/** Normalize one raw Ollama tool call (handles both wire shapes). */
+export function parseToolCalls(raw: OllamaChatResponse['message']): ToolCall[] {
+  const calls = raw?.tool_calls;
+  if (!Array.isArray(calls)) return [];
+  const out: ToolCall[] = [];
+  for (const c of calls) {
+    if (!c) continue;
+    const name = c.function?.name ?? c.name;
+    if (typeof name !== 'string' || name === '') continue;
+    const args = c.function?.arguments !== undefined ? c.function.arguments : c.arguments;
+    out.push({ name, args: parseArgs(args) });
+  }
+  return out;
+}
+
+/** Strip the base to an absolute Ollama URL: accept `http://host[:port]` or `/api/...`-less paths. */
+export function baseUrl(endpoint: string): string {
+  const t = endpoint.trim().replace(/\/+$/, '');
+  return t;
+}
+
+function join(endpoint: string, path: string): string {
+  return `${baseUrl(endpoint)}${path}`;
+}
+
+/**
+ * The default transport: native `fetch`, JSON in / JSON out. Throws a plain
+ * `Error` (with the HTTP status) on a non-2xx response so the loop can surface
+ * a useful message; honors `signal` for Stop.
+ */
+export const fetchTransport: Transport = {
+  async post(url, body, signal) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    });
+    const text = await res.text();
+    let parsed: unknown;
+    try {
+      parsed = text === '' ? {} : JSON.parse(text);
+    } catch {
+      throw new Error(`Ollama returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+    }
+    if (!res.ok) {
+      const msg =
+        (parsed as { error?: string })?.error ?? `HTTP ${res.status}`;
+      throw new Error(String(msg));
+    }
+    return parsed;
+  },
+};
+
+/**
+ * One non-streaming chat turn. Sends `messages` + `tools` to `/api/chat` and
+ * returns the model's message (its `content` and any `tool_calls`). The
+ * response is normalized to a `Message` (assistant role) plus the parsed tool
+ * calls, so the loop never has to know Ollama's exact wire shape.
+ */
+export async function chatOnce(
+  endpoint: string,
+  model: string,
+  messages: Message[],
+  tools: ToolSpec[],
+  transport: Transport = fetchTransport,
+  signal?: AbortSignal,
+): Promise<Message> {
+  const body: ChatRequest = { model, messages, tools, stream: false };
+  const res = (await transport.post(join(endpoint, '/api/chat'), body, signal)) as OllamaChatResponse;
+  const msg = res?.message;
+  const content = typeof msg?.content === 'string' ? msg.content : '';
+  const tool_calls = parseToolCalls(msg);
+  const out: Message = { role: 'assistant', content };
+  if (tool_calls.length) out.tool_calls = tool_calls;
+  return out;
+}
+
+/** List installed models (`GET /api/tags` → `{ models: [{ name, … }] }`). */
+export async function listModels(
+  endpoint: string,
+  transport: Transport = fetchTransport,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  // Ollama exposes models at GET /api/tags. Our Transport is POST-shaped, so
+  // we reuse it with an empty body; Ollama ignores the body on this route.
+  const res = (await transport.post(join(endpoint, '/api/tags'), {}, signal)) as OllamaTagResponse;
+  const models = res?.models;
+  if (!Array.isArray(models)) return [];
+  return models.map((m) => m?.name).filter((n): n is string => typeof n === 'string' && n !== '');
+}
+
+/**
+ * Health check for "test connection": resolves `true` when Ollama answers with
+ * a model list (even an empty one), `false` on any transport error.
+ */
+export async function checkHealth(
+  endpoint: string,
+  transport: Transport = fetchTransport,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; models: string[]; error?: string }> {
+  try {
+    const models = await listModels(endpoint, transport, signal);
+    return { ok: true, models };
+  } catch (err) {
+    return { ok: false, models: [], error: (err as Error).message };
+  }
+}

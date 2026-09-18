@@ -1,0 +1,437 @@
+/**
+ * `agent-chat` — the 🤖 panel that drives the three authoring pages from one
+ * window, backed by an Ollama function-calling endpoint.
+ *
+ * Browser-only (plain DOM, no deps): it wires the pure agent core
+ * (`src/agent/*`) to the page controllers (`makeAsmController` /
+ * `makeGfxController` / `makeTrackController`). One send = one
+ * `runAgent()` loop (non-streaming `POST /api/chat` per step); the panel
+ * shows a thinking indicator, tool-call chips, and the final reply. Stop
+ * aborts the in-flight request via `AbortController`.
+ *
+ * Endpoint + model are user-configured (persisted to
+ * `localStorage["snes-web:agent:v1"]`); "test connection" fetches the
+ * installed-model list from `/api/tags`. The panel NEVER navigates the app —
+ * the one sanctioned navigation is `asm_run`'s handoff to the emulator,
+ * inside the assembler controller.
+ */
+
+import type { AgentControllers, Message, PageKind } from '../agent/types';
+import { checkHealth } from '../agent/ollama';
+import { runAgent, type AgentEvent } from '../agent/loop';
+import { buildSystemPrompt } from '../agent/system';
+
+const SETTINGS_KEY = 'snes-web:agent:v1';
+const DEFAULT_ENDPOINT = 'http://127.0.0.1:11434';
+
+interface AgentSettings {
+  endpoint: string;
+  model: string;
+}
+
+function loadSettings(): AgentSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) {
+      const v = JSON.parse(raw) as Partial<AgentSettings>;
+      if (typeof v.endpoint === 'string' && v.endpoint !== '' && typeof v.model === 'string') {
+        return { endpoint: v.endpoint, model: v.model };
+      }
+    }
+  } catch {
+    // private mode / bad JSON — fall through to defaults
+  }
+  return { endpoint: DEFAULT_ENDPOINT, model: '' };
+}
+
+function saveSettings(s: AgentSettings): void {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  } catch {
+    // best effort — the panel still works for this page load
+  }
+}
+
+/** A compact snapshot of all three pages, shown to the model in the prompt. */
+function stateSummary(controllers: AgentControllers): string {
+  const lines: string[] = [];
+  try {
+    const g = controllers.gfx.getState();
+    lines.push(
+      `graphics: mode ${g.mode}, ${g.tiles} tile(s), ${g.palette} palette colors, ${g.mapEntries}/1024 SC0 cells set`,
+    );
+    const files = controllers.asm.listDataFiles();
+    lines.push(
+      `assembler: source ${controllers.asm.getSource().length} bytes, data files ${files.length ? files.map((f) => `${f.name} (${f.bytes} B)`).join(', ') : '(none)'}`,
+    );
+    const song = JSON.parse(controllers.track.getSong()) as {
+      name?: string;
+      tempo?: number;
+      orders?: number[];
+      patterns?: unknown[];
+      instruments?: unknown[];
+    };
+    lines.push(
+      `tracker: "${song.name ?? 'song'}", ${song.tempo ?? '?'} rows/s, ${song.patterns?.length ?? '?'} pattern(s), ${song.instruments?.length ?? '?'} instrument(s), order [${(song.orders ?? []).join(', ')}]`,
+    );
+  } catch {
+    // controller snapshots are best-effort; an empty summary is fine
+  }
+  return `## Current page state\n${lines.join('\n')}`;
+}
+
+/** One rendered line of the conversation list. */
+type UiItem =
+  | { kind: 'user'; text: string }
+  | { kind: 'assistant'; text: string }
+  | { kind: 'chip'; name: string; args: Record<string, unknown>; ok?: boolean; content?: string }
+  | { kind: 'error'; text: string };
+
+const CSS = `
+.agc-root{position:fixed;right:16px;bottom:16px;width:min(430px,calc(100vw - 32px));height:min(600px,calc(100vh - 96px));display:flex;flex-direction:column;background:#14161b;border:1px solid #2e3440;border-radius:12px;box-shadow:0 10px 32px rgba(0,0,0,.55);z-index:1000;font:13px/1.5 ui-sans-serif,system-ui,sans-serif;color:#dde3ec}
+.agc-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #2e3440;cursor:default;flex:none}
+.agc-title{font-weight:600;font-size:14px}
+.agc-sub{color:#8a93a5;font-size:11px;margin-left:auto}
+.agc-toggle{cursor:pointer;background:none;border:none;color:#8a93a5;font-size:14px;padding:2px 6px}
+.agc-body{display:flex;flex-direction:column;flex:1;min-height:0}
+.agc-root.collapsed .agc-body{display:none}
+.agc-settings{display:grid;gap:6px;padding:10px 12px;border-bottom:1px solid #2e3440;flex:none}
+.agc-row{display:flex;gap:6px;align-items:center}
+.agc-settings input[type=text]{flex:1;min-width:0;background:#0f1115;border:1px solid #2e3440;border-radius:6px;color:#dde3ec;padding:5px 8px;font-size:12px}
+.agc-settings select{flex:1;min-width:0;background:#0f1115;border:1px solid #2e3440;border-radius:6px;color:#dde3ec;padding:5px 8px;font-size:12px}
+.agc-btn{background:#242a35;border:1px solid #343c4c;color:#dde3ec;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer}
+.agc-btn:hover{background:#2c3342}
+.agc-btn:disabled{opacity:.45;cursor:default}
+.agc-btn.primary{background:#2f6feb;border-color:#2f6feb;color:#fff}
+.agc-btn.primary:hover{background:#3b7bff}
+.agc-status{font-size:11px;color:#8a93a5;min-height:14px}
+.agc-status.err{color:#f0883e}
+.agc-status.ok{color:#56b369}
+.agc-hint{font-size:10.5px;color:#5d6575}
+.agc-msgs{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:12px}
+.agc-user,.agc-asst,.agc-error{max-width:92%;padding:8px 10px;border-radius:10px;white-space:pre-wrap;word-wrap:break-word}
+.agc-user{align-self:flex-end;background:#2f6feb22;border:1px solid #2f6feb55}
+.agc-asst{align-self:flex-start;background:#1c212b;border:1px solid #2e3440}
+.agc-error{align-self:flex-start;background:#f0883e1a;border:1px solid #f0883e66;color:#ffb27a}
+.agc-chip{align-self:flex-start;display:flex;flex-direction:column;gap:4px;background:#171b22;border:1px solid #2a3140;border-radius:8px;padding:6px 9px;font-size:12px}
+.agc-chip .top{display:flex;align-items:center;gap:6px}
+.agc-chip .name{font-weight:600;color:#9db1d8;font-family:ui-monospace,monospace}
+.agc-chip .badge{font-size:10.5px;padding:1px 6px;border-radius:8px}
+.agc-chip .badge.ok{background:#56b36922;color:#56b369}
+.agc-chip .badge.err{background:#f0883e22;color:#f0883e}
+.agc-chip .badge.run{background:#8a93a522;color:#8a93a5}
+.agc-chip details{font-size:11px;color:#8a93a5}
+.agc-chip details pre{white-space:pre-wrap;word-wrap:break-word;max-height:160px;overflow-y:auto;margin:4px 0 0}
+.agc-think{align-self:flex-start;color:#8a93a5;font-size:12px;padding:2px 4px}
+.agc-think i{display:inline-block;width:6px;height:6px;border-radius:50%;background:#8a93a5;margin-right:2px;animation:agc-blink 1.2s infinite}
+.agc-think i:nth-child(2){animation-delay:.2s}
+.agc-think i:nth-child(3){animation-delay:.4s}
+@keyframes agc-blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
+.agc-input{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border-top:1px solid #2e3440;flex:none}
+.agc-input textarea{width:100%;box-sizing:border-box;min-height:52px;max-height:140px;resize:vertical;background:#0f1115;border:1px solid #2e3440;border-radius:8px;color:#dde3ec;padding:8px;font:13px/1.45 ui-sans-serif,system-ui,sans-serif}
+.agc-actions{display:flex;gap:6px;justify-content:flex-end}
+`;
+
+function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string): HTMLElementTagNameMap[K] {
+  const n = document.createElement(tag);
+  if (className) n.className = className;
+  return n;
+}
+
+function fmtArgs(args: Record<string, unknown>): string {
+  try {
+    const s = JSON.stringify(args, null, 1);
+    return s.length > 600 ? `${s.slice(0, 600)}…` : s;
+  } catch {
+    return String(args);
+  }
+}
+
+function clip(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
+export function mountAgentChat(container: HTMLElement, page: PageKind, controllers: AgentControllers): void {
+  let settings = loadSettings();
+  let history: Message[] = [];
+  const items: UiItem[] = [];
+  let thinking = false;
+  let running = false;
+  let aborter: AbortController | null = null;
+
+  const root = el('div', 'agc-root');
+  const style = el('style');
+  style.textContent = CSS;
+  root.appendChild(style);
+
+  // --- header ---------------------------------------------------------------
+  const head = el('div', 'agc-head');
+  const title = el('span', 'agc-title');
+  title.textContent = '🤖 Agent';
+  const sub = el('span', 'agc-sub');
+  const PAGE_NAMES = { asm: 'assembler', gfx: 'graphics', track: 'tracker' } as const;
+  sub.textContent = `on ${PAGE_NAMES[page]}`;
+  const toggle = el('button', 'agc-toggle');
+  toggle.textContent = '▾';
+  toggle.title = 'Collapse / expand';
+  head.append(title, sub, toggle);
+  root.appendChild(head);
+  toggle.addEventListener('click', () => {
+    const collapsed = root.classList.toggle('collapsed');
+    toggle.textContent = collapsed ? '▸' : '▾';
+  });
+
+  const body = el('div', 'agc-body');
+  root.appendChild(body);
+
+  // --- settings -------------------------------------------------------------
+  const settingsBox = el('div', 'agc-settings');
+  const epRow = el('div', 'agc-row');
+  const epIn = document.createElement('input');
+  epIn.type = 'text';
+  epIn.value = settings.endpoint;
+  epIn.placeholder = 'http://127.0.0.1:11434';
+  epIn.spellcheck = false;
+  const testBtn = el('button', 'agc-btn');
+  testBtn.textContent = 'Test';
+  epRow.append(epIn, testBtn);
+
+  const modelRow = el('div', 'agc-row');
+  const modelSel = document.createElement('select');
+  const status = el('div', 'agc-status');
+  const hint = el('div', 'agc-hint');
+  hint.textContent =
+    'Phone/LAN: Ollama must allow this origin — run it with OLLAMA_ORIGINS=http://<host>:<port> (e.g. OLLAMA_ORIGINS=http://10.0.1.5:8080) or it will refuse the CORS preflight.';
+  modelRow.append(modelSel);
+  settingsBox.append(epRow, modelRow, status, hint);
+  body.appendChild(settingsBox);
+
+  function rebuildModelSelect(models: string[]): void {
+    const current = modelSel.value || settings.model;
+    modelSel.innerHTML = '';
+    const all = new Set<string>(models);
+    if (current && !all.has(current)) all.add(current);
+    if (all.size === 0) {
+      const opt = el('option');
+      opt.value = '';
+      opt.textContent = '— run “Test” to load models —';
+      modelSel.appendChild(opt);
+    }
+    for (const m of Array.from(all).sort()) {
+      const opt = el('option');
+      opt.value = m;
+      opt.textContent = m;
+      modelSel.appendChild(opt);
+    }
+    if (current && all.has(current)) modelSel.value = current;
+  }
+
+  function persistSettings(): void {
+    settings = { endpoint: epIn.value.trim(), model: modelSel.value };
+    saveSettings(settings);
+  }
+  epIn.addEventListener('change', persistSettings);
+  epIn.addEventListener('input', () => {
+    // live-update so a typo doesn't require a blur
+    settings.endpoint = epIn.value.trim();
+  });
+  modelSel.addEventListener('change', persistSettings);
+
+  testBtn.addEventListener('click', () => {
+    const ep = epIn.value.trim();
+    if (!ep) return;
+    persistSettings();
+    testBtn.disabled = true;
+    status.className = 'agc-status';
+    status.textContent = 'checking…';
+    void (async () => {
+      const res = await checkHealth(ep).catch(() => null);
+      testBtn.disabled = false;
+      if (res && res.ok) {
+        rebuildModelSelect(res.models);
+        persistSettings();
+        status.className = 'agc-status ok';
+        status.textContent =
+          res.models.length > 0
+            ? `connected — ${res.models.length} model(s) installed`
+            : 'connected — no models installed (ollama pull <model>)';
+      } else {
+        status.className = 'agc-status err';
+        status.textContent = res?.error ? `unreachable: ${res.error}` : 'unreachable (see CORS hint)';
+      }
+    })();
+  });
+
+  // --- message list -----------------------------------------------------------
+  const msgs = el('div', 'agc-msgs');
+  body.appendChild(msgs);
+
+  function renderChip(c: UiItem & { kind: 'chip' }): HTMLElement {
+    const chip = el('div', 'agc-chip');
+    const top = el('div', 'top');
+    const name = el('span', 'name');
+    name.textContent = c.name;
+    const badge = el('span', `badge ${c.ok === undefined ? 'run' : c.ok ? 'ok' : 'err'}`);
+    badge.textContent = c.ok === undefined ? 'running…' : c.ok ? 'ok' : 'error';
+    top.append(name, badge);
+    chip.appendChild(top);
+    if (c.args && Object.keys(c.args).length > 0) {
+      const d = document.createElement('details');
+      const s = document.createElement('summary');
+      s.textContent = 'arguments';
+      const pre = el('pre');
+      pre.textContent = fmtArgs(c.args);
+      d.append(s, pre);
+      chip.appendChild(d);
+    }
+    if (c.content !== undefined) {
+      const d = document.createElement('details');
+      const s = document.createElement('summary');
+      s.textContent = c.ok === false ? 'result (error)' : 'result';
+      const pre = el('pre');
+      pre.textContent = clip(c.content, 2000);
+      d.append(s, pre);
+      chip.appendChild(d);
+    }
+    return chip;
+  }
+
+  function renderAll(): void {
+    msgs.innerHTML = '';
+    for (const it of items) {
+      if (it.kind === 'user') {
+        const n = el('div', 'agc-user');
+        n.textContent = it.text;
+        msgs.appendChild(n);
+      } else if (it.kind === 'assistant') {
+        const n = el('div', 'agc-asst');
+        n.textContent = it.text;
+        msgs.appendChild(n);
+      } else if (it.kind === 'error') {
+        const n = el('div', 'agc-error');
+        n.textContent = it.text;
+        msgs.appendChild(n);
+      } else {
+        msgs.appendChild(renderChip(it));
+      }
+    }
+    if (thinking) {
+      const t = el('div', 'agc-think');
+      t.innerHTML = '<i></i><i></i><i></i>';
+      t.append(' thinking');
+      msgs.appendChild(t);
+    }
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  // --- input ------------------------------------------------------------------
+  const inputBox = el('div', 'agc-input');
+  const ta = document.createElement('textarea');
+  ta.placeholder = 'What should we make? (Enter to send, Shift+Enter for a newline)';
+  const actions = el('div', 'agc-actions');
+  const sendBtn = el('button', 'agc-btn primary');
+  sendBtn.textContent = 'Send';
+  const stopBtn = el('button', 'agc-btn');
+  stopBtn.textContent = 'Stop';
+  stopBtn.disabled = true;
+  actions.append(sendBtn, stopBtn);
+  inputBox.append(ta, actions);
+  body.appendChild(inputBox);
+
+  function send(): void {
+    const text = ta.value.trim();
+    if (!text || running) return;
+    const ep = epIn.value.trim();
+    const model = modelSel.value;
+    if (!ep || !model) {
+      status.className = 'agc-status err';
+      status.textContent = 'set the endpoint and a model (Test connection loads the list)';
+      return;
+    }
+    persistSettings();
+    ta.value = '';
+    items.push({ kind: 'user', text });
+    history.push({ role: 'user', content: text });
+    thinking = true;
+    running = true;
+    sendBtn.disabled = true;
+    stopBtn.disabled = false;
+    aborter = new AbortController();
+    renderAll();
+
+    const pending: (UiItem & { kind: 'chip' })[] = [];
+    const onEvent = (ev: AgentEvent): void => {
+      if (ev.type === 'thinking') {
+        thinking = true;
+        renderAll();
+      } else if (ev.type === 'tool-call') {
+        const chip: UiItem & { kind: 'chip' } = { kind: 'chip', name: ev.name, args: ev.args };
+        items.push(chip);
+        pending.push(chip);
+        renderAll();
+      } else if (ev.type === 'tool-result') {
+        // The loop dispatches calls in order, so pop the first open chip.
+        const chip = pending.shift();
+        const target = chip && chip.name === ev.name ? chip : items[items.length - 1];
+        if (target && target.kind === 'chip') {
+          target.ok = ev.ok;
+          target.content = ev.content;
+        }
+        renderAll();
+      } else if (ev.type === 'message') {
+        if (ev.content.trim() !== '') items.push({ kind: 'assistant', text: ev.content });
+        renderAll();
+      }
+    };
+
+    void (async () => {
+      try {
+        const res = await runAgent({
+          endpoint: ep,
+          model,
+          system: buildSystemPrompt(page, stateSummary(controllers)),
+          messages: history,
+          controllers,
+          signal: aborter?.signal,
+          onEvent,
+        });
+        // Continue the conversation from the full wire history (minus system).
+        history = res.messages.slice(1);
+        if (res.stopped === 'max-turns' && res.finalContent.trim() === '') {
+          items.push({
+            kind: 'assistant',
+            text: '⏸ Stopped at the 10-step limit mid-task. Send “continue” to pick up where I left off.',
+          });
+        }
+        if (res.stopped === 'aborted') {
+          items.push({ kind: 'assistant', text: '⏹ Stopped.' });
+        }
+      } catch (err) {
+        items.push({ kind: 'error', text: `Ollama error: ${(err as Error).message}` });
+      } finally {
+        thinking = false;
+        running = false;
+        sendBtn.disabled = false;
+        stopBtn.disabled = true;
+        aborter = null;
+        renderAll();
+      }
+    })();
+  }
+
+  sendBtn.addEventListener('click', send);
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+  stopBtn.addEventListener('click', () => aborter?.abort());
+
+  // --- init ---------------------------------------------------------------------
+  rebuildModelSelect([]);
+  if (settings.model) modelSel.value = settings.model;
+  renderAll();
+
+  container.appendChild(root);
+}

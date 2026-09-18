@@ -69,6 +69,10 @@ Emscripten exposes each `core_*` function as `Module._core_*`.
   see below), `core_set_breakpoint`, `core_clear_breakpoint`,
   `core_breakpoint_count/bank/addr`
 - **Save-state differ:** `core_sram_ptr`, `core_wram_ptr`
+- **Graphics:** `core_vram_ptr` — the base of the core's 64 KB PPU VRAM
+  (tile graphics + CG-RAM palettes + tilemaps). VRAM is PPU-only, **not on
+  the CPU bus**, so `core_read_mem_into` cannot reach it; the app reads it
+  directly through this pointer (see [`GRAPHICS.md`](../GRAPHICS.md)).
 
 Breakpoint *hits* are delivered C→JS: the shim calls the `EM_JS` bridge
 `js_on_breakpoint(bank, addr)`, which invokes `Module._s9xBreakpoint` — a

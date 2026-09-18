@@ -554,3 +554,8 @@ EMSCRIPTEN_KEEPALIVE
 unsigned char *core_wram_ptr(void) {
     return g_ready ? Memory.RAM : NULL;
 }
+
+EMSCRIPTEN_KEEPALIVE
+unsigned char *core_vram_ptr(void) {
+    return g_ready ? Memory.VRAM : NULL;
+}

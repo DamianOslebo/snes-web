@@ -7,11 +7,17 @@ editor lives on its own full page — `?asm=1`, reached from the "⌨ Assembler"
 transport button — because a debugger panel was too cramped to write and review
 code in. The old panel has been removed from the debugger.
 
+🤖 The agent panel (present on all three authoring pages) can drive this page end-to-end — see [AGENT.md](AGENT.md).
+
 The assembler no longer writes bytes into the core's RAM. It **builds a valid
 256 KB LoROM SFC image** from the assembled code (`src/asm/rom.ts`) and hands it
 to the emulator (`▶ Run in emulator`) or to the user (`⬇ Download .sfc`), so the
 CPU *executes it from the reset vector on a cold boot* — the missing "run the
 assembled code" capability, achieved without any PC-setter ABI change.
+
+**New (uncommitted): `.incbin` / `.bin`** — embed a loaded binary file
+(`📦 Data files…`) into the ROM at that position and reference its address by
+label. See the `.incbin` section below + `test/incbin.test.ts`.
 
 **Load-gate fix:** the cart header is now emitted at its real location
 (file offset `$7FB0`), with the `ROMSize` byte at `$7FD7` set to a valid value.
@@ -230,6 +236,44 @@ DOM, unit-testable like the rest of `src/asm/`.
   URL, and one valid base64 string (a single `btoa` over a bounded binary build,
   not per-chunk `btoa` which leaves `=` padding mid-string).
 
+### `.incbin` — embed binary data files (uncommitted)
+
+The assembler now accepts two new directives, `.incbin "file"` (and the
+`.bin` alias), which embed a loaded `.bin` file's bytes verbatim at that
+position — the way to pull the graphics editor's VRAM dump (or any
+tileset/PCM/SFX data) into the built ROM.
+
+- **Syntax:** `label: .incbin "tiles.bin"` (or `.incbin 'x'`, `.bin x` —
+  quoted, single-quoted, or bare; names with spaces work when quoted).
+  Unknown names fail with the loaded-file list; zero files loaded fails
+  with a "load it first" message; every failure is line-numbered.
+- **Address referencing:** a label **on** the include line resolves to
+  the data's first CPU byte (`origin + offset`); a label on the next line
+  resolves just past it — so `data: .incbin "t.bin"` followed by
+  `LDA data,X` / `JSR handler` / `CMP data+3` are all ordinary label uses.
+  Branches correctly span the data (the byte map is real bytes, so the
+  two-pass offset sweep sees it).
+- **Cap:** code **plus** data must fit the 32 KB entry region
+  (`MAX_CODE = $7FB0`, file `$0000–$7FAF`) — a full 64 KB VRAM image does
+  **not** fit; a typical KB-scale tileset does. The escape hatch for more
+  than 32 KB is multi-bank placement (`.org` into bank `$01`, file `$8000`)
+  — deliberately not in v1 (the ROM is fixed 256 KB; bigger images mean a
+  512 KB+ image and `ROMSize` changes).
+- **Engine cost:** zero — the bytes materialize into `Line.data` at parse
+  time, so sizing, labels, branch ranges, the `buildRom` cap check, and
+  the listing all inherit it. The page's listing caps a displayed include
+  at 16 bytes + "… +N more" so a 64 KB dump can't wreck the DOM.
+- **Page:** a "📦 Data files…" picker (`.bin/.dat/.img/.rom`, multi-file)
+  keeps the bytes in page state (chips with size + remove); each change
+  re-assembles live. `assemble(source, origin, includes)` — the third
+  argument is the new `IncludeMap` (`Record<string, Uint8Array>`).
+- **Tests:** `test/incbin.test.ts` — 13 tests: exact byte placement,
+  alias/quote/name variants, multi-include ordering, label-before and
+  label-after addressing (`LDA data,X` → `bd lo hi` over the data,
+  `BRA past` rel = +4 over a 4-byte include), the three error cases,
+  end-to-end `buildRom` → `looksLikeSnesRom` with the data at its file
+  offset, the `$7FB0` overflow throw, and the exact-fit boundary.
+
 ### `test/rom.test.ts` (new) — 11 tests, all green
 
 Exact 256 KB size; code byte-for-byte at file `$0000` (== CPU `$008000`);
@@ -271,6 +315,11 @@ review code. Reached from the "⌨ Assembler" transport button, which sets
 - **⬇ Download .sfc** → the same `buildRom` image written to disk as
   `assembled.sfc` (an object-URL anchor click) — the "ROM file" the user can
   keep or load elsewhere.
+- **📦 Data files…** → pick `.bin`/`.dat`/`.img`/`.rom` files to embed with
+  `.incbin "name"` (e.g. the graphics editor's 64 KB VRAM dump or a slice of
+  it). Loaded files show as chips (name · size · ✕); removing one re-assembles
+  so a dangling `.incbin` fails loudly. The listing shows an include's first
+  16 bytes + "… +N more" — never the full dump.
 - "← Back to game" strips the param and reboots the emulator.
 
 The debugger's old Assembler panel (and its `buildMemToolbar` return-value
@@ -296,7 +345,8 @@ to its five core panels.
 npx vitest run test/asm.test.ts      # 20 tests (incl. round-trips)
 npx vitest run test/disasm.test.ts   # 9 tests
 npx vitest run test/rom.test.ts      # 11 tests (header, vectors, checksums, gate, base64)
-npx vitest run                       # full suite: 80 tests
+npx vitest run test/incbin.test.ts   # 13 tests (placement, labels, cap, errors)
+npx vitest run                       # full suite (asm + gfx + mock + …)
 npm run typecheck
 npm run build
 ```

@@ -13,6 +13,8 @@ export interface Ui {
   stepBtn: HTMLButtonElement;
   saveBtn: HTMLButtonElement;
   asmBtn: HTMLButtonElement;
+  gfxBtn: HTMLButtonElement;
+  trackBtn: HTMLButtonElement;
   focusBtn: HTMLButtonElement;
   fullscreenBtn: HTMLButtonElement;
   bindingsBtn: HTMLButtonElement;
@@ -60,6 +62,12 @@ export function buildUi(mount: HTMLElement): Ui {
   // Always visible (unlike the gamepad-only Controller button).
   const asmBtn = el('button', 'btn', '⌨ Assembler');
   asmBtn.title = 'Open the 65C816 assembler';
+  // Graphics editor + VRAM inspector — a full page (?gfx=1).
+  const gfxBtn = el('button', 'btn', '🎨 Graphics');
+  gfxBtn.title = 'Open the graphics editor / VRAM inspector';
+  // Music tracker — a full page (?track=1), core-free like the graphics page.
+  const trackBtn = el('button', 'btn', '🎵 Music');
+  trackBtn.title = 'Open the SNES music tracker';
   const focusBtn = el('button', 'btn', '🎮 Focus');
   const fullscreenBtn = el('button', 'btn', '⛶ Fullscreen');
   // Only meaningful once a gamepad is detected; main.ts reveals it then
@@ -67,7 +75,7 @@ export function buildUi(mount: HTMLElement): Ui {
   const bindingsBtn = el('button', 'btn', '🎮 Controller');
   bindingsBtn.hidden = true;
   bindingsBtn.title = 'Configure controller button bindings';
-  for (const b of [playBtn, pauseBtn, stepBtn, saveBtn, asmBtn, focusBtn, fullscreenBtn, bindingsBtn]) {
+  for (const b of [playBtn, pauseBtn, stepBtn, saveBtn, asmBtn, gfxBtn, trackBtn, focusBtn, fullscreenBtn, bindingsBtn]) {
     transport.appendChild(b);
   }
   // Keep the keyboard for the game: a clicked button would otherwise retain
@@ -96,7 +104,7 @@ export function buildUi(mount: HTMLElement): Ui {
 
   mount.appendChild(root);
 
-  return { root, canvas, status, romInput, playBtn, pauseBtn, stepBtn, saveBtn, asmBtn, focusBtn, fullscreenBtn, bindingsBtn, exitFocusBtn, debug };
+  return { root, canvas, status, romInput, playBtn, pauseBtn, stepBtn, saveBtn, asmBtn, gfxBtn, trackBtn, focusBtn, fullscreenBtn, bindingsBtn, exitFocusBtn, debug };
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(

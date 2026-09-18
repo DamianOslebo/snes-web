@@ -16,3 +16,9 @@ core/*.js.map
 .DS_Store
 .idea/
 .vscode/
+
+# local Claude Code state (worktrees, etc.)
+.claude/
+
+# reference PDFs — keep the markdown, not the 33 MB of source PDFs
+snes_manual/*.pdf

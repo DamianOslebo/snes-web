@@ -10,9 +10,31 @@ import { FrameLoop } from './runtime/frame-loop';
 import { buildUi } from './ui/app';
 import { mountBindings } from './ui/bindings';
 import { mountAssembler } from './ui/assembler';
+import { mountInputTest } from './ui/input-test';
+import { mountGraphics } from './ui/graphics';
+import { mountTrack } from './ui/track';
+import { mountAgentChat } from './ui/agent-chat';
+import { makeAsmController } from './ui/assembler';
+import { makeGfxController } from './ui/graphics';
+import { makeTrackController } from './ui/track';
+import type { AgentControllers } from './agent/types';
 import { ASM_ROM_KEY, base64ToBytes } from './asm/rom';
 import { mountDebug } from './debug/debugger';
 import workletSource from './runtime/worklet.js?raw';
+
+/**
+ * The controllers the 🤖 agent panel drives. All three are always available —
+ * each reads/writes its page's persisted (localStorage) state, so the agent
+ * can edit any page from any of the three, re-rendering a page only when it
+ * happens to be on screen.
+ */
+function agentControllers(): AgentControllers {
+  return {
+    asm: makeAsmController(),
+    gfx: makeGfxController(),
+    track: makeTrackController(),
+  };
+}
 
 async function boot(): Promise<void> {
   const mountEl = document.getElementById('app');
@@ -33,6 +55,35 @@ async function boot(): Promise<void> {
   // (⬇ Download). No core/audio needed to author, so it works on any origin.
   if (new URLSearchParams(location.search).get('asm') === '1') {
     mountAssembler(mountEl);
+    mountAgentChat(mountEl, 'asm', agentControllers());
+    return;
+  }
+
+  // Input probe (?inputtest=1): a diagnostic that shows what the browser
+  // actually receives from a controller (keyboard events + Gamepad API).
+  // Standalone like the bindings page — no core, no audio. Useful for finding
+  // out whether a pad (e.g. a Backbone on an Android phone) is even visible
+  // to the web page before we attempt to bind it.
+  if (new URLSearchParams(location.search).get('inputtest') === '1') {
+    mountInputTest(mountEl);
+    return;
+  }
+
+  // Graphics page (?gfx=1), reached from the "Graphics" button: a live VRAM
+  // Inspector (load a ROM, read the core's 64 KB of PPU VRAM) and a core-free
+  // tile/palette/tilemap Editor that downloads a raw VRAM image.
+  if (new URLSearchParams(location.search).get('gfx') === '1') {
+    mountGraphics(mountEl);
+    mountAgentChat(mountEl, 'gfx', agentControllers());
+    return;
+  }
+
+  // Music tracker (?track=1), reached from the "Music" button: a core-free
+  // FamiTracker-style editor for the S-DSP — pattern grid, instrument rack,
+  // song order — with Web Audio preview. No core/audio boot, like the others.
+  if (new URLSearchParams(location.search).get('track') === '1') {
+    mountTrack(mountEl);
+    mountAgentChat(mountEl, 'track', agentControllers());
     return;
   }
 
@@ -233,6 +284,20 @@ async function boot(): Promise<void> {
   ui.asmBtn.addEventListener('click', () => {
     const url = new URL(location.href);
     url.searchParams.set('asm', '1');
+    location.href = url.toString();
+  });
+  // Opens the graphics page (?gfx=1). "Back to emulator" there strips the
+  // param, so the app reboots normally.
+  ui.gfxBtn.addEventListener('click', () => {
+    const url = new URL(location.href);
+    url.searchParams.set('gfx', '1');
+    location.href = url.toString();
+  });
+  // Opens the music tracker page (?track=1). "Back to emulator" there strips
+  // the param, so the app reboots normally.
+  ui.trackBtn.addEventListener('click', () => {
+    const url = new URL(location.href);
+    url.searchParams.set('track', '1');
     location.href = url.toString();
   });
   // Touch escape hatch for focus mode (Esc/F1 don't exist on a phone).

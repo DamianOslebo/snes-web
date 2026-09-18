@@ -18,6 +18,12 @@
  *  - Branch operands: a label, an explicit signed offset (`+$2` / `-$3`), or
  *    an absolute target `$bank:addr` — the same target form the disassembler
  *    prints, which is what makes the text round-trip work.
+ *  - `.incbin "file.bin"` (alias `.bin`) embeds a loaded binary file's bytes
+ *    at that point in the stream — the data-include hook for e.g. the
+ *    graphics editor's VRAM `.bin`. The bytes materialize into `Line.data`
+ *    exactly like `.byte`, so sizing, labels, and layout all inherit it: a
+ *    label BEFORE the line resolves to the data's CPU address, one AFTER
+ *    points just past it. No separate linker pass needed.
  *  - Deliberately does NOT interpret "direct page" / bank-relative modes.
  *    Numeric addresses are classified by the width AS WRITTEN — ≤2 hex digits
  *    → zero-page, 3–4 → absolute — the same convention the disassembler
@@ -45,6 +51,9 @@ export interface AsmLine {
 export interface AsmLabel { name: string; offset: number; address: number; }
 
 export interface AsmError { line: number; message: string; }
+
+/** Binary files embeddable with `.incbin` / `.bin` — file name → bytes. */
+export type IncludeMap = Record<string, Uint8Array>;
 
 export interface AsmResult {
   ok: boolean;
@@ -123,14 +132,14 @@ function stripComment(s: string): string {
   return s.slice(0, end);
 }
 
-const DIRECTIVES = new Set(['.byte', '.db', '.word', '.dw', '.ascii', '.asciz', '.text']);
+const DIRECTIVES = new Set(['.byte', '.db', '.word', '.dw', '.ascii', '.asciz', '.text', '.incbin', '.bin']);
 
 /**
  * Parse one source line into a `Line`. Label is optional (`name:`), then a
  * mnemonic and optional operand, or a directive. Empty/label-only lines are
  * legal (a bare label points at the current offset).
  */
-function parseLine(num: number, raw: string): Line {
+function parseLine(num: number, raw: string, includes?: IncludeMap): Line {
   let s = stripComment(raw).trim();
   if (s === '') return { num, mnem: '', operandRaw: '' };
 
@@ -157,6 +166,9 @@ function parseLine(num: number, raw: string): Line {
     }
     if (m === '.word' || m === '.dw') {
       return { num, label, mnem: m, operandRaw, data: parseWordList(num, operandRaw) };
+    }
+    if (m === '.incbin' || m === '.bin') {
+      return { num, label, mnem: m, operandRaw, data: parseInclude(num, operandRaw, includes) };
     }
     return { num, label, mnem: m, operandRaw, data: parseAscii(num, operandRaw) };
   }
@@ -209,6 +221,30 @@ function parseAscii(num: number, s: string): number[] {
     out.push(c & 0xff);
   }
   return out;
+}
+
+/**
+ * `.incbin "name"` / `.bin`: the operand is the file NAME (quoted or bare),
+ * not its contents — the bytes come from the `includes` map passed to
+ * `assemble()`. Everything after the name check is inherited: the bytes land
+ * in `Line.data`, so `sizeOfLine`, the label pass, and `layout` treat the
+ * line exactly like a `.byte` sequence (that is what makes a preceding label
+ * resolve to the data's address). Fails loudly — an assembler that guesses a
+ * missing file is worse than one that refuses.
+ */
+function parseInclude(num: number, s: string, includes: IncludeMap | undefined): number[] {
+  let t = s.trim();
+  if (t.length >= 2 && ((t[0] === '"' && t[t.length - 1] === '"') || (t[0] === "'" && t[t.length - 1] === "'"))) {
+    t = t.slice(1, -1).trim();
+  }
+  if (t === '') throw new AsmFail(num, '.incbin needs a file name — e.g. `.incbin "tiles.bin"`');
+  if (!includes || Object.keys(includes).length === 0) {
+    throw new AsmFail(num, `no data files are loaded yet — load "${t}" (or any .bin) and re-assemble`);
+  }
+  if (!includes[t]) {
+    throw new AsmFail(num, `unknown include "${t}" (loaded: ${Object.keys(includes).join(', ')})`);
+  }
+  return Array.from(includes[t]);
 }
 
 /**
@@ -603,14 +639,19 @@ function encodeLine(ln: Line, origin: number, labelOffset: Map<string, number>, 
  * `origin` is the 24-bit base address: labels resolve to `origin + offset`, and
  * that is what gets emitted into absolute/long operands. Default $008000 — the
  * conventional 5A22 reset vector region and where this project's mock seeds.
+ *
+ * `includes` (optional) is the name→bytes map for `.incbin` / `.bin`: each
+ * directive embeds that file's bytes at its position, and labels around it
+ * resolve against the same offsets as any other data. Omit it and any
+ * `.incbin` line fails with a line-numbered error.
  */
-export function assemble(source: string, origin = 0x008000): AsmResult {
+export function assemble(source: string, origin = 0x008000, includes?: IncludeMap): AsmResult {
   const result: AsmResult = {
     ok: false, origin, bytes: new Uint8Array(0), lines: [], labels: [], errors: [], modeTrace: [],
   };
   try {
     const rawLines = source.replace(/\r\n/g, '\n').split('\n');
-    const lines: Line[] = rawLines.map((t, i) => parseLine(i + 1, t));
+    const lines: Line[] = rawLines.map((t, i) => parseLine(i + 1, t, includes));
 
     markPState(lines);
     const labelOffset = labelPass(lines, origin);

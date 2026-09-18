@@ -13,6 +13,7 @@ const SCRIPT_URL = '/core/build/snes9x.js';
 const EXPORT_NAME = 'snesWasm';
 const SRAM_SIZE = 0x20000; // 128KB
 const WRAM_SIZE = 0x20000; // 128KB
+const VRAM_SIZE = 0x10000; // 64KB
 
 /**
  * The C ABI the snes9x shim (core/shim/s9x_shim.c) must export. Keep in sync
@@ -59,6 +60,7 @@ export interface S9xModule {
 
   _core_sram_ptr(): number;
   _core_wram_ptr(): number;
+  _core_vram_ptr(): number;
 }
 
 type Factory = (moduleOverrides?: Record<string, unknown>) => Promise<S9xModule>;
@@ -279,6 +281,17 @@ export class WasmCore implements SnesCore {
       out.push({ bank: M._core_breakpoint_bank(i) & 0xff, addr: M._core_breakpoint_addr(i) & 0xffff });
     }
     return out;
+  }
+
+  /**
+   * The core's 64 KB PPU VRAM (tile graphics + CG-RAM palettes + tilemaps).
+   * VRAM is PPU-only — not on the CPU bus — so `readMem` cannot reach it;
+   * this reads it straight from `core_vram_ptr` instead.
+   */
+  readVram(): Uint8Array {
+    const M = this.M;
+    const vram = M._core_vram_ptr();
+    return M.HEAPU8.slice(vram, vram + VRAM_SIZE);
   }
 
   // --- save states -------------------------------------------------------

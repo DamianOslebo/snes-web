@@ -10,6 +10,9 @@ import {
   type SnesRegisters,
   type VideoFrame,
 } from './types';
+import { buildVram, VRAM_SIZE } from '../gfx/vram';
+import { rgb15, type Rgb15 } from '../gfx/palette';
+import { type TilemapEntry } from '../gfx/tilemap';
 
 // The 65C816 address space is 256 banks of 64KB (16MB) with 8-bit bank
 // numbers. The mock gives every bank real storage and treats bank $7E as
@@ -47,6 +50,8 @@ export class MockCore implements SnesCore {
   private lastAudio!: AudioFrame;
 
   private breakpoints = new Map<number, { bank: number; addr: number }>();
+  /** Seeded 64 KB PPU VRAM so the graphics Inspector is demoable core-free. */
+  private readonly vram: Uint8Array;
   onBreakpoint?: (hit: BreakpointHit) => void;
 
   // Ordered (addr, byte-length) sequence the mock PC walks through.
@@ -64,9 +69,75 @@ export class MockCore implements SnesCore {
 
   constructor() {
     this.mem = Array.from({ length: BANKS }, () => new Uint8Array(BANK_SIZE));
+    this.vram = this.seedVram();
     this.seedProgram();
     this.render(0);
     this.generateAudio(0, 0);
+  }
+
+  /**
+   * Build a small, recognizable 8×8 / 4-color (mode 0) tile set with a palette
+   * and a few tilemap entries, so the graphics Inspector has something to show
+   * without a real core. Uses the same gfx encoders the Editor exports, so the
+   * mock's VRAM is guaranteed to round-trip through them.
+   */
+  private seedVram(): Uint8Array {
+    const tiles: number[][][] = [
+      [
+        [1, 0, 1, 0, 1, 0, 1, 0],
+        [0, 1, 0, 1, 0, 1, 0, 1],
+        [1, 0, 1, 0, 1, 0, 1, 0],
+        [0, 1, 0, 1, 0, 1, 0, 1],
+        [1, 0, 1, 0, 1, 0, 1, 0],
+        [0, 1, 0, 1, 0, 1, 0, 1],
+        [1, 0, 1, 0, 1, 0, 1, 0],
+        [0, 1, 0, 1, 0, 1, 0, 1],
+      ],
+      [
+        [2, 2, 2, 2, 3, 3, 3, 3],
+        [2, 2, 2, 2, 3, 3, 3, 3],
+        [2, 2, 2, 2, 3, 3, 3, 3],
+        [2, 2, 2, 2, 3, 3, 3, 3],
+        [2, 2, 2, 2, 3, 3, 3, 3],
+        [2, 2, 2, 2, 3, 3, 3, 3],
+        [2, 2, 2, 2, 3, 3, 3, 3],
+        [2, 2, 2, 2, 3, 3, 3, 3],
+      ],
+      [
+        [0, 1, 2, 3, 0, 1, 2, 3],
+        [0, 1, 2, 3, 0, 1, 2, 3],
+        [0, 1, 2, 3, 0, 1, 2, 3],
+        [0, 1, 2, 3, 0, 1, 2, 3],
+        [0, 1, 2, 3, 0, 1, 2, 3],
+        [0, 1, 2, 3, 0, 1, 2, 3],
+        [0, 1, 2, 3, 0, 1, 2, 3],
+        [0, 1, 2, 3, 0, 1, 2, 3],
+      ],
+    ];
+    // A CGRAM palette is always 16 colors (32 B); indices 0-3 are the ones
+    // the tiles above use, the rest are a visible ramp so the Inspector's
+    // palette strip has something to show.
+    const palette: Rgb15[] = [
+      { r: 0, g: 0, b: 0, transparent: true }, // 0 = transparent
+      rgb15(31, 0, 0), // 1 = red
+      rgb15(0, 31, 0), // 2 = green
+      rgb15(0, 0, 31), // 3 = blue
+      rgb15(31, 31, 0), // 4 = yellow
+      rgb15(31, 0, 31), // 5 = magenta
+      rgb15(0, 31, 31), // 6 = cyan
+      rgb15(31, 31, 31), // 7 = white
+    ];
+    for (let i = 8; i < 16; i++) palette.push(rgb15(i - 8, 15, 31 - (i - 8)));
+    const map: TilemapEntry[] = new Array(1024).fill(0).map((_, i) => ({
+      tile: [0, 1, 2][i % 3],
+      palette: 0,
+      flipX: false,
+      flipY: false,
+      priority: false,
+    }));
+    // Map at $8000 (SCBase $4000): the usual real-world placement just below
+    // CGRAM, and non-overlapping with the tiles at char slots 0-2.
+    return buildVram({ mode: 0, tiles, palettes: [palette], tilemap: map, tileBase: 0, paletteBase: 0, mapBase: 0x8000 });
   }
 
   private seedProgram(): void {
@@ -168,6 +239,11 @@ export class MockCore implements SnesCore {
       const off = (addr + i) & 0xffff;
       this.mem[bank & 0xff][off] = bytes[i];
     }
+  }
+
+  /** The core's 64 KB PPU VRAM (seeded tile set + palette + tilemap). */
+  readVram(): Uint8Array {
+    return this.vram.slice(0, VRAM_SIZE);
   }
 
   readRegisters(): SnesRegisters {

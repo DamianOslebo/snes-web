@@ -422,9 +422,16 @@ const EXTRA_CSS = `
 .debug .toolbar select, .debug .toolbar input { max-width: 160px; }
 .debug .btn.mini { padding: 3px 8px; font-size: 12px; }
 .debug .dh, .debug .row, .debug .mrow, .debug .slot {
-  display: grid; grid-template-columns: 70px 90px 56px 1fr; gap: 8px;
+  display: grid; gap: 8px;
   align-items: baseline; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+.debug .dh, .debug .row, .debug .slot { grid-template-columns: 70px 90px 56px 1fr; }
+/* Memory rows have 3 cells (addr / 16-byte hex / ascii), not the 4-cell disasm
+   layout — the shared 90px middle column was squeezing the hex to ~4 bytes per
+   line. Give the hex field the flexible track and keep it on one line (the body
+   scrolls horizontally if the panel is narrower than the 16-byte row). */
+.debug .mrow { grid-template-columns: auto 1fr auto; }
+.debug .mrow .b { white-space: nowrap; }
 .debug .dh { color: #8a8a92; border-bottom: 1px solid #2a2a30; }
 .debug .row.cur { color: #ffe08a; background: rgba(255,224,138,.08); }
 .debug .m { color: #9ad0ff; }

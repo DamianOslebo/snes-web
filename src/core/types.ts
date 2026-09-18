@@ -13,6 +13,9 @@
 export const SNES_WIDTH = 256;
 export const SNES_HEIGHT = 224;
 
+/** SNES PPU video RAM size: 64 KB (tile graphics + palettes + tilemaps). */
+export const VRAM_SIZE = 0x10000;
+
 /** Nominal SNES SPU sample rate — fallback only; snes9x runs the SPC at 32040 Hz. */
 export const SNES_AUDIO_RATE = 32_000;
 
@@ -154,6 +157,14 @@ export interface SnesCore {
   readMem(bank: number, addr: number, len: number): Uint8Array;
   writeMem(bank: number, addr: number, bytes: Uint8Array): void;
   readRegisters(): SnesRegisters;
+
+  /**
+   * The core's 64 KB PPU VRAM (tile graphics at $0000–$7FFF, CG-RAM palettes
+   * at $C000–$DFFF, tilemaps at their SC-base). VRAM is PPU-only — not on
+   * the CPU bus — so `readMem` cannot reach it; this is the read path.
+   * `VRAM_SIZE` bytes.
+   */
+  readVram(): Uint8Array;
 
   /** Single-step one CPU instruction (debug only). */
   step(): void;
