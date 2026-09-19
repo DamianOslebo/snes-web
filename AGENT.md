@@ -35,9 +35,25 @@ work and re-render the page when it's on screen.
 Non-streaming by design: one send = one agent loop of `POST /api/chat` steps.
 Each step the model may request tools; the panel shows a tool chip per call
 (arguments expandable, result expandable), a thinking indicator, and the final
-reply. **Stop** aborts the in-flight request. The panel never navigates the
-app — the only navigation is `asm_run`'s handoff to the emulator, which is the
-intended end of a task.
+reply. **Stop** aborts the in-flight request.
+
+## One conversation across all three pages
+
+The panel's tabs (**65C816 · 🎨 Graphics · 🎵 Music**) switch between the
+authoring pages — this is the *only* navigation the panel does, and it is
+always **you** clicking it (the agent itself never navigates; the other
+sanctioned navigation is `asm_run`'s handoff to the emulator).
+
+The conversation is shared: the message history — the exact context sent to
+Ollama — is persisted to `localStorage["snes-web:agent-conversation:v1"]`
+after every send and turn, and restored on every page mount. So:
+
+- Switching pages keeps the **same context** (the per-page system prompt
+  still updates to the page you're on; the chat history continues).
+- A mid-turn reload is safe: a dangling tool call is dropped on restore, and
+  the history ends at your last message — send "continue" to pick up.
+- **↺ New** clears the conversation only (your code/graphics/music pages are
+  kept).
 
 ## Tool reference (28)
 

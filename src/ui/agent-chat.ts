@@ -11,15 +11,22 @@
  *
  * Endpoint + model are user-configured (persisted to
  * `localStorage["snes-web:agent:v1"]`); "test connection" fetches the
- * installed-model list from `/api/tags`. The panel NEVER navigates the app —
- * the one sanctioned navigation is `asm_run`'s handoff to the emulator,
- * inside the assembler controller.
+ * installed-model list from `/api/tags`.
+ *
+ * The conversation itself is ONE across all three authoring pages: the
+ * message history (the exact context sent to Ollama) is persisted to
+ * `localStorage["snes-web:agent-conversation:v1"]` and restored on every
+ * mount, and a tab strip switches between the pages. User-clicked navigation
+ * is safe because the history survives the reload; the agent itself still
+ * NEVER navigates — the one sanctioned navigation is `asm_run`'s handoff to
+ * the emulator, inside the assembler controller.
  */
 
 import type { AgentControllers, Message, PageKind } from '../agent/types';
 import { checkHealth } from '../agent/ollama';
 import { runAgent, type AgentEvent } from '../agent/loop';
 import { buildSystemPrompt } from '../agent/system';
+import { clearHistory, loadHistory, saveHistory } from '../agent/conversation';
 
 const SETTINGS_KEY = 'snes-web:agent:v1';
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:11434';
@@ -127,6 +134,14 @@ const CSS = `
 .agc-think i:nth-child(2){animation-delay:.2s}
 .agc-think i:nth-child(3){animation-delay:.4s}
 @keyframes agc-blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
+.agc-nav{display:flex;gap:6px;align-items:center;padding:8px 12px;border-bottom:1px solid #2e3440;flex:none}
+.agc-navbtn{flex:1;min-width:0;background:#1a1f28;border:1px solid #2e3440;border-radius:6px;color:#aeb8c9;padding:5px 6px;font-size:11.5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agc-navbtn:hover{background:#242a35}
+.agc-navbtn.cur{background:#2f6feb22;border-color:#2f6feb88;color:#9db1d8;font-weight:600}
+.agc-navbtn:disabled{opacity:.45;cursor:default}
+.agc-new{flex:0 0 auto;background:none;border:1px solid #2e3440;border-radius:6px;color:#8a93a5;font-size:11.5px;padding:5px 8px;cursor:pointer}
+.agc-new:hover{background:#242a35;color:#dde3ec}
+.agc-new:disabled{opacity:.45;cursor:default}
 .agc-input{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border-top:1px solid #2e3440;flex:none}
 .agc-input textarea{width:100%;box-sizing:border-box;min-height:52px;max-height:140px;resize:vertical;background:#0f1115;border:1px solid #2e3440;border-radius:8px;color:#dde3ec;padding:8px;font:13px/1.45 ui-sans-serif,system-ui,sans-serif}
 .agc-actions{display:flex;gap:6px;justify-content:flex-end}
@@ -151,10 +166,53 @@ function clip(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n)}…` : s;
 }
 
+/** Tool results are compact JSON; errors carry an `error` field (tools.ts `fail`). */
+function resultLooksOk(content: string): boolean {
+  try {
+    const j: unknown = JSON.parse(content);
+    if (j && typeof j === 'object' && 'error' in (j as Record<string, unknown>)) return false;
+  } catch {
+    // not JSON — informational, not an error
+  }
+  return true;
+}
+
+/** Rebuild the rendered conversation list from a restored wire history. */
+function itemsFromHistory(h: Message[]): UiItem[] {
+  const out: UiItem[] = [];
+  for (const m of h) {
+    if (m.role === 'user') {
+      out.push({ kind: 'user', text: m.content });
+    } else if (m.role === 'assistant') {
+      for (const tc of m.tool_calls ?? []) {
+        out.push({ kind: 'chip', name: tc.name, args: (tc.args ?? {}) as Record<string, unknown> });
+      }
+      if (m.content.trim() !== '') out.push({ kind: 'assistant', text: m.content });
+    } else if (m.role === 'tool') {
+      // Attach the result to the first still-open chip (same pairing as the live loop).
+      const open = out.find((it) => it.kind === 'chip' && it.content === undefined);
+      if (open && open.kind === 'chip') {
+        open.ok = resultLooksOk(m.content);
+        open.content = m.content;
+      }
+    }
+  }
+  for (const it of out) {
+    // A chip whose result never arrived: the page reloaded mid-turn.
+    if (it.kind === 'chip' && it.content === undefined) {
+      it.ok = false;
+      it.content = '(no result — the page reloaded before this step finished)';
+    }
+  }
+  return out;
+}
+
 export function mountAgentChat(container: HTMLElement, page: PageKind, controllers: AgentControllers): void {
   let settings = loadSettings();
-  let history: Message[] = [];
-  const items: UiItem[] = [];
+  // One shared conversation across all three pages — restored here, saved on
+  // every send/turn (see `saveHistory` calls below).
+  let history: Message[] = loadHistory(localStorage);
+  const items: UiItem[] = itemsFromHistory(history);
   let thinking = false;
   let running = false;
   let aborter: AbortController | null = null;
@@ -183,6 +241,46 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
 
   const body = el('div', 'agc-body');
   root.appendChild(body);
+
+  // --- page tabs (user-initiated only — the agent itself never navigates) ---
+  const NAV_PAGES: { page: PageKind; label: string }[] = [
+    { page: 'asm', label: '65C816' },
+    { page: 'gfx', label: '🎨 Graphics' },
+    { page: 'track', label: '🎵 Music' },
+  ];
+  const navRow = el('div', 'agc-nav');
+  const navBtns: HTMLButtonElement[] = [];
+  for (const n of NAV_PAGES) {
+    const b = document.createElement('button');
+    b.className = n.page === page ? 'agc-navbtn cur' : 'agc-navbtn';
+    b.textContent = n.label;
+    b.title = `Open the ${n.label} page (the conversation follows)`;
+    b.addEventListener('click', () => {
+      if (running) return; // a turn is in flight — Stop it first
+      const url = new URL(location.href);
+      url.searchParams.delete('asm');
+      url.searchParams.delete('gfx');
+      url.searchParams.delete('track');
+      url.searchParams.set(n.page, '1');
+      location.href = url.toString();
+    });
+    navRow.appendChild(b);
+    navBtns.push(b);
+  }
+  const newBtn = document.createElement('button');
+  newBtn.className = 'agc-new';
+  newBtn.textContent = '↺ New';
+  newBtn.title = 'Start a fresh conversation (your code/graphics/music pages are kept)';
+  newBtn.addEventListener('click', () => {
+    if (running || items.length === 0) return;
+    if (!confirm('Clear the agent conversation? (Your code/graphics/music are kept.)')) return;
+    history = [];
+    items.length = 0;
+    clearHistory(localStorage);
+    renderAll();
+  });
+  navRow.append(newBtn);
+  body.appendChild(navRow);
 
   // --- settings -------------------------------------------------------------
   const settingsBox = el('div', 'agc-settings');
@@ -352,10 +450,13 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
     ta.value = '';
     items.push({ kind: 'user', text });
     history.push({ role: 'user', content: text });
+    saveHistory(localStorage, history); // survives even a mid-turn reload
     thinking = true;
     running = true;
     sendBtn.disabled = true;
     stopBtn.disabled = false;
+    navBtns.forEach((b) => (b.disabled = true));
+    newBtn.disabled = true;
     aborter = new AbortController();
     renderAll();
 
@@ -397,6 +498,7 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
         });
         // Continue the conversation from the full wire history (minus system).
         history = res.messages.slice(1);
+        saveHistory(localStorage, history);
         if (res.stopped === 'max-turns' && res.finalContent.trim() === '') {
           items.push({
             kind: 'assistant',
@@ -413,6 +515,8 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
         running = false;
         sendBtn.disabled = false;
         stopBtn.disabled = true;
+        navBtns.forEach((b) => (b.disabled = false));
+        newBtn.disabled = items.length === 0;
         aborter = null;
         renderAll();
       }
@@ -431,6 +535,7 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
   // --- init ---------------------------------------------------------------------
   rebuildModelSelect([]);
   if (settings.model) modelSel.value = settings.model;
+  newBtn.disabled = items.length === 0;
   renderAll();
 
   container.appendChild(root);
