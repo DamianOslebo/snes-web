@@ -37,6 +37,12 @@ Each step the model may request tools; the panel shows a tool chip per call
 (arguments expandable, result expandable), a thinking indicator, and the final
 reply. **Stop** aborts the in-flight request.
 
+A step that Ollama rejects for a transient reason (a 5xx, a dropped tunnel
+response, or the model emitting a malformed tool-call that Ollama can't parse)
+is **retried up to 2 times** before the error surfaces — a failed step has no
+side effects yet (nothing is dispatched or appended), so the retry just
+re-sends the identical conversation. Aborts are never retried.
+
 ## Thinking (per-step latency)
 
 The panel's **Thinking** control sends Ollama's `think` field with every

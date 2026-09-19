@@ -216,7 +216,75 @@ describe('runAgent', () => {
       },
     };
     await expect(
-      runAgent({ ...base, controllers: miniControllers().controllers, transport: t }),
+      runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 }),
     ).rejects.toThrow('fetch failed (CORS?)');
+  });
+
+  it('retries a failed model call and recovers on the next attempt', async () => {
+    // First attempt throws (e.g. Ollama 500), second succeeds — the loop should
+    // not surface the error, and should not have dispatched any tools for it.
+    let attempts = 0;
+    const t: Transport = {
+      post: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('XML syntax error on line 3');
+        return reply('recovered');
+      },
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    const { controllers, log } = miniControllers();
+    const r = await runAgent({ ...base, controllers, transport: t, retryDelayMs: 0 });
+    expect(attempts).toBe(2);
+    expect(r.stopped).toBe('reply');
+    expect(r.finalContent).toBe('recovered');
+    expect(log).toEqual([]); // no tools ran against the failed attempt
+  });
+
+  it('propagates after all retries are exhausted', async () => {
+    let attempts = 0;
+    const t: Transport = {
+      post: async () => {
+        attempts += 1;
+        throw new Error('always fails');
+      },
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    await expect(
+      runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retries: 2, retryDelayMs: 0 }),
+    ).rejects.toThrow('always fails');
+    expect(attempts).toBe(3); // 1 original + 2 retries
+  });
+
+  it('does not retry an aborted request', async () => {
+    const ac = new AbortController();
+    const abortErr = () => {
+      const e = new Error('aborted');
+      e.name = 'AbortError';
+      return e;
+    };
+    let attempts = 0;
+    const t: Transport = {
+      post: async () => {
+        attempts += 1;
+        ac.abort();
+        throw abortErr();
+      },
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    const r = await runAgent({
+      ...base,
+      controllers: miniControllers().controllers,
+      transport: t,
+      signal: ac.signal,
+      retryDelayMs: 0,
+    });
+    expect(attempts).toBe(1);
+    expect(r.stopped).toBe('aborted');
   });
 });
