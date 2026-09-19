@@ -104,6 +104,21 @@ describe('runAgent', () => {
     expect(calls[0].url).toBe('http://ollama.test/api/chat');
   });
 
+  it('passes the `think` toggle to the request body (or omits it in auto mode)', async () => {
+    const off = scripted([reply('done!')]);
+    await runAgent({
+      ...base,
+      controllers: miniControllers().controllers,
+      transport: off.t,
+      think: false,
+    });
+    expect((off.calls[0].body as { think?: boolean }).think).toBe(false);
+
+    const auto = scripted([reply('done!')]);
+    await runAgent({ ...base, controllers: miniControllers().controllers, transport: auto.t });
+    expect('think' in (auto.calls[0].body as Record<string, unknown>)).toBe(false);
+  });
+
   it('runs a multi-turn tool loop, feeding each result back as a tool message', async () => {
     const { controllers, log } = miniControllers();
     const { t, calls } = scripted([

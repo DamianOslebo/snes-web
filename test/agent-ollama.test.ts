@@ -71,6 +71,17 @@ describe('chatOnce — request shape', () => {
     expect(body.stream).toBe(false);
   });
 
+  it('sends the `think` toggle when set, and omits it in auto mode', async () => {
+    const { t, calls } = fake(() => ({ message: { role: 'assistant', content: 'ok' } }));
+    await chatOnce('http://h', 'm', [], [], t, undefined, false);
+    expect((calls[0].body as { think?: boolean }).think).toBe(false);
+    await chatOnce('http://h', 'm', [], [], t, undefined, true);
+    expect((calls[1].body as { think?: boolean }).think).toBe(true);
+    // Auto: the field is absent entirely, so Ollama applies the model default.
+    await chatOnce('http://h', 'm', [], [], t);
+    expect('think' in (calls[2].body as Record<string, unknown>)).toBe(false);
+  });
+
   it('returns the assistant message (content only when there are no calls)', async () => {
     const { t } = fake(() => ({ message: { role: 'assistant', content: 'hello' } }));
     const m = await chatOnce('http://h', 'm', [], [], t);

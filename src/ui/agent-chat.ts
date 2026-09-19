@@ -31,9 +31,19 @@ import { clearHistory, loadHistory, saveHistory } from '../agent/conversation';
 const SETTINGS_KEY = 'snes-web:agent:v1';
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:11434';
 
+/**
+ * Ollama's `think` as surfaced in the panel. 'auto' = don't send the field
+ * at all (the model's default — Qwen3 models think by default); 'on'/'off'
+ * map to `think: true/false` on `/api/chat`.
+ */
+type ThinkMode = 'auto' | 'off' | 'on';
+
+const THINK_MODES: readonly ThinkMode[] = ['auto', 'off', 'on'];
+
 interface AgentSettings {
   endpoint: string;
   model: string;
+  think: ThinkMode;
 }
 
 function loadSettings(): AgentSettings {
@@ -42,13 +52,17 @@ function loadSettings(): AgentSettings {
     if (raw) {
       const v = JSON.parse(raw) as Partial<AgentSettings>;
       if (typeof v.endpoint === 'string' && v.endpoint !== '' && typeof v.model === 'string') {
-        return { endpoint: v.endpoint, model: v.model };
+        const think =
+          typeof v.think === 'string' && (THINK_MODES as readonly string[]).includes(v.think)
+            ? (v.think as ThinkMode)
+            : 'auto';
+        return { endpoint: v.endpoint, model: v.model, think };
       }
     }
   } catch {
     // private mode / bad JSON — fall through to defaults
   }
-  return { endpoint: DEFAULT_ENDPOINT, model: '' };
+  return { endpoint: DEFAULT_ENDPOINT, model: '', think: 'auto' };
 }
 
 function saveSettings(s: AgentSettings): void {
@@ -106,6 +120,7 @@ const CSS = `
 .agc-row{display:flex;gap:6px;align-items:center}
 .agc-settings input[type=text]{flex:1;min-width:0;background:#0f1115;border:1px solid #2e3440;border-radius:6px;color:#dde3ec;padding:5px 8px;font-size:12px}
 .agc-settings select{flex:1;min-width:0;background:#0f1115;border:1px solid #2e3440;border-radius:6px;color:#dde3ec;padding:5px 8px;font-size:12px}
+.agc-lbl{flex:0 0 auto;font-size:11.5px;color:#8a93a5}
 .agc-btn{background:#242a35;border:1px solid #343c4c;color:#dde3ec;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer}
 .agc-btn:hover{background:#2c3342}
 .agc-btn:disabled{opacity:.45;cursor:default}
@@ -296,12 +311,31 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
 
   const modelRow = el('div', 'agc-row');
   const modelSel = document.createElement('select');
+  const thinkRow = el('div', 'agc-row');
+  const thinkLbl = el('span', 'agc-lbl');
+  thinkLbl.textContent = 'Thinking';
+  const thinkSel = document.createElement('select');
+  const THINK_LABELS: Record<ThinkMode, string> = {
+    auto: 'Auto (model default)',
+    on: 'On — reasons each step (slow)',
+    off: 'Off — no reasoning (fastest)',
+  };
+  for (const m of THINK_MODES) {
+    const opt = document.createElement('option');
+    opt.value = m;
+    opt.textContent = THINK_LABELS[m];
+    thinkSel.appendChild(opt);
+  }
+  thinkSel.value = settings.think;
+  thinkSel.title =
+    "Ollama's `think` field: Off skips the model's reasoning phase — the biggest per-step speedup. Qwen3-style models are on/off only (no token budget).";
   const status = el('div', 'agc-status');
   const hint = el('div', 'agc-hint');
   hint.textContent =
     'Phone/LAN: Ollama must allow this origin — run it with OLLAMA_ORIGINS=http://<host>:<port> (e.g. OLLAMA_ORIGINS=http://10.0.1.5:8080) or it will refuse the CORS preflight.';
   modelRow.append(modelSel);
-  settingsBox.append(epRow, modelRow, status, hint);
+  thinkRow.append(thinkLbl, thinkSel);
+  settingsBox.append(epRow, modelRow, thinkRow, status, hint);
   body.appendChild(settingsBox);
 
   function rebuildModelSelect(models: string[]): void {
@@ -325,7 +359,7 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
   }
 
   function persistSettings(): void {
-    settings = { endpoint: epIn.value.trim(), model: modelSel.value };
+    settings = { endpoint: epIn.value.trim(), model: modelSel.value, think: thinkSel.value as ThinkMode };
     saveSettings(settings);
   }
   epIn.addEventListener('change', persistSettings);
@@ -334,6 +368,7 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
     settings.endpoint = epIn.value.trim();
   });
   modelSel.addEventListener('change', persistSettings);
+  thinkSel.addEventListener('change', persistSettings);
 
   testBtn.addEventListener('click', () => {
     const ep = epIn.value.trim();
@@ -493,6 +528,7 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
           system: buildSystemPrompt(page, stateSummary(controllers)),
           messages: history,
           controllers,
+          think: settings.think === 'on' ? true : settings.think === 'off' ? false : undefined,
           signal: aborter?.signal,
           onEvent,
         });

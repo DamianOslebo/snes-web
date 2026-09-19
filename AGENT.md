@@ -37,6 +37,24 @@ Each step the model may request tools; the panel shows a tool chip per call
 (arguments expandable, result expandable), a thinking indicator, and the final
 reply. **Stop** aborts the in-flight request.
 
+## Thinking (per-step latency)
+
+The panel's **Thinking** control sends Ollama's `think` field with every
+`/api/chat` step (persisted in `snes-web:agent:v1`):
+
+- **Off** → `think: false` — skips the model's reasoning phase. This is the
+  biggest per-step speedup; thinking tokens are seconds-to-minutes of extra
+  generation on large models and are the usual culprit behind tunnel/origin
+  timeouts (a Cloudflare 524).
+- **On** → `think: true` — force reasoning even if the model defaults off.
+- **Auto** (default) → the field is omitted; the model's default applies
+  (Qwen3 models think **on** by default).
+
+Qwen3-style models are on/off only — Ollama's token-budget form of `think`
+applies to a different model family. If steps still time out over a tunnel,
+raise cloudflared's `originResponseTimeoutSeconds` (default is 100 s) and set
+`OLLAMA_KEEP_ALIVE=3600` so the model stays loaded between steps.
+
 ## One conversation across all three pages
 
 The panel's tabs (**65C816 · 🎨 Graphics · 🎵 Music**) switch between the

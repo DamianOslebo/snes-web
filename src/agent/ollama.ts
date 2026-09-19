@@ -131,6 +131,10 @@ export const fetchTransport: Transport = {
  * returns the model's message (its `content` and any `tool_calls`). The
  * response is normalized to a `Message` (assistant role) plus the parsed tool
  * calls, so the loop never has to know Ollama's exact wire shape.
+ *
+ * `think` (optional) forwards Ollama's thinking toggle to models that
+ * support it (e.g. Qwen3): `false` skips the reasoning phase — the biggest
+ * per-step latency win; omitted leaves it to the model default.
  */
 export async function chatOnce(
   endpoint: string,
@@ -139,8 +143,10 @@ export async function chatOnce(
   tools: ToolSpec[],
   transport: Transport = fetchTransport,
   signal?: AbortSignal,
+  think?: boolean,
 ): Promise<Message> {
   const body: ChatRequest = { model, messages, tools, stream: false };
+  if (think !== undefined) body.think = think;
   const res = (await transport.post(join(endpoint, '/api/chat'), body, signal)) as OllamaChatResponse;
   const msg = res?.message;
   const content = typeof msg?.content === 'string' ? msg.content : '';

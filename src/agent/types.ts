@@ -53,6 +53,8 @@ export interface ChatRequest {
   messages: Message[];
   tools: ToolSpec[];
   stream: false;
+  /** Ollama `think` — enable/disable the model's reasoning. Omitted = model default. */
+  think?: boolean;
 }
 
 /**

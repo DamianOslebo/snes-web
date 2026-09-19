@@ -36,6 +36,8 @@ export interface RunAgentOptions {
   transport?: Transport;
   /** Max tool-calling steps before the loop stops (default 10). */
   maxTurns?: number;
+  /** Ollama `think` toggle for models that support it; `undefined` = model default. */
+  think?: boolean;
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void;
 }
@@ -70,6 +72,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     controllers,
     transport = fetchTransport,
     maxTurns = 10,
+    think,
     signal,
     onEvent,
   } = opts;
@@ -87,7 +90,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     onEvent?.({ type: 'thinking' });
     let reply: Message;
     try {
-      reply = await chatOnce(endpoint, model, messages, TOOL_SPECS, transport, signal);
+      reply = await chatOnce(endpoint, model, messages, TOOL_SPECS, transport, signal, think);
     } catch (err) {
       if (isAbort(err, signal)) {
         stopped = 'aborted';
