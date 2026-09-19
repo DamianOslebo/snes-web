@@ -68,6 +68,9 @@ function scripted(responses: unknown[]) {
       calls.push({ url, body });
       return responses[Math.min(i++, responses.length - 1)];
     },
+    get: async () => {
+      throw new Error('scripted transport: get() should not be used by the loop');
+    },
   };
   return { t, calls };
 }
@@ -155,6 +158,9 @@ describe('runAgent', () => {
         err.name = 'AbortError';
         throw err;
       },
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
     };
     const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t });
     expect(r.stopped).toBe('aborted');
@@ -189,6 +195,9 @@ describe('runAgent', () => {
     const t: Transport = {
       post: async () => {
         throw new Error('fetch failed (CORS?)');
+      },
+      get: async () => {
+        throw new Error('unexpected get()');
       },
     };
     await expect(

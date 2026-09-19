@@ -12,12 +12,16 @@ import type { Message, ToolSpec } from '../src/agent/types';
 /** A recording fake: answers via `responder`, records every request. */
 function fake(
   responder: (url: string, body: unknown) => unknown,
-): { t: Transport; calls: { url: string; body: unknown }[] } {
-  const calls: { url: string; body: unknown }[] = [];
+): { t: Transport; calls: { method: string; url: string; body: unknown }[] } {
+  const calls: { method: string; url: string; body: unknown }[] = [];
   const t: Transport = {
     post: async (url, body) => {
-      calls.push({ url, body });
+      calls.push({ method: 'POST', url, body });
       return responder(url, body);
+    },
+    get: async (url) => {
+      calls.push({ method: 'GET', url, body: undefined });
+      return responder(url, undefined);
     },
   };
   return { t, calls };
@@ -39,13 +43,13 @@ describe('URL handling', () => {
     expect(baseUrl('http://127.0.0.1:11434///')).toBe('http://127.0.0.1:11434');
   });
 
-  it('posts to <endpoint>/api/chat and /api/tags', async () => {
+  it('POSTs to <endpoint>/api/chat and GETs <endpoint>/api/tags', async () => {
     const { t, calls } = fake(() => ({ message: { role: 'assistant', content: '' } }));
     await chatOnce('http://h:1/', 'm', [], [TOOL], t);
     await listModels('http://h:1', t);
-    expect(calls.map((c) => c.url)).toEqual([
-      'http://h:1/api/chat',
-      'http://h:1/api/tags',
+    expect(calls.map((c) => [c.method, c.url])).toEqual([
+      ['POST', 'http://h:1/api/chat'],
+      ['GET', 'http://h:1/api/tags'],
     ]);
   });
 });
@@ -171,6 +175,9 @@ describe('checkHealth', () => {
   it('reports the transport error instead of throwing', async () => {
     const t: Transport = {
       post: async () => {
+        throw new Error('fetch failed (CORS?)');
+      },
+      get: async () => {
         throw new Error('fetch failed (CORS?)');
       },
     };

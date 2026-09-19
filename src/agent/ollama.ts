@@ -1,9 +1,10 @@
 /**
  * `ollama` — a thin, injectable client for Ollama's HTTP API.
  *
- * The only place in the agent that does I/O. A `Transport` is a
- * `post(url, body) → parsed JSON` function, so the node tests can substitute a
- * fake (no network, no fetch) and pin the exact request shapes. The browser
+ * The only place in the agent that does I/O. A `Transport` is a small
+ * `post(url, body)` / `get(url)` pair (JSON in, JSON out), so the node tests
+ * can substitute a fake (no network, no fetch) and pin the exact request
+ * shapes. The browser
  * passes `fetchTransport` (native `fetch`, CORS to the Ollama host).
  *
  * Non-streaming by design: one `POST /api/chat` per agent step (the loop in
@@ -24,16 +25,17 @@ import type {
 } from './types';
 
 /**
- * A transport posts a JSON body to `url` and resolves with the parsed JSON
+ * A transport issues JSON requests and resolves with the parsed JSON
  * response. `signal` (optional) aborts the request; reject with an
  * `AbortError`-like error when aborted so callers can detect it.
+ *
+ * `post` is for `/api/chat` (JSON body). `get` is for `/api/tags` — Ollama
+ * answers that route GET-only (a POST gets a 405), and a plain GET is a
+ * "simple" request, so it needs no CORS preflight either.
  */
 export interface Transport {
-  post(
-    url: string,
-    body: unknown,
-    signal?: AbortSignal,
-  ): Promise<unknown>;
+  post(url: string, body: unknown, signal?: AbortSignal): Promise<unknown>;
+  get(url: string, signal?: AbortSignal): Promise<unknown>;
 }
 
 /**
@@ -86,6 +88,22 @@ function join(endpoint: string, path: string): string {
   return `${baseUrl(endpoint)}${path}`;
 }
 
+/** Parse a response body as JSON; throw a plain `Error` on non-2xx or non-JSON. */
+async function parseJson(res: Response): Promise<unknown> {
+  const text = await res.text();
+  let parsed: unknown;
+  try {
+    parsed = text === '' ? {} : JSON.parse(text);
+  } catch {
+    throw new Error(`Ollama returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+  }
+  if (!res.ok) {
+    const msg = (parsed as { error?: string })?.error ?? `HTTP ${res.status}`;
+    throw new Error(String(msg));
+  }
+  return parsed;
+}
+
 /**
  * The default transport: native `fetch`, JSON in / JSON out. Throws a plain
  * `Error` (with the HTTP status) on a non-2xx response so the loop can surface
@@ -99,19 +117,12 @@ export const fetchTransport: Transport = {
       body: JSON.stringify(body),
       signal,
     });
-    const text = await res.text();
-    let parsed: unknown;
-    try {
-      parsed = text === '' ? {} : JSON.parse(text);
-    } catch {
-      throw new Error(`Ollama returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
-    }
-    if (!res.ok) {
-      const msg =
-        (parsed as { error?: string })?.error ?? `HTTP ${res.status}`;
-      throw new Error(String(msg));
-    }
-    return parsed;
+    return parseJson(res);
+  },
+  async get(url, signal) {
+    // No custom headers → a "simple" request → no CORS preflight.
+    const res = await fetch(url, { signal });
+    return parseJson(res);
   },
 };
 
@@ -145,9 +156,7 @@ export async function listModels(
   transport: Transport = fetchTransport,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  // Ollama exposes models at GET /api/tags. Our Transport is POST-shaped, so
-  // we reuse it with an empty body; Ollama ignores the body on this route.
-  const res = (await transport.post(join(endpoint, '/api/tags'), {}, signal)) as OllamaTagResponse;
+  const res = (await transport.get(join(endpoint, '/api/tags'), signal)) as OllamaTagResponse;
   const models = res?.models;
   if (!Array.isArray(models)) return [];
   return models.map((m) => m?.name).filter((n): n is string => typeof n === 'string' && n !== '');
