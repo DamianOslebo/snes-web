@@ -48,13 +48,21 @@ re-sends the identical conversation. Aborts are never retried.
 The panel's **Thinking** control sends Ollama's `think` field with every
 `/api/chat` step (persisted in `snes-web:agent:v1`):
 
-- **Off** → `think: false` — skips the model's reasoning phase. This is the
-  biggest per-step speedup; thinking tokens are seconds-to-minutes of extra
-  generation on large models and are the usual culprit behind tunnel/origin
-  timeouts (a Cloudflare 524).
+- **Off** (default) → `think: false` — skips the model's reasoning phase.
+  This is the biggest per-step speedup; thinking tokens are seconds-to-minutes
+  of extra generation on large models and are the usual culprit behind
+  tunnel/origin timeouts (a Cloudflare 524) and flaky tool-call parsing.
 - **On** → `think: true` — force reasoning even if the model defaults off.
-- **Auto** (default) → the field is omitted; the model's default applies
-  (Qwen3 models think **on** by default).
+- **Auto** → the field is omitted; the model's default applies (Qwen3 models
+  think **on** by default — expect slow steps over a tunnel).
+
+**Off is the default** (as of the one-time migration): a panel configured
+before the Thinking control existed stored the legacy default `auto` —
+thinking ON on Qwen3-style models, which is exactly the failure mode. On
+first load after the change, that legacy `auto` is silently flipped to
+`off` (the stored object is stamped `v: 1`). An `on`/`off` you chose
+explicitly before the migration, or an `auto` chosen after it, is always
+respected verbatim.
 
 Qwen3-style models are on/off only — Ollama's token-budget form of `think`
 applies to a different model family. If steps still time out over a tunnel,
@@ -78,6 +86,39 @@ after every send and turn, and restored on every page mount. So:
   the history ends at your last message — send "continue" to pick up.
 - **↺ New** clears the conversation only (your code/graphics/music pages are
   kept).
+
+## Log, export & metrics
+
+The panel keeps a timestamped journal of what actually happened, separate from
+the conversation (which is what gets sent to Ollama). Per send it records:
+
+- **run-start** — the settings snapshot: page, endpoint, model, Thinking mode;
+- **user** — your prompt;
+- **tool-call** / **tool-result** — every tool the model requested, its
+  arguments (kept whole), and the result it got back;
+- **assistant** — the model's reply;
+- **error** — a surfaced failure (e.g. the exact Ollama 500 text, a CORS
+  error) and the phase it happened in;
+- **run-end** — how it stopped (`reply` / `max-turns` / `aborted`), the turn
+  count, total wall time, and **per-step metrics**: `modelMs` (that step's
+  `/api/chat` round trip, including any retries), `retries`, `retryErrors`
+  (the failed attempt(s) that recovered — e.g. the XML-syntax error),
+  `toolCalls`, and `toolMs` (controller dispatch time).
+
+The journal is capped (newest 400 entries), long free-text fields are
+truncated to 2000 chars, and it is persisted to
+`localStorage["snes-web:agent-log:v1"]` (oldest entries drop first; if storage
+is over quota the newest tail is kept). It survives page switches and reloads,
+so you can gather a full session's worth across all three pages.
+
+Two buttons next to **↺ New**:
+
+- **⬇ Log** — downloads `snes-agent-log-<timestamp>.json`: pretty-printed,
+  self-describing (app, schema, your browser user-agent, created/exported
+  times, entry count, then the entries). This is the file to share when
+  something misbehaves — it carries the exact error text, the per-step
+  latencies, and the retry trail.
+- **🧹** — clears the journal only (conversation and pages are kept).
 
 ## Tool reference (28)
 

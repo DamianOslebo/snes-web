@@ -27,6 +27,15 @@ import { checkHealth } from '../agent/ollama';
 import { runAgent, type AgentEvent } from '../agent/loop';
 import { buildSystemPrompt } from '../agent/system';
 import { clearHistory, loadHistory, saveHistory } from '../agent/conversation';
+import {
+  append,
+  buildExport,
+  clearLog,
+  loadLog,
+  makeLog,
+  saveLog,
+  type AgentLog,
+} from '../agent/log';
 
 const SETTINGS_KEY = 'snes-web:agent:v1';
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:11434';
@@ -44,6 +53,27 @@ interface AgentSettings {
   endpoint: string;
   model: string;
   think: ThinkMode;
+  /** Bumped once a migration has run, so a later explicit choice is respected. */
+  v?: 1;
+}
+
+/**
+ * Resolve a stored (or missing) `think` to the effective mode.
+ *
+ * The legacy default was `'auto'` — which for Qwen3-style models means
+ * thinking **ON**, i.e. long reasoning-heavy responses. That is the failure
+ * mode: it blows past the tunnel timeout (524) and trips Ollama's tool-call
+ * parser. So a stored object from before the migration (no `v` field) that
+ * still carries the default `'auto'` is flipped to `'off'`. An explicit
+ * `'on'`/`'off'` — or an `'auto'` chosen *after* migration (versioned) — is
+ * always respected verbatim.
+ *
+ * Pure + node-testable: no localStorage here.
+ */
+export function normalizeThink(raw: string | undefined, legacy: boolean): ThinkMode {
+  if (raw === 'on' || raw === 'off') return raw; // explicit — always respected
+  if (raw === 'auto') return legacy ? 'off' : 'auto'; // legacy default → off
+  return 'off'; // fresh install default
 }
 
 function loadSettings(): AgentSettings {
@@ -52,17 +82,14 @@ function loadSettings(): AgentSettings {
     if (raw) {
       const v = JSON.parse(raw) as Partial<AgentSettings>;
       if (typeof v.endpoint === 'string' && v.endpoint !== '' && typeof v.model === 'string') {
-        const think =
-          typeof v.think === 'string' && (THINK_MODES as readonly string[]).includes(v.think)
-            ? (v.think as ThinkMode)
-            : 'auto';
-        return { endpoint: v.endpoint, model: v.model, think };
+        const legacy = v.v === undefined; // pre-migration stored object
+        return { endpoint: v.endpoint, model: v.model, think: normalizeThink(v.think, legacy), v: 1 };
       }
     }
   } catch {
     // private mode / bad JSON — fall through to defaults
   }
-  return { endpoint: DEFAULT_ENDPOINT, model: '', think: 'auto' };
+  return { endpoint: DEFAULT_ENDPOINT, model: '', think: 'off', v: 1 };
 }
 
 function saveSettings(s: AgentSettings): void {
@@ -228,6 +255,13 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
   // every send/turn (see `saveHistory` calls below).
   let history: Message[] = loadHistory(localStorage);
   const items: UiItem[] = itemsFromHistory(history);
+  // A separate, append-only journal of what actually happened — each run's
+  // config (page/endpoint/model/thinking), the prompt, every tool call +
+  // result, errors, and per-step latency/retry metrics. Persists across pages
+  // and reloads (its own key, independent of the conversation); "⬇ Log"
+  // downloads it as JSON for sharing.
+  let log: AgentLog =
+    loadLog(localStorage) ?? makeLog(typeof navigator !== 'undefined' ? navigator.userAgent : undefined);
   let thinking = false;
   let running = false;
   let aborter: AbortController | null = null;
@@ -295,6 +329,41 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
     renderAll();
   });
   navRow.append(newBtn);
+
+  // --- log tools: export the journal, or clear it ---------------------------
+  // The log is separate from the conversation: "↺ New" and page reloads don't
+  // touch it, so it accumulates runs across the whole session. Exporting it is
+  // how the user shares what went wrong / how slow things were.
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : undefined;
+  const exportBtn = document.createElement('button');
+  exportBtn.className = 'agc-new';
+  exportBtn.textContent = '⬇ Log';
+  exportBtn.title =
+    'Download the agent log (JSON) — timestamps, run config, tool calls + results, errors, and per-step latency/retry metrics';
+  exportBtn.addEventListener('click', () => {
+    const blob = new Blob([buildExport(log)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `snes-agent-log-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+
+  const clearLogBtn = document.createElement('button');
+  clearLogBtn.className = 'agc-new';
+  clearLogBtn.textContent = '🧹';
+  clearLogBtn.title = 'Clear the agent log (your conversation and pages are kept)';
+  clearLogBtn.addEventListener('click', () => {
+    if (log.entries.length === 0) return;
+    if (!confirm('Clear the agent log? (Your conversation and pages are kept.)')) return;
+    log = makeLog(ua);
+    clearLog(localStorage);
+  });
+
+  navRow.append(exportBtn, clearLogBtn);
   body.appendChild(navRow);
 
   // --- settings -------------------------------------------------------------
@@ -359,7 +428,9 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
   }
 
   function persistSettings(): void {
-    settings = { endpoint: epIn.value.trim(), model: modelSel.value, think: thinkSel.value as ThinkMode };
+    // spread `settings` to keep the `v` migration stamp (dropping it would
+    // re-classify the next load as legacy and re-flip an explicit Auto)
+    settings = { ...settings, endpoint: epIn.value.trim(), model: modelSel.value, think: thinkSel.value as ThinkMode };
     saveSettings(settings);
   }
   epIn.addEventListener('change', persistSettings);
@@ -486,6 +557,11 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
     items.push({ kind: 'user', text });
     history.push({ role: 'user', content: text });
     saveHistory(localStorage, history); // survives even a mid-turn reload
+    // Open the run in the journal (config snapshot + prompt) before anything
+    // can fail, so even an immediate error is logged with its context.
+    const runId = 'r' + Date.now().toString(36);
+    log = append(log, { type: 'run-start', runId, config: { page, endpoint: ep, model, think: settings.think } });
+    log = append(log, { type: 'user', text });
     thinking = true;
     running = true;
     sendBtn.disabled = true;
@@ -504,6 +580,7 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
         const chip: UiItem & { kind: 'chip' } = { kind: 'chip', name: ev.name, args: ev.args };
         items.push(chip);
         pending.push(chip);
+        log = append(log, { type: 'tool-call', name: ev.name, args: ev.args });
         renderAll();
       } else if (ev.type === 'tool-result') {
         // The loop dispatches calls in order, so pop the first open chip.
@@ -513,9 +590,13 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
           target.ok = ev.ok;
           target.content = ev.content;
         }
+        log = append(log, { type: 'tool-result', name: ev.name, ok: ev.ok, content: ev.content });
         renderAll();
       } else if (ev.type === 'message') {
-        if (ev.content.trim() !== '') items.push({ kind: 'assistant', text: ev.content });
+        if (ev.content.trim() !== '') {
+          items.push({ kind: 'assistant', text: ev.content });
+          log = append(log, { type: 'assistant', text: ev.content });
+        }
         renderAll();
       }
     };
@@ -544,8 +625,18 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
         if (res.stopped === 'aborted') {
           items.push({ kind: 'assistant', text: '⏹ Stopped.' });
         }
+        // Close the run in the journal with the loop's latency + retry metrics.
+        log = append(log, {
+          type: 'run-end',
+          runId,
+          stopped: res.stopped,
+          turns: res.turns,
+          totalMs: res.totalMs,
+          perStep: res.perStep,
+        });
       } catch (err) {
         items.push({ kind: 'error', text: `Ollama error: ${(err as Error).message}` });
+        log = append(log, { type: 'error', phase: 'model', message: (err as Error).message });
       } finally {
         thinking = false;
         running = false;
@@ -555,6 +646,7 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
         newBtn.disabled = items.length === 0;
         aborter = null;
         renderAll();
+        saveLog(localStorage, log); // persist the journal (best-effort, capped)
       }
     })();
   }

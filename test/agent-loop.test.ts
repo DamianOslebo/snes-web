@@ -287,4 +287,46 @@ describe('runAgent', () => {
     expect(attempts).toBe(1);
     expect(r.stopped).toBe('aborted');
   });
+
+  it('reports total + per-step metrics (a plain reply is one model step)', async () => {
+    const { t } = scripted([reply('done!')]);
+    const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 });
+    expect(r.totalMs).toBeGreaterThanOrEqual(0);
+    expect(r.perStep).toHaveLength(1);
+    expect(r.perStep[0]).toMatchObject({ index: 0, toolCalls: 0, retries: 0, retryErrors: [] });
+    expect(r.perStep[0].modelMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('records one per-step entry for every model step, tool-calling and final', async () => {
+    const { t } = scripted([
+      call('asm_set_source', { source: 'RTI\n  rts' }),
+      call('asm_assemble', {}),
+      reply('built it'),
+    ]);
+    const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 });
+    expect(r.turns).toBe(2);
+    expect(r.perStep).toHaveLength(3);
+    expect(r.perStep.map((s) => s.index)).toEqual([0, 1, 2]);
+    expect(r.perStep.map((s) => s.toolCalls)).toEqual([1, 1, 0]);
+  });
+
+  it('captures the retry error(s) on a step that recovered', async () => {
+    let attempts = 0;
+    const t: Transport = {
+      post: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('XML syntax error on line 3');
+        return reply('recovered');
+      },
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 });
+    expect(r.stopped).toBe('reply');
+    expect(r.perStep).toHaveLength(1);
+    expect(r.perStep[0].retries).toBe(1);
+    expect(r.perStep[0].retryErrors).toHaveLength(1);
+    expect(r.perStep[0].retryErrors[0]).toContain('XML syntax error');
+  });
 });

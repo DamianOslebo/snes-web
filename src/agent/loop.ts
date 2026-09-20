@@ -46,6 +46,22 @@ export interface RunAgentOptions {
   onEvent?: (event: AgentEvent) => void;
 }
 
+/**
+ * Per-step metrics — the raw material for the perf/error log. `index` is the
+ * 0-based model step; `modelMs` is the wall time for that step's `/api/chat`
+ * round trip (including any retries); `retries`/`retryErrors` capture a flaky
+ * step that recovered; `toolMs` is the time spent dispatching that step's
+ * tool calls (usually small, but included so a slow controller shows up).
+ */
+export interface StepMetrics {
+  index: number;
+  modelMs: number;
+  retries: number;
+  retryErrors: string[];
+  toolCalls: number;
+  toolMs: number;
+}
+
 export interface RunAgentResult {
   /** The full conversation, including the system message and every step. */
   messages: Message[];
@@ -54,6 +70,10 @@ export interface RunAgentResult {
   /** Tool-calling steps actually taken. */
   turns: number;
   stopped: 'reply' | 'max-turns' | 'aborted';
+  /** Wall time of the whole run (thinking → final answer), in ms. */
+  totalMs: number;
+  /** One entry per model step actually taken (empty if it never started). */
+  perStep: StepMetrics[];
 }
 
 function isAbort(err: unknown, signal?: AbortSignal): boolean {
@@ -64,6 +84,18 @@ function isAbort(err: unknown, signal?: AbortSignal): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** A successful model call plus how many failed attempts preceded it. */
+interface ChatOutcome {
+  reply: Message;
+  retries: number;
+  /** The error message(s) from any failed attempts, in order (empty if clean). */
+  retryErrors: string[];
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**
@@ -81,15 +113,18 @@ async function chatWithRetry(
   think: boolean | undefined,
   retries: number,
   retryDelayMs: number,
-): Promise<Message> {
+): Promise<ChatOutcome> {
+  const retryErrors: string[] = [];
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt > 0 && retryDelayMs > 0) await sleep(retryDelayMs * attempt);
     try {
-      return await chatOnce(endpoint, model, messages, TOOL_SPECS, transport, signal, think);
+      const reply = await chatOnce(endpoint, model, messages, TOOL_SPECS, transport, signal, think);
+      return { reply, retries: attempt, retryErrors };
     } catch (err) {
       if (isAbort(err, signal)) throw err;
       lastErr = err;
+      retryErrors.push(errText(err));
     }
   }
   throw lastErr;
@@ -117,9 +152,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   } = opts;
   const ctx: ToolCtx = { controllers };
   const messages: Message[] = [{ role: 'system', content: system }, ...opts.messages];
+  const startedAt = Date.now();
   let turns = 0;
   let stopped: RunAgentResult['stopped'] = 'max-turns';
   let finalContent = '';
+  const perStep: StepMetrics[] = [];
 
   for (;;) {
     if (signal?.aborted) {
@@ -127,9 +164,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       break;
     }
     onEvent?.({ type: 'thinking' });
-    let reply: Message;
+    const stepIndex = perStep.length;
+    const modelStart = Date.now();
+    let outcome: ChatOutcome;
     try {
-      reply = await chatWithRetry(endpoint, model, messages, transport, signal, think, retries, retryDelayMs);
+      outcome = await chatWithRetry(endpoint, model, messages, transport, signal, think, retries, retryDelayMs);
     } catch (err) {
       if (isAbort(err, signal)) {
         stopped = 'aborted';
@@ -137,16 +176,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       }
       throw err;
     }
+    const modelMs = Date.now() - modelStart;
+    const reply = outcome.reply;
     messages.push(reply);
     finalContent = reply.content;
 
     const calls = reply.tool_calls ?? [];
     if (calls.length === 0) {
+      perStep.push({ index: stepIndex, modelMs, retries: outcome.retries, retryErrors: outcome.retryErrors, toolCalls: 0, toolMs: 0 });
       onEvent?.({ type: 'message', content: reply.content });
       stopped = 'reply';
       break;
     }
 
+    let toolMs = 0;
     for (const call of calls) {
       // `ToolCall.args` is `unknown` for tolerance; dispatch wants an object.
       const args: Record<string, unknown> =
@@ -154,10 +197,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
           ? (call.args as Record<string, unknown>)
           : {};
       onEvent?.({ type: 'tool-call', name: call.name, args });
+      const toolStart = Date.now();
       const result = dispatchTool(call.name, args, ctx);
+      toolMs += Date.now() - toolStart;
       onEvent?.({ type: 'tool-result', name: call.name, ok: result.ok, content: result.content });
       messages.push({ role: 'tool', content: result.content, tool_name: call.name });
     }
+    perStep.push({ index: stepIndex, modelMs, retries: outcome.retries, retryErrors: outcome.retryErrors, toolCalls: calls.length, toolMs });
 
     if (++turns >= maxTurns) {
       stopped = 'max-turns';
@@ -165,5 +211,5 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     }
   }
 
-  return { messages, finalContent, turns, stopped };
+  return { messages, finalContent, turns, stopped, totalMs: Date.now() - startedAt, perStep };
 }
