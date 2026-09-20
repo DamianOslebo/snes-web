@@ -34,7 +34,7 @@ export interface RunAgentOptions {
   messages: Message[];
   controllers: AgentControllers;
   transport?: Transport;
-  /** Max tool-calling steps before the loop stops (default 10). */
+  /** Max tool-calling steps before the loop stops (default 14). */
   maxTurns?: number;
   /** Ollama `think` toggle for models that support it; `undefined` = model default. */
   think?: boolean;
@@ -143,7 +143,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     system,
     controllers,
     transport = fetchTransport,
-    maxTurns = 10,
+    maxTurns = 14,
     think,
     retries = 2,
     retryDelayMs = 400,

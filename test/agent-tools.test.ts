@@ -286,6 +286,66 @@ describe('asm tools', () => {
   });
 });
 
+describe('actionable failure hints (steer the model back to the recipe)', () => {
+  function bodyOf(m: ReturnType<typeof mockControllers>, tool: string, args: Record<string, unknown> = {}): Record<string, unknown> {
+    return JSON.parse(dispatch(m, tool, args).content) as Record<string, unknown>;
+  }
+
+  it('asm_assemble: undefined "vram_load" points at gfx_export_vram + vram.bin', () => {
+    const m = mockControllers();
+    m.results.assemble.ok = false;
+    m.results.assemble.errors = [{ line: 2, message: 'undefined label "vram_load"' }];
+    const body = bodyOf(m, 'asm_assemble');
+    expect(body.hint).toContain('gfx_export_vram');
+    expect(body.hint).toContain('vram.bin');
+  });
+
+  it('asm_assemble: undefined "spc_load" points at trk_export_spc', () => {
+    const m = mockControllers();
+    m.results.assemble.ok = false;
+    m.results.assemble.errors = [{ line: 3, message: 'undefined label "spc_load"' }];
+    expect(bodyOf(m, 'asm_assemble').hint).toContain('trk_export_spc');
+  });
+
+  it('asm_assemble: unknown instruction warns against hand-rolled PPU/DMA', () => {
+    const m = mockControllers();
+    m.results.assemble.ok = false;
+    m.results.assemble.errors = [{ line: 5, message: 'unknown instruction "x=0"' }];
+    expect(bodyOf(m, 'asm_assemble').hint).toContain('gfx_export_vram');
+  });
+
+  it('asm_assemble: label arithmetic (invalid number) says to use the exports', () => {
+    const m = mockControllers();
+    m.results.assemble.ok = false;
+    m.results.assemble.errors = [{ line: 7, message: 'invalid number "vram_img+1" for immediate' }];
+    expect(bodyOf(m, 'asm_assemble').hint).toContain('label arithmetic');
+  });
+
+  it('asm_assemble: an unrelated failure carries no hint', () => {
+    const m = mockControllers();
+    m.results.assemble.ok = false;
+    m.results.assemble.errors = [{ line: 1, message: 'bad opcode' }];
+    expect(bodyOf(m, 'asm_assemble').hint).toBeUndefined();
+  });
+
+  it('asm_build_rom: a 32 KB blowout blames a stale 64 KB vram.bin', () => {
+    const m = mockControllers();
+    m.results.buildRom.ok = false;
+    m.results.buildRom.error =
+      'buildRom: program is 65588 bytes but the entry region is $0000–$7fb0 (max 32688 bytes)';
+    const hint = bodyOf(m, 'asm_build_rom').hint as string;
+    expect(hint).toContain('asm_remove_data_file');
+    expect(hint).toContain('gfx_export_vram');
+  });
+
+  it('asm_build_rom: an unrelated failure carries no hint', () => {
+    const m = mockControllers();
+    m.results.buildRom.ok = false;
+    m.results.buildRom.error = 'no assemble yet';
+    expect(bodyOf(m, 'asm_build_rom').hint).toBeUndefined();
+  });
+});
+
 // --- gfx tools -----------------------------------------------------------------
 
 describe('gfx tools', () => {

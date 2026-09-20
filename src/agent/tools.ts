@@ -83,6 +83,48 @@ export function fail(message: string, extra?: Record<string, unknown>): ToolResu
   return { ok: false, content: JSON.stringify({ error: message, ...extra }) };
 }
 
+/**
+ * Turn raw assembler diagnostics into an ACTIONABLE hint for the model. This is
+ * the highest-leverage nudge: in practice the model writes the correct tiny
+ * program (`jsr vram_load`) but then forgets the one call that makes the label
+ * exist — `gfx_export_vram`. Seeing `undefined label "vram_load"` it re-writes
+ * source and appends hand-rolled junk instead of calling the export. Naming the
+ * exact tool + args in the failure is what steers it back to the recipe.
+ * Returns `undefined` when none of the known signatures match.
+ */
+export function assembleHint(errors: { line: number; message: string }[]): string | undefined {
+  const text = errors.map((e) => e.message).join('\n');
+  if (/undefined label "vram_load"/.test(text)) {
+    return (
+      'vram_load is a GENERATED routine — you do not write it. Call gfx_export_vram with ' +
+      '{"destName":"vram.bin"} to compile the compact VRAM, register vram.bin, and append the ' +
+      'vram_load routine; then call asm_assemble again. Do NOT hand-write PPU setup, DMA, or VRAM bytes.'
+    );
+  }
+  if (/undefined label "spc_load"/.test(text)) {
+    return (
+      'spc_load is a GENERATED routine — you do not write it. Call trk_export_spc with ' +
+      '{"destName":"spc.bin"} to build the SPC package and append the spc_load routine; then call ' +
+      'asm_assemble again. Do NOT hand-write the SPU port handshake.'
+    );
+  }
+  if (/unknown instruction/.test(text)) {
+    return (
+      'This assembler does not support that instruction. It assembles a 65C816 subset only — do NOT ' +
+      'use x=0/x=1, pcsh/pcsw, RTI, or hand-rolled PPU/DMA/SPU writes. For screen and sound bring-up, ' +
+      'call gfx_export_vram / trk_export_spc and let their generated glue do that work.'
+    );
+  }
+  if (/invalid number/.test(text) && /[+<>]/.test(text)) {
+    return (
+      'This assembler has no label arithmetic — you cannot use `label+1` or `<label`/`>label` in an ' +
+      'immediate. Remove the hand-rolled byte offsets; gfx_export_vram / trk_export_spc generate the ' +
+      'data files for you.'
+    );
+  }
+  return undefined;
+}
+
 // --- argument validation (each returns either a value or an error) ----------
 
 interface Field<T> {
@@ -277,9 +319,12 @@ const DEFS: ToolDef[] = [
     parameters: { type: 'object', properties: {} },
     run: (_a, c) => {
       const r = c.asm.assemble();
-      return r.ok
-        ? ok({ ok: true, byteCount: r.byteCount })
-        : fail('assemble failed — fix these diagnostics and re-assemble', { errors: r.errors });
+      if (r.ok) return ok({ ok: true, byteCount: r.byteCount });
+      const hint = assembleHint(r.errors);
+      return fail('assemble failed — fix these diagnostics and re-assemble', {
+        errors: r.errors,
+        ...(hint ? { hint } : {}),
+      });
     },
   },
   {
@@ -288,9 +333,15 @@ const DEFS: ToolDef[] = [
     parameters: { type: 'object', properties: {} },
     run: (_a, c) => {
       const r = c.asm.buildRom();
-      return r.ok
-        ? ok({ ok: true, bytes: r.bytes })
-        : fail(`buildRom failed: ${r.error ?? 'no successful assemble yet — run asm_assemble first'}`);
+      if (r.ok) return ok({ ok: true, bytes: r.bytes });
+      const err = r.error ?? 'no successful assemble yet — run asm_assemble first';
+      // The 32 KB entry-region blowout is almost always a stale 64 KB vram.bin.
+      const hint = /entry region|max \d+ bytes/.test(err)
+        ? 'Your code + .incbin data exceed the 32 KB entry region — a stale 64 KB vram.bin is the usual cause. ' +
+          'Remove it with asm_remove_data_file, then re-export with gfx_export_vram (it produces a few-KB ' +
+          'COMPACT image, not 64 KB), and assemble again. Keep graphics small.'
+        : undefined;
+      return fail(`buildRom failed: ${err}`, hint ? { hint } : undefined);
     },
   },
   {

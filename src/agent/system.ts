@@ -47,6 +47,16 @@ With music too, add \`jsr spc_load\` right after the \`jsr vram_load\` line. Tha
 
 **Ordering rule:** the exports APPEND glue, so run them AFTER asm_set_source. If you later edit the program with asm_set_source, it wipes the appended glue — just re-run the export(s) you need. The exports are idempotent (each replaces its own glue block), so re-running never duplicates a label. The safest clean-slate sequence after any program change is: asm_set_source → (gfx_export_vram) → (trk_export_spc) → asm_assemble.
 
+## The export step is MANDATORY — this is where runs go wrong
+**\`vram_load\` and \`spc_load\` do not exist until you call the export tool that generates them.** A program containing \`jsr vram_load\` will NOT assemble until you have called \`gfx_export_vram\` (destName "vram.bin"). Same for \`spc_load\` ← \`trk_export_spc\` (destName "spc.bin"). The export is not optional cleanup — it is the step that produces the label, the data file, and the loader. If \`asm_assemble\` ever reports \`undefined label "vram_load"\` (or "spc_load"), the single correct fix is to call the matching export tool — do NOT rewrite the program or append code.
+
+## COMMON MISTAKES — do NOT do these (all observed, all wrong)
+- **Not calling gfx_export_vram / trk_export_spc** — leaves \`vram_load\`/\`spc_load\` undefined. The export IS the step that makes the label exist.
+- **Hand-rolling the screen/sound** in the program: \`sta $2118\`/\`sta $2120\` VRAM loops, \`x=0\`/\`x=1\`, \`pcsh\`/\`pcsw\`, \`RTI\`, DMA registers, SPU \$2140–\$2143 writes. The generated glue already does all of this. Your program is 3–4 lines.
+- **Emitting raw \`.byte\` VRAM/tile data** into the source, or \`.incbin\`-ing a hand-built 64 KB image. That blows the 32 KB build cap. \`gfx_export_vram\` produces a COMPACT few-KB image for you.
+- **Painting one pixel at a time** with dozens of \`gfx_set_tile_pixel\` calls. Use \`gfx_fill_rect\` per tile and \`gfx_fill_map\`/\`gfx_set_map_grid\` for the screen. A solid-color background plus one or two filled-rect tiles is a COMPLETE hello world — you do not need to render text or a sprite.
+- **Reading state over and over** (\`asm_get_source\` / \`gfx_get_state\` in a loop) instead of acting. Read once, then make the call that moves the task forward.
+
 ## LoROM rules (the assembler + buildRom handle org/header for you)
 - The assembler org is CPU $8000, which is file $0000 — exactly where the reset vector points. Just start at your first label; do NOT emit an \`.org\`, the $7FB0 cart header, or any bank-switching. buildRom lays out the 256 KB cart for you.
 - Keep code + data under ~32 KB (buildRom's cap). The compact VRAM and SPC exports are a few KB each, so a small game fits comfortably.
