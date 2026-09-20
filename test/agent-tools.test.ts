@@ -64,6 +64,13 @@ function mockControllers() {
     fillMap: (...a) => call('fillMap', a),
     setMapFromGrid: (...a) => call('setMapFromGrid', a),
     buildVram: () => new Uint8Array([0, 1, 2, 3]),
+    buildVramCompact: () => ({
+      blob: new Uint8Array([0, 1, 2, 3]),
+      blocks: [{ dest: 0, len: 2 }],
+      mapBase: 0x1000,
+      bgmode: 0,
+    }),
+    vramGlue: (n) => `; vram glue for ${n ?? 'vram.bin'}`,
   };
 
   const track: TrackController = {
@@ -347,10 +354,20 @@ describe('gfx tools', () => {
   it('gfx_export_vram builds the image; with destName it registers on the asm page', () => {
     const m = mockControllers();
     const r = dispatch(m, 'gfx_export_vram');
-    expect(JSON.parse(r.content)).toEqual({ bytes: 4 });
+    const body = JSON.parse(r.content) as Record<string, unknown>;
+    expect(body).toMatchObject({ bytes: 4, layout: { bytes: 4, mapBase: 0x1000 } });
+    expect(typeof body.glue).toBe('string');
     expect(m.files.size).toBe(0);
     dispatch(m, 'gfx_export_vram', { destName: 'vram.bin' });
     expect(m.files.get('vram.bin')).toEqual(new Uint8Array([0, 1, 2, 3]));
+    // glue appended into the source, wrapped in the (re-runnable) marker block
+    expect(m.sources.src).toContain('vram glue for vram.bin');
+    expect(m.sources.src).toContain('GFX_VRAM_GLUE');
+    // re-exporting is idempotent — the marker block (and its label) is not duplicated
+    const before = m.sources.src;
+    dispatch(m, 'gfx_export_vram', { destName: 'vram.bin' });
+    expect(m.sources.src).toBe(before);
+    expect(m.sources.src.match(/GFX_VRAM_GLUE \(generated\)/g)!.length).toBe(1);
     expect(dispatch(m, 'gfx_export_vram', { destName: 5 }).ok).toBe(false);
   });
 });

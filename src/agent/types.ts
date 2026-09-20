@@ -15,6 +15,8 @@
  *   models   GET  /api/tags  → { models: [{ name, ... }] }
  */
 
+import type { VramCompact } from '../gfx/vram';
+
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 
 /** One tool call requested by the model (arguments already parsed to a value). */
@@ -137,6 +139,18 @@ export interface GfxController {
   setMapFromGrid(grid: number[][], palette: number): void;
   /** Compile the editor to a 64 KB VRAM image. */
   buildVram(): Uint8Array;
+  /**
+   * Compile the editor to a **compact** VRAM export — only the used char,
+   * tilemap, and palette regions (a few KB, not all 64 KB), with the tilemap
+   * re-homed into a displayable NameBase. This is what a ROM should embed.
+   */
+  buildVramCompact(): VramCompact;
+  /**
+   * The self-contained 65C816 bring-up routine (PPU setup + VRAM fill) that
+   * loads `buildVramCompact()`'s blob. The program only needs `JSR vram_load`.
+   * `dataName` is the `.incbin` file name the glue references (default "vram.bin").
+   */
+  vramGlue(dataName?: string): string;
 }
 
 /** Music page: the S-DSP song, and the SPC package export. */

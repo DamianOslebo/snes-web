@@ -175,10 +175,10 @@ export function spcGlue(dataName = 'spc.bin'): string {
 ; $2140-$2143 ports, then hands the SPU its start address. Pure 8-bit mode.
 spc_load:
   pea spc_data          ; push the 16-bit address of the embedded data
+  pla                   ; A = low byte (PEA writes high first, so low pops first)
+  sta $10               ; ptr_lo
   pla                   ; A = high byte
   sta $11               ; ptr_hi
-  pla                   ; A = low byte
-  sta $10               ; ptr_lo
   ldy #0                ; (zp),Y with Y=0 reads *ptr
 spc_rdy:
   lda $2140             ; wait for SPU ready: PORT0 = $AA

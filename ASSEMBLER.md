@@ -255,7 +255,12 @@ tileset/PCM/SFX data) into the built ROM.
   two-pass offset sweep sees it).
 - **Cap:** code **plus** data must fit the 32 KB entry region
   (`MAX_CODE = $7FB0`, file `$0000–$7FAF`) — a full 64 KB VRAM image does
-  **not** fit; a typical KB-scale tileset does. The escape hatch for more
+  **not** fit; a typical KB-scale tileset does. The graphics page's
+  **compact** export (`buildVramCompact` / the agent's `gfx_export_vram`)
+  is exactly this KB-scale image — only the used char + tilemap + palette
+  regions, re-homed into a displayable NameBase — and it ships with a
+  self-contained `vram_load` 65C816 bring-up routine (see GRAPHICS.md and
+  AGENT.md). The escape hatch for more
   than 32 KB is multi-bank placement (`.org` into bank `$01`, file `$8000`)
   — deliberately not in v1 (the ROM is fixed 256 KB; bigger images mean a
   512 KB+ image and `ROMSize` changes).
@@ -316,8 +321,9 @@ review code. Reached from the "⌨ Assembler" transport button, which sets
   `assembled.sfc` (an object-URL anchor click) — the "ROM file" the user can
   keep or load elsewhere.
 - **📦 Data files…** → pick `.bin`/`.dat`/`.img`/`.rom` files to embed with
-  `.incbin "name"` (e.g. the graphics editor's 64 KB VRAM dump or a slice of
-  it). Loaded files show as chips (name · size · ✕); removing one re-assembles
+  `.incbin "name"` (e.g. the graphics page's **compact** VRAM image — the
+  full 64 KB dump exceeds the 32 KB cap, see above). Loaded files show as
+  chips (name · size · ✕); removing one re-assembles
   so a dangling `.incbin` fails loudly. The listing shows an include's first
   16 bytes + "… +N more" — never the full dump.
 - "← Back to game" strips the param and reboots the emulator.

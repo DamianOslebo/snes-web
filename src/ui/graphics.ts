@@ -15,7 +15,7 @@
 import { MODES, colorsForMode, depthForMode, sizeForMode } from '../gfx/tile-encode';
 import { cgramOffset, rgb5to8, type Rgb15 } from '../gfx/palette';
 import { MAP_ENTRIES, type TilemapEntry } from '../gfx/tilemap';
-import { VRAM_SIZE, buildVram as buildVramImage } from '../gfx/vram';
+import { VRAM_SIZE, buildVram as buildVramImage, buildVramCompact, vramGlue as vramGlueGen, type BuildVramOptions } from '../gfx/vram';
 import { decodePalette, decodeTile } from '../gfx/decode';
 import { toHexRows } from '../debug/memory-view';
 import { looksLikeSnesRom } from '../core/rom-check';
@@ -1305,15 +1305,30 @@ export function makeGfxController(): GfxController {
 
     buildVram() {
       ensureGfxState();
-      return buildVramImage({
-        mode: ed.mode,
-        tiles: ed.tiles.length ? ed.tiles : [blankTile()],
-        palettes: [ed.palette],
-        tilemap: ed.map.map((e) => e ?? blankEntry()),
-        tileBase: ed.tileBase,
-        paletteBase: ed.paletteBase,
-        mapBase: ed.mapBase,
-      });
+      return buildVramImage(gfxVramOpts());
     },
+
+    buildVramCompact() {
+      ensureGfxState();
+      return buildVramCompact(gfxVramOpts());
+    },
+
+    vramGlue(dataName) {
+      const c = buildVramCompact(gfxVramOpts());
+      return vramGlueGen(c.mapBase, c.bgmode, c.blocks, dataName);
+    },
+  };
+}
+
+/** The shared `BuildVramOptions` for the gfx controller's compile methods. */
+function gfxVramOpts(): BuildVramOptions {
+  return {
+    mode: ed.mode,
+    tiles: ed.tiles.length ? ed.tiles : [blankTile()],
+    palettes: [ed.palette],
+    tilemap: ed.map.map((e) => e ?? blankEntry()),
+    tileBase: ed.tileBase,
+    paletteBase: ed.paletteBase,
+    mapBase: ed.mapBase,
   };
 }

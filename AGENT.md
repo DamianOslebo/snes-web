@@ -138,7 +138,7 @@ Two buttons next to **↺ New**:
 | `gfx_set_palette_color` | 5-bit RGB, index 0–15 (0 = transparent by convention) |
 | `gfx_add_tile` / `gfx_set_tile_pixel` / `gfx_fill_rect` | 16×16 tile authoring (batch: `fill_rect`) |
 | `gfx_set_map_entry` / `gfx_fill_map` / `gfx_set_map_grid` | the 32×32 SC0 map (`set_map_grid` takes `grid[row][col]`) |
-| `gfx_export_vram` | compile the 64 KB VRAM image → registers `vram.bin` on the asm page |
+| `gfx_export_vram` | compile the **compact** VRAM image (used palette + tiles + tilemap, a few KB) → registers `vram.bin` on the asm page **and appends the `vram_load` bring-up glue** (idempotent — re-running replaces the block, never duplicates it) |
 
 **trk_*** — the music page
 | tool | what it does |
@@ -148,22 +148,38 @@ Two buttons next to **↺ New**:
 | `trk_set_tempo` / `trk_set_orders` / `trk_add_pattern` | tempo (rows/s), play order, blank pattern |
 | `trk_add_instrument` | preset `lead` \| `bass` \| `noise` \| `pad` |
 | `trk_preview` / `trk_stop` | browser Web Audio preview (only works while the tracker page is open) |
-| `trk_export_spc` | build the SPC700 package → registers `spc.bin` **and appends the 65C816 loader glue** |
+| `trk_export_spc` | build the SPC700 package → registers `spc.bin` **and appends the `spc_load` 65C816 loader glue** (idempotent — re-running replaces the block, never duplicates it) |
 
 ## The end-to-end recipe (what the prompt teaches the model)
 
-Order matters — the exports append/register data, so they come **after**
-`asm_set_source` (which replaces the whole source):
+The program is **tiny** — the model never hand-rolls PPU setup, VRAM DMA, or
+SPU port writes. The two export tools generate self-contained 65C816 routines
+(`vram_load`, `spc_load`) and append them; the program just calls them:
 
-1. `gfx_*` — palette, tiles, SC0 map.
-2. `trk_*` — author the song (or skip music).
-3. `asm_set_source` — the complete 65C816 program: `.incbin "vram.bin"` +
-   VRAM DMA at startup ($2108/$2118), and `JSR spc_load` if there is music
-   (never `.incbin "spc.bin"` itself — the glue already includes it).
+```
+reset:
+  jsr vram_load        ; PPU bring-up + VRAM fill (glue from gfx_export_vram)
+  ; jsr spc_load       ; SPC700 loader (glue from trk_export_spc) — only if music
+idle:
+  bra idle
+```
+
+Order matters — the exports **append** glue, so they come **after**
+`asm_set_source` (which replaces the whole source, wiping any appended glue):
+
+1. `gfx_*` — palette, tiles, SC0 map (skip if no graphics).
+2. `trk_*` — author the song (skip if no music).
+3. `asm_set_source` — the minimal reset program above (`jsr vram_load` if
+   graphics, `jsr spc_load` if music; nothing else).
 4. `gfx_export_vram` (destName `vram.bin`) and `trk_export_spc` (destName
-   `spc.bin`) — both register their data file on the assembler page.
+   `spc.bin`) — each compiles its image, registers the data file, **and
+   appends its loader glue** (both are idempotent, so re-running after a later
+   `asm_set_source` restores the glue without duplicating a label).
 5. `asm_assemble` → fix diagnostics → repeat until clean.
 6. `asm_build_rom` → `asm_run` → the ROM loads + runs in the emulator.
+
+The safest clean-slate sequence after any program edit is:
+`asm_set_source` → (gfx_export_vram) → (trk_export_spc) → `asm_assemble`.
 
 ## In-ROM SPU audio — scope & limits (EXPERIMENTAL)
 

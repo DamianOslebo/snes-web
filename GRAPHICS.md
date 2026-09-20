@@ -2,8 +2,9 @@
 
 Status: **complete.** The `?gfx=1` page (Inspector + Editor) and the 🎨 Graphics
 button wiring are in place, the five-way `core_vram_ptr` ABI sync and the pure-TS
-gfx data path are done, and the test suite is green (120 tests, 40 of them gfx).
-The last confirmation is a final `npm run typecheck && npm run build` run.
+gfx data path are done (including the **compact VRAM export + `vram_load` glue**
+for in-ROM programs), and the test suite is green. The last confirmation is a
+final `npm run typecheck && npm run build` run.
 
 🤖 The agent panel (present on all three authoring pages) can drive this page end-to-end — see [AGENT.md](AGENT.md).
 The graphics tool is one new page — `?gfx=1`, reached from
@@ -154,6 +155,60 @@ Tile name range-checked 0..1023 (never a wrapped name).
 would exceed the 64 KB. This is the graphics analog of `buildRom` in
 `src/asm/rom.ts` — except the output is PPU graphics data, not an SFC.
 
+### `src/gfx/vram.ts` (new) — compact export + `vram_load` glue
+
+The 64 KB image above is what the Editor's ⬇ button downloads and what a
+*hand-rolled* project would DMA in. A **program assembled in this repo** has a
+32 KB code cap (`buildRom`, `MAX_CODE = $7FB0`), so a 64 KB `.incbin` of VRAM can
+never fit. The compact export is the shape that fits, and it ships with the 65C816
+routine that brings the screen up — so a hello-world ROM is one `JSR`.
+
+**`buildVramCompact(opts)`** → `VramCompact { blob, blocks, mapBase, bgmode }`
+
+- **`blob`** — only the *used* regions concatenated: the char (tile) region, the
+  tilemap, and the CGRAM palettes. Everything else of the 64 KB is dropped. A few
+  KB for a small scene, not 64 KB — small enough to sit under the 32 KB cap.
+- **`blocks`** — the `VramBlock { dest, len }` table that tells the glue where each
+  slice of `blob` lands. `dest` is the VRAM **word** address (byte offset =
+  `dest * 2`); `len` is the word count (1–255, so the glue's 8-bit length byte is
+  valid). `blob` order = `blocks` order.
+- **`mapBase`** — the tilemap is **re-homed** into a displayable 4 KB NameBase
+  (`≤ $7000`), placed at the first 4 KB boundary at or past the tile region. The
+  SNES can only point BG0-3 at eight windows ($0000, $1000 … $7000), so an
+  authoring `mapBase` above `$7000` (the editor default is `$8000`) would never
+  render; this is what makes the image displayable. Throws if it cannot fit.
+- **`bgmode`** — the mode (0-7) the glue programs into BGMODE.
+
+**`vramGlue(mapBase, bgmode, blocks, dataName = 'vram.bin')`** → a self-contained
+65C816 routine (pure 8-bit mode, same `PEA`/`PLA` idiom as `spcGlue`, so it
+assembles with this repo's assembler — no bank-switching). The program only has to
+`JSR vram_load`. The routine:
+
+1. un-blanks + sets full brightness (INIDISP twice — the reset state is
+   forced-blank, brightness 0, i.e. a black screen),
+2. programs BGMODE / BG0SC / BG12NBA (the `mapBase` NameBase), enables BG0 (TM),
+   and sets VMAIN so the `$2118/$2119` word pair auto-advances,
+3. walks the `blocks` table (`dest_lo, dest_hi, len`) and streams each slice of
+   the embedded data word-by-word, stopping at the `len == 0` terminator.
+
+Scratch is zero-page `$20–$26`, deliberately clear of `spcGlue`'s `$10–$17`, so
+the two routines coexist in one ROM.
+
+**Agent tool — `gfx_export_vram`** ([AGENT.md](AGENT.md)): with `destName
+"vram.bin"` it compiles the compact image, registers it as the assembler page's
+`.incbin` data file, **and appends** this `vram_load` glue (idempotent — re-running
+replaces the block, never duplicates the label). Without `destName` it just returns
+the bytes + glue so the model can inspect them. So the end-to-end recipe stays
+`gfx_*` → `asm_set_source` → `gfx_export_vram` → `asm_assemble`, and the program
+is literally:
+
+```
+reset:
+  jsr vram_load
+idle:
+  bra idle
+```
+
 ### `src/gfx/decode.ts` (new) — the Inspector's reader
 
 The inverse of the encoders, all reading straight out of a 64 KB buffer:
@@ -161,7 +216,7 @@ The inverse of the encoders, all reading straight out of a 64 KB buffer:
 (16×16 composes its four sub-tiles); `decodePalette(vram, paletteIndex)` → 16
 `Rgb15`; `decodeTilemap(vram, mapBase?, count?)`. Range-checked against the buffer.
 
-### Tests (node env) — 40 tests, all green
+### Tests (node env) — 47 tests, all green
 
 - **`test/gfx-tile.test.ts` (14)** — per-mode 0-7 round-trip
   (encode→decode identical); exact byte counts (16/32/64 per sub-tile, ×4 for 16×16);
@@ -178,6 +233,15 @@ The inverse of the encoders, all reading straight out of a 64 KB buffer:
   (tiles at base, sub-tiles at slots 0/1/16/17, palettes at `$C000+`, map at
   `mapBase`); 64 KB size; custom bases; **decode the built image → equal to the
   inputs** (the end-to-end round trip); and the overflow rejections.
+- **`test/gfx-vram-compact.test.ts` (7)** — `buildVramCompact` re-homes the
+  tilemap into a displayable NameBase (`≤ $7000`) and drops the unused 64 KB so
+  the blob is a few KB (under the 32 KB cap); a `simulateLoad` walks the `blocks`
+  table into a fresh 64 KB and the result is **byte-for-byte equal to the full
+  image's used regions**; block lengths are `≤ 255` words and sum to the blob;
+  and `vramGlue` **assembles cleanly in pure 8-bit mode** (no `rep`/`sep`),
+  carries `vram.bin` in verbatim, and with the agent's minimal `reset: jsr
+  vram_load` entry produces a **valid 256 KB LoROM SFC** (reset vector →
+  `$008000`).
 
 ## `?gfx=1` page — `src/ui/graphics.ts` (`mountGraphics`)
 
@@ -225,7 +289,8 @@ npx vitest run test/gfx-tile.test.ts      # 14 tests (per-mode round-trips + han
 npx vitest run test/gfx-palette.test.ts   # 8 tests  (5-5-5 round-trips, rgb5to8)
 npx vitest run test/gfx-tilemap.test.ts   # 7 tests  (entry bits, 2048 B, guard)
 npx vitest run test/gfx-vram.test.ts      # 11 tests (buildVram layout + round-trip)
-npx vitest run                           # full suite: 120 tests
+npx vitest run test/gfx-vram-compact.test.ts  # 7 tests (compact export + vram_load glue + ROM)
+npx vitest run                           # full suite
 npm run typecheck
 npm run build
 ```
