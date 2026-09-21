@@ -265,6 +265,7 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
     loadLog(localStorage) ?? makeLog(typeof navigator !== 'undefined' ? navigator.userAgent : undefined);
   let thinking = false;
   let running = false;
+  let retryNote = ''; // "retrying n/m…" text, set by the retry event, shown at the foot of the thread
   let aborter: AbortController | null = null;
 
   const root = el('div', 'agc-root');
@@ -578,7 +579,6 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
     renderAll();
 
     const pending: (UiItem & { kind: 'chip' })[] = [];
-    let retryNote = '';
     const onEvent = (ev: AgentEvent): void => {
       if (ev.type === 'thinking') {
         retryNote = '';
@@ -652,10 +652,13 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
           perStep: res.perStep,
         });
       } catch (err) {
-        // Only reachable after the retry budget is exhausted (or a hard
-        // failure) — the loop already burned ~10 attempts with backoff.
+        // The loop throws a self-contained, actionable message per failure
+        // class — a permanent 4xx (bad model name) fails fast on the first
+        // attempt, a context overflow is auto-trimmed a few rounds before
+        // giving up, a transient endpoint burns the retry budget and says
+        // what to check. Show it verbatim.
         const msg = (err as Error).message;
-        items.push({ kind: 'error', text: `Ollama error: ${msg} — kept retrying, still failing. Send “continue” to try again, or Stop.` });
+        items.push({ kind: 'error', text: msg });
         log = append(log, { type: 'error', phase: 'model', message: msg });
       } finally {
         thinking = false;

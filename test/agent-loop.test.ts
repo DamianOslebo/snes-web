@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { runAgent, type AgentEvent } from '../src/agent/loop';
+import { classifyError, runAgent, type AgentEvent } from '../src/agent/loop';
 import type { Transport } from '../src/agent/ollama';
 import type {
   AgentControllers,
@@ -330,5 +330,254 @@ describe('runAgent', () => {
     expect(r.perStep[0].retries).toBe(1);
     expect(r.perStep[0].retryErrors).toHaveLength(1);
     expect(r.perStep[0].retryErrors[0]).toContain('XML syntax error');
+  });
+});
+
+/** An `Error` carrying an HTTP status, like `httpError` in ollama.ts. */
+function withStatus(message: string, status: number): Error {
+  const e = new Error(message) as Error & { status?: number };
+  e.status = status;
+  return e;
+}
+
+describe('classifyError', () => {
+  it('context-overflow text wins, even on a 400', () => {
+    expect(classifyError(new Error('context length exceeded'))).toBe('context');
+    expect(classifyError(new Error('prompt is too long'))).toBe('context');
+    expect(classifyError(withStatus('prompt length exceeds the limit', 400))).toBe('context');
+  });
+
+  it('4xx is permanent, except 408 and 429', () => {
+    expect(classifyError(withStatus('model "nope" not found', 404))).toBe('permanent');
+    expect(classifyError(withStatus('bad request body', 400))).toBe('permanent');
+    expect(classifyError(withStatus('gateway timed out', 408))).toBe('retryable');
+    expect(classifyError(withStatus('rate limited', 429))).toBe('retryable');
+  });
+
+  it('5xx, network failures and timeouts are retryable', () => {
+    expect(classifyError(withStatus('internal error', 500))).toBe('retryable');
+    expect(classifyError(new Error('fetch failed (CORS?)'))).toBe('retryable');
+    const t = new Error('signal is aborted due to timeout') as Error & { name?: string };
+    t.name = 'TimeoutError';
+    expect(classifyError(t)).toBe('retryable');
+  });
+});
+
+describe('failure classification in the loop', () => {
+  it('a permanent 4xx fails fast — the retry budget is not burned', async () => {
+    let attempts = 0;
+    const t: Transport = {
+      post: async () => {
+        attempts += 1;
+        throw withStatus('model "nope" not found', 404);
+      },
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    await expect(
+      runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retries: 10, retryDelayMs: 0 }),
+    ).rejects.toThrow(/ollama pull test-model/);
+    expect(attempts).toBe(1);
+  });
+
+  it('still retries 5xx and 429 — the next sample often fixes them', async () => {
+    let attempts = 0;
+    const t: Transport = {
+      post: async () => {
+        attempts += 1;
+        throw withStatus('server hiccup', attempts === 1 ? 500 : 429);
+      },
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    await expect(
+      runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retries: 2, retryDelayMs: 0 }),
+    ).rejects.toThrow('server hiccup');
+    expect(attempts).toBe(3); // 1 + 2 retries — neither permanent
+  });
+
+  it('trims the conversation on a context rejection, then recovers', async () => {
+    const history: Message[] = [];
+    for (let i = 0; i < 30; i++) {
+      history.push({ role: 'user', content: `old question ${i}` });
+      history.push({ role: 'assistant', content: `old answer ${i}` });
+    }
+    let attempts = 0;
+    const bodies: { messages: Message[] }[] = [];
+    const t: Transport = {
+      post: async (_url, body) => {
+        attempts += 1;
+        bodies.push(body as { messages: Message[] });
+        if (attempts === 1) throw new Error('context length exceeded');
+        return reply('fits now');
+      },
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    const r = await runAgent({
+      ...base,
+      messages: history,
+      controllers: miniControllers().controllers,
+      transport: t,
+      retryDelayMs: 0,
+    });
+    expect(r.stopped).toBe('reply');
+    expect(r.finalContent).toBe('fits now');
+    // The re-sent request is strictly shorter, still starts with the system
+    // prompt, and does not begin with a dangling tool result.
+    expect(bodies[1].messages.length).toBeLessThan(bodies[0].messages.length);
+    expect(bodies[1].messages[0].role).toBe('system');
+    expect(bodies[1].messages[1].role).not.toBe('tool');
+  });
+
+  it('gives up on a context failure after the trim rounds, with an actionable error', async () => {
+    let attempts = 0;
+    const t: Transport = {
+      post: async () => {
+        attempts += 1;
+        throw new Error('context length exceeded');
+      },
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    await expect(
+      runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 }),
+    ).rejects.toThrow(/context window/i);
+    expect(attempts).toBe(4); // original + one attempt per trim tail (8 → 4 → 2)
+  });
+
+  it('a request timeout is retryable, never a user abort', async () => {
+    let attempts = 0;
+    const t: Transport = {
+      post: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          const e = new Error('signal is aborted due to timeout') as Error & { name?: string };
+          e.name = 'TimeoutError';
+          throw e;
+        }
+        return reply('recovered');
+      },
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 });
+    expect(attempts).toBe(2);
+    expect(r.stopped).toBe('reply');
+    expect(r.finalContent).toBe('recovered');
+  });
+
+  it('an abort during the retry delay ends the run without waiting out the sleep', async () => {
+    const ac = new AbortController();
+    let attempts = 0;
+    const t: Transport = {
+      post: async (_url, _body, signal) => {
+        attempts += 1;
+        if (signal?.aborted) {
+          const e = new Error('aborted') as Error & { name?: string };
+          e.name = 'AbortError';
+          throw e;
+        }
+        if (attempts === 1) {
+          setTimeout(() => ac.abort(), 30);
+          throw new Error('fail once');
+        }
+        return reply('late');
+      },
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    const started = Date.now();
+    const r = await runAgent({
+      ...base,
+      controllers: miniControllers().controllers,
+      transport: t,
+      signal: ac.signal,
+      retries: 5,
+      retryDelayMs: 2000, // long sleep — the abort must cut it short
+    });
+    expect(r.stopped).toBe('aborted');
+    expect(attempts).toBe(2);
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+});
+
+describe('spin detection', () => {
+  it('breaks three identical steps with stopped:"loop" and a visible note', async () => {
+    const { t, calls } = scripted([call('asm_get_source')]); // same call + same result, forever
+    const events: AgentEvent[] = [];
+    const r = await runAgent({
+      ...base,
+      controllers: miniControllers().controllers,
+      transport: t,
+      retryDelayMs: 0,
+      onEvent: (e) => events.push(e),
+    });
+    expect(r.stopped).toBe('loop');
+    expect(r.turns).toBe(3); // the third identical step is taken, then it stops
+    expect(calls).toHaveLength(3);
+    expect(r.finalContent).toMatch(/not making progress/i);
+    // The explanation was shown as a message, not just returned.
+    const note = events.find((e) => e.type === 'message');
+    expect(note).toMatchObject({ type: 'message' });
+    expect((note as { content: string }).content).toMatch(/not making progress/i);
+    // …and the wire history ends with a nudge so a "continue" carries the reason.
+    const last = r.messages[r.messages.length - 1];
+    expect(last.role).toBe('user');
+    expect(last.content).toMatch(/do not repeat/i);
+  });
+
+  it('breaks an A-B-A-B cycle with identical results', async () => {
+    const A = call('asm_set_source', { source: 'RTI\n  rts' });
+    const B = call('asm_assemble', {});
+    let i = 0;
+    const t: Transport = {
+      post: async () => [A, B, A, B][Math.min(i++, 3)], // a true alternating cycle
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 });
+    expect(r.stopped).toBe('loop');
+    expect(r.turns).toBe(4);
+  });
+
+  it('does NOT trip on repeated calls that change their result', async () => {
+    // A model legitimately appending source twice: different args → different
+    // signature → no spin, and it can finish with a normal reply.
+    const { t } = scripted([
+      call('asm_append_source', { text: '  LDA #$00' }),
+      call('asm_append_source', { text: '  STA $20' }),
+      reply('done'),
+    ]);
+    const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 });
+    expect(r.stopped).toBe('reply');
+    expect(r.finalContent).toBe('done');
+  });
+});
+
+describe('empty replies', () => {
+  it('nudges an empty reply once, then stops with a visible note on a second', async () => {
+    const { t } = scripted([reply(''), reply('')]);
+    const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 });
+    expect(r.stopped).toBe('reply');
+    expect(r.finalContent).toMatch(/empty/i);
+    // The model got exactly one nudge before the run ended.
+    const nudges = r.messages.filter((m) => m.role === 'user' && /empty/i.test(m.content));
+    expect(nudges).toHaveLength(1);
+  });
+
+  it('recovers when the model answers after the nudge', async () => {
+    const { t } = scripted([reply(''), reply('built it')]);
+    const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 });
+    expect(r.stopped).toBe('reply');
+    expect(r.finalContent).toBe('built it');
+    expect(r.messages.some((m) => m.role === 'user' && /empty/i.test(m.content))).toBe(true);
   });
 });

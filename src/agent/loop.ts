@@ -5,7 +5,16 @@
  *   model replies → if it requested tool calls, run each in order (dispatched
  *   against `AgentControllers`), append the results as `role:"tool"` messages,
  *   and send the whole conversation back → repeat until the model answers with
- *   a plain text reply, hits `maxTurns`, or the request is aborted.
+ *   a plain text reply, hits `maxTurns`, is aborted, or is detected spinning
+ *   (the same step producing the same result again and again).
+ *
+ * Failure handling is classified, because the right response differs:
+ *   - transient (network blip, 5xx, 429, a per-request timeout, Ollama's
+ *     flaky tool-call parse) → retried, with backoff and "retrying n/m";
+ *   - context overflow → the conversation is trimmed (oldest first) and the
+ *     step re-sent, a few rounds before giving up with an actionable error;
+ *   - permanent (a 4xx — bad model name, rejected request) → fails fast on
+ *     the first attempt with the reason; retrying can never fix it.
  *
  * Pure and node-testable: the I/O is injected (`Transport`) and the pages are
  * the `AgentControllers` interface — no DOM, no fetch, no AudioContext. The
@@ -14,6 +23,7 @@
 
 import { chatOnce, fetchTransport } from './ollama';
 import type { Transport } from './ollama';
+import { CONTEXT_TRIM_TAILS, trimForContext } from './conversation';
 import { dispatchTool, TOOL_SPECS } from './tools';
 import type { ToolCtx } from './tools';
 import type { AgentControllers, Message } from './types';
@@ -40,14 +50,21 @@ export interface RunAgentOptions {
   /** Ollama `think` toggle for models that support it; `undefined` = model default. */
   think?: boolean;
   /**
-   * Retries per model call for transient errors (default 10). The loop
+   * Retries per model call for TRANSIENT errors (default 10). The loop
    * deliberately keeps retrying — Ollama's flaky tool-call parse ("XML syntax
    * error …") and tunnel hiccups clear on the next sample; the user's Stop
-   * button (abort) is what ends a run, not a bad step. Aborts never retry.
+   * button (abort) is what ends a run, not a bad step. Aborts never retry,
+   * and permanent 4xx responses don't count against this budget at all.
    */
   retries?: number;
   /** Delay before retry *n*, in ms (default 400*n; tests pass 0). */
   retryDelayMs?: number;
+  /**
+   * Per-request deadline in ms (default 30 s, `0` = no deadline). Bounds a
+   * single `/api/chat` round trip so a silent Ollama/dead tunnel fails as a
+   * retryable error instead of hanging forever; the Stop button still wins.
+   */
+  timeoutMs?: number;
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void;
 }
@@ -75,21 +92,95 @@ export interface RunAgentResult {
   finalContent: string;
   /** Tool-calling steps actually taken. */
   turns: number;
-  stopped: 'reply' | 'max-turns' | 'aborted';
+  /**
+   * Why the loop stopped: a plain-text reply, the step budget, a user Stop,
+   * or a detected spin (same step + same result, no progress).
+   */
+  stopped: 'reply' | 'max-turns' | 'aborted' | 'loop';
   /** Wall time of the whole run (thinking → final answer), in ms. */
   totalMs: number;
   /** One entry per model step actually taken (empty if it never started). */
   perStep: StepMetrics[];
 }
 
+/**
+ * A user Stop, not a deadline: `AbortSignal.timeout` rejects with a
+ * `TimeoutError` (or a "timed out" message on some runtimes), and a timeout
+ * must be RETRIED, never treated as the user's abort. An aborted user signal
+ * always wins, whatever the error is.
+ */
 function isAbort(err: unknown, signal?: AbortSignal): boolean {
   if (signal?.aborted) return true;
   const e = err as { name?: string; message?: string };
+  if (e?.name === 'TimeoutError' || /timed?[\s_-]?out/i.test(e?.message ?? '')) return false;
   return e?.name === 'AbortError' || /abort/i.test(e?.message ?? '');
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+/** `sleep` that ends early when `signal` aborts (Stop during a retry delay). */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(t);
+      resolve();
+    }, { once: true });
+  });
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** What a failed model call means for the retry strategy (see file header). */
+export type FailureKind = 'retryable' | 'permanent' | 'context';
+
+/**
+ * Classify a failed model call. Context-overflow text wins (it can happen as
+ * a 400 too, and the fix is a trim, not a give-up). A 4xx is permanent
+ * EXCEPT 408 (their gateway timed out — worth one more go) and 429 (rate
+ * limit — the backoff delay is the fix). Everything else — network, 5xx,
+ * timeouts — is retryable: re-sending is a fresh sample.
+ */
+export function classifyError(err: unknown): FailureKind {
+  const text = errText(err);
+  if (/context|exceed|too (long|large)/i.test(text)) return 'context';
+  const status = (err as { status?: unknown })?.status;
+  if (typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 429) {
+    return 'permanent';
+  }
+  return 'retryable';
+}
+
+/** A permanent 4xx with an actionable message (esp. the 404 bad-model case). */
+function permanentMessage(err: unknown, model: string): string {
+  const status = (err as { status?: unknown })?.status;
+  let msg = `Ollama rejected the request${typeof status === 'number' ? ` (HTTP ${status})` : ''}: ${errText(err)}`;
+  if (status === 404) {
+    msg += ` — the model name is probably wrong: check it in the settings field, or run \`ollama pull ${model}\` to install it.`;
+  }
+  return msg;
+}
+
+/**
+ * Stable-serialized step signature: the tool calls made AND the results they
+ * produced. Identical signature twice in a row (or an A,B,A,B cycle) means the
+ * model is doing exactly the same thing and getting exactly the same outcome
+ * — provably no progress, whatever its (missing) commentary says.
+ */
+function stableJson(v: unknown): string {
+  if (v === null || v === undefined) return 'null';
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(',')}]`;
+  if (typeof v === 'object') {
+    const obj = v as Record<string, unknown>;
+    const keys = Object.keys(obj).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJson(obj[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(v);
+}
+
+function stepSignature(calls: { name: string; args: unknown }[], results: { ok: boolean; content: string }[]): string {
+  return stableJson(calls) + '|' + stableJson(results);
 }
 
 /** A successful model call plus how many failed attempts preceded it. */
@@ -100,17 +191,15 @@ interface ChatOutcome {
   retryErrors: string[];
 }
 
-function errText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
 /**
- * `chatOnce` with bounded retries for transient errors. Safe because a failed
- * step has no side effects yet (nothing is dispatched or appended until the
- * call succeeds), so a retry just re-sends the identical conversation and the
- * model re-samples its answer. Aborts rethrow immediately — a Stop is never
- * retried. `onRetry` is notified (but never blocks) on each failed attempt so
- * the UI can show "retrying n/m…" instead of looking frozen.
+ * `chatOnce` with bounded retries for TRANSIENT errors only. Safe because a
+ * failed step has no side effects yet (nothing is dispatched or appended until
+ * the call succeeds), so a retry just re-sends the identical conversation and
+ * the model re-samples its answer. Aborts rethrow immediately — a Stop is
+ * never retried. Permanent 4xx and context-overflow rethrow on the FIRST
+ * attempt (the loop handles them — a trim, or a fail-fast message). `onRetry`
+ * is notified (but never blocks) on each failed attempt so the UI can show
+ * "retrying n/m…" instead of looking frozen.
  */
 async function chatWithRetry(
   endpoint: string,
@@ -121,17 +210,19 @@ async function chatWithRetry(
   think: boolean | undefined,
   retries: number,
   retryDelayMs: number,
+  timeoutMs: number,
   onRetry?: (attempt: number, max: number, error: string) => void,
 ): Promise<ChatOutcome> {
   const retryErrors: string[] = [];
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    if (attempt > 0 && retryDelayMs > 0) await sleep(retryDelayMs * attempt);
+    if (attempt > 0 && retryDelayMs > 0) await sleep(retryDelayMs * attempt, signal);
     try {
-      const reply = await chatOnce(endpoint, model, messages, TOOL_SPECS, transport, signal, think);
+      const reply = await chatOnce(endpoint, model, messages, TOOL_SPECS, transport, signal, think, timeoutMs);
       return { reply, retries: attempt, retryErrors };
     } catch (err) {
       if (isAbort(err, signal)) throw err;
+      if (classifyError(err) !== 'retryable') throw err; // permanent / context — retrying can't help
       lastErr = err;
       const text = errText(err);
       retryErrors.push(text);
@@ -143,9 +234,11 @@ async function chatWithRetry(
 
 /**
  * Run the agent until it answers in plain text (or stops). Never throws for
- * aborts or tool errors — those become loop state / clean tool results; other
- * transport errors (Ollama down, CORS, HTTP 5xx) propagate so the panel can
- * show the user a useful message.
+ * aborts or tool errors — those become loop state / clean tool results.
+ * Transport failures throw a SELF-CONTAINED, actionable message for the
+ * panel: a permanent 4xx (bad model name) fails fast on the first attempt;
+ * a context overflow is auto-trimmed a few rounds, then explained; a
+ * transient endpoint burns the retry budget and says what to check.
  */
 export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   const {
@@ -158,16 +251,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     think,
     retries = 10,
     retryDelayMs = 400,
+    timeoutMs = 30_000,
     signal,
     onEvent,
   } = opts;
   const ctx: ToolCtx = { controllers };
-  const messages: Message[] = [{ role: 'system', content: system }, ...opts.messages];
+  let messages: Message[] = [{ role: 'system', content: system }, ...opts.messages];
   const startedAt = Date.now();
   let turns = 0;
   let stopped: RunAgentResult['stopped'] = 'max-turns';
   let finalContent = '';
   const perStep: StepMetrics[] = [];
+  let trimRounds = 0; // context-trims tried for the current step (reset on success)
+  let emptyStreak = 0; // consecutive empty replies (a nudge is allowed, not a loop)
+  const sigs: string[] = []; // recent step signatures, for spin detection
 
   for (;;) {
     if (signal?.aborted) {
@@ -188,6 +285,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         think,
         retries,
         retryDelayMs,
+        timeoutMs,
         (attempt, max, error) => onEvent?.({ type: 'retry', attempt, max, error }),
       );
     } catch (err) {
@@ -195,15 +293,54 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         stopped = 'aborted';
         break;
       }
-      throw err;
+      const kind = classifyError(err);
+      if (kind === 'context') {
+        // The same context just failed on length — re-sending it unchanged
+        // can never work. Trim the OLDEST messages away and re-ask, up to
+        // one attempt per tail size.
+        if (trimRounds >= CONTEXT_TRIM_TAILS.length) {
+          throw new Error(
+            `The conversation is longer than ${model}'s context window, and it still failed after trimming to the last ${CONTEXT_TRIM_TAILS[CONTEXT_TRIM_TAILS.length - 1]} messages (last error: ${errText(err)}). ` +
+            'Start a new conversation (🆕) or switch to a model with a larger context window.',
+          );
+        }
+        messages = trimForContext(messages, trimRounds);
+        trimRounds += 1;
+        continue;
+      }
+      if (kind === 'permanent') {
+        throw new Error(permanentMessage(err, model));
+      }
+      throw new Error(
+        `Ollama kept failing after ${retries + 1} attempts (last error: ${errText(err)}). ` +
+        'Check that Ollama is running and reachable, then send "continue" to try again.',
+      );
     }
     const modelMs = Date.now() - modelStart;
     const reply = outcome.reply;
+    trimRounds = 0; // this context size fits — future trims start over
     messages.push(reply);
     finalContent = reply.content;
 
     const calls = reply.tool_calls ?? [];
     if (calls.length === 0) {
+      // A content-less reply with no tool call is NOT an answer. Nudge once;
+      // a second empty reply ends the run with a visible explanation rather
+      // than a silent blank line.
+      if (reply.content.trim() === '') {
+        perStep.push({ index: stepIndex, modelMs, retries: outcome.retries, retryErrors: outcome.retryErrors, toolCalls: 0, toolMs: 0 });
+        if (emptyStreak >= 1) {
+          const note = 'The model kept replying with an empty message, so I stopped. Send your request again — or switch models — and I\'ll pick up from here.';
+          finalContent = note;
+          onEvent?.({ type: 'message', content: note });
+          stopped = 'reply';
+          break;
+        }
+        emptyStreak += 1;
+        messages.push({ role: 'user', content: 'Your last reply was empty. Call a tool to continue the work, or reply with a short summary of what you did so far.' });
+        continue;
+      }
+      emptyStreak = 0;
       perStep.push({ index: stepIndex, modelMs, retries: outcome.retries, retryErrors: outcome.retryErrors, toolCalls: 0, toolMs: 0 });
       onEvent?.({ type: 'message', content: reply.content });
       stopped = 'reply';
@@ -211,6 +348,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     }
 
     let toolMs = 0;
+    const results: { ok: boolean; content: string }[] = [];
     for (const call of calls) {
       // `ToolCall.args` is `unknown` for tolerance; dispatch wants an object.
       const args: Record<string, unknown> =
@@ -221,13 +359,34 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       const toolStart = Date.now();
       const result = dispatchTool(call.name, args, ctx);
       toolMs += Date.now() - toolStart;
+      results.push(result);
       onEvent?.({ type: 'tool-result', name: call.name, ok: result.ok, content: result.content });
       messages.push({ role: 'tool', content: result.content, tool_name: call.name });
     }
     perStep.push({ index: stepIndex, modelMs, retries: outcome.retries, retryErrors: outcome.retryErrors, toolCalls: calls.length, toolMs });
+    emptyStreak = 0;
 
     if (++turns >= maxTurns) {
       stopped = 'max-turns';
+      break;
+    }
+
+    // Spin detection: the same calls producing the same results, three times
+    // in a row, or an A-B-A-B cycle. Identical RESULTS are the key — a tool
+    // legitimately called twice (add a tile, assemble…) usually changes
+    // something, so its signature differs and it never trips this.
+    sigs.push(stepSignature(calls, results));
+    if (sigs.length > 4) sigs.shift();
+    const repeats = sigs.length >= 3 && sigs[0] === sigs[1] && sigs[1] === sigs[2];
+    const cycles = sigs.length >= 4 && sigs[0] === sigs[2] && sigs[1] === sigs[3];
+    if (repeats || cycles) {
+      const note = 'I stopped: the same step kept producing the same result with nothing changing, so I am not making progress this way. Tell me what to change — a different approach, or what is failing — and I\'ll pick up from here.';
+      finalContent = note;
+      onEvent?.({ type: 'message', content: note });
+      // Leave a user nudge in the wire history so a "continue" carries the
+      // reason, not just the word.
+      messages.push({ role: 'user', content: 'That step just repeated with the same result and made no progress. Do NOT repeat it — change your approach: fix the failing part, try a different tool, or re-plan the task.' });
+      stopped = 'loop';
       break;
     }
   }

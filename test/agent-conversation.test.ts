@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   CONVERSATION_KEY,
+  CONTEXT_TRIM_TAILS,
   MAX_HISTORY_MESSAGES,
   clearHistory,
   guardMessages,
   loadHistory,
   sanitizeHistory,
   saveHistory,
+  trimForContext,
 } from '../src/agent/conversation';
 import type { StorageBackend } from '../src/agent/state-store';
 import type { Message } from '../src/agent/types';
@@ -172,6 +174,65 @@ describe('saveHistory', () => {
     const hist: Message[] = [user('one'), asst('two')];
     const { store } = fakeStore(10);
     expect(saveHistory(store, hist)).toBe(false);
+  });
+});
+
+describe('trimForContext', () => {
+  /** system + 40 plain messages, ending in an assistant tool-call and its result. */
+  function longHistory(): Message[] {
+    const out: Message[] = [{ role: 'system', content: 'sys' }];
+    for (let i = 0; i < 20; i++) {
+      out.push({ role: 'user', content: `q${i}` });
+      out.push({ role: 'assistant', content: `a${i}` });
+    }
+    out.push({ role: 'assistant', content: '', tool_calls: [{ name: 'asm_assemble', args: {} }] });
+    out.push({ role: 'tool', content: '{"ok":true}', tool_name: 'asm_assemble' });
+    return out;
+  }
+
+  it('keeps the system message and only the tail', () => {
+    const t = trimForContext(longHistory(), 0);
+    expect(t.length).toBe(CONTEXT_TRIM_TAILS[0]); // the tail budget includes the system prompt
+    expect(t[0].role).toBe('system');
+    expect(t[t.length - 1].content).toBe('{"ok":true}'); // newest work survives
+  });
+
+  it('shrinks on each round and clamps at the shortest tail', () => {
+    const round0 = trimForContext(longHistory(), 0).length;
+    const round1 = trimForContext(longHistory(), 1).length;
+    const round99 = trimForContext(longHistory(), 99).length;
+    expect(round1).toBeLessThan(round0);
+    // At most the shortest budget — and it can be SHORTER when the cut lands
+    // on a tool result, which the head repair then drops as an orphan.
+    expect(round99).toBeLessThanOrEqual(CONTEXT_TRIM_TAILS[CONTEXT_TRIM_TAILS.length - 1]);
+    expect(round99).toBeGreaterThanOrEqual(1);
+    expect(trimForContext(longHistory(), 99)[0].role).toBe('system');
+  });
+
+  it('leaves a valid head (no dangling tool result or call batch)', () => {
+    // End with an assistant call + only ONE of its two results — the cut must
+    // not strand a tool message at the head.
+    const hist: Message[] = [
+      { role: 'system', content: 'sys' },
+      { role: 'assistant', content: '', tool_calls: [{ name: 'a', args: {} }, { name: 'b', args: {} }] },
+      { role: 'tool', content: 'r1', tool_name: 'a' },
+      { role: 'user', content: 'next' },
+      { role: 'assistant', content: 'done' },
+    ];
+    for (let round = 0; round <= CONTEXT_TRIM_TAILS.length; round++) {
+      const t = trimForContext(hist, round);
+      expect(t[0].role).toBe('system');
+      if (t.length > 1) expect(t[1].role).not.toBe('tool');
+      // A kept assistant call must be followed by its full result batch.
+      for (let i = 0; i < t.length; i++) {
+        const m = t[i];
+        if (m.role === 'assistant' && (m.tool_calls?.length ?? 0) > 0) {
+          let j = i + 1;
+          while (j < t.length && t[j].role === 'tool') j++;
+          expect(j - (i + 1)).toBeGreaterThanOrEqual(m.tool_calls!.length);
+        }
+      }
+    }
   });
 });
 

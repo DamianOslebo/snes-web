@@ -88,18 +88,29 @@ function join(endpoint: string, path: string): string {
   return `${baseUrl(endpoint)}${path}`;
 }
 
-/** Parse a response body as JSON; throw a plain `Error` on non-2xx or non-JSON. */
+/**
+ * An `Error` carrying the HTTP status. The loop uses it to classify the
+ * failure: a 4xx (except 408/429) is permanent — a bad model name or a
+ * rejected request that retrying can never fix — while a 5xx is transient.
+ */
+export function httpError(status: number, message: string): Error {
+  const e = new Error(message) as Error & { status?: number };
+  e.status = status;
+  return e;
+}
+
+/** Parse a response body as JSON; throw a status-carrying `Error` on non-2xx or non-JSON. */
 async function parseJson(res: Response): Promise<unknown> {
   const text = await res.text();
   let parsed: unknown;
   try {
     parsed = text === '' ? {} : JSON.parse(text);
   } catch {
-    throw new Error(`Ollama returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+    throw httpError(res.status, `Ollama returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
   }
   if (!res.ok) {
     const msg = (parsed as { error?: string })?.error ?? `HTTP ${res.status}`;
-    throw new Error(String(msg));
+    throw httpError(res.status, String(msg));
   }
   return parsed;
 }
@@ -127,6 +138,23 @@ export const fetchTransport: Transport = {
 };
 
 /**
+ * Link the user's abort signal with an optional per-request deadline. The
+ * user's Stop always wins; the deadline only turns "Ollama went silent" (a
+ * dead tunnel, a stuck first-token load) into a retryable error instead of an
+ * infinite hang. `0`/no deadline → the user signal unchanged (or undefined).
+ * Falls back to the user signal alone on runtimes without `AbortSignal.any`.
+ */
+export function linkedSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal | undefined {
+  if (!timeoutMs) return signal;
+  const A = AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal };
+  if (typeof A.any !== 'function') return signal;
+  const deadline = AbortSignal.timeout(timeoutMs);
+  // Node (and some browsers) want the signals as an ARRAY — the rest-argument
+  // form throws "Value can not be converted to sequence" on Node 22.
+  return signal ? A.any([signal, deadline]) : deadline;
+}
+
+/**
  * One non-streaming chat turn. Sends `messages` + `tools` to `/api/chat` and
  * returns the model's message (its `content` and any `tool_calls`). The
  * response is normalized to a `Message` (assistant role) plus the parsed tool
@@ -135,6 +163,11 @@ export const fetchTransport: Transport = {
  * `think` (optional) forwards Ollama's thinking toggle to models that
  * support it (e.g. Qwen3): `false` skips the reasoning phase — the biggest
  * per-step latency win; omitted leaves it to the model default.
+ *
+ * `timeoutMs` (default 30 s, `0` = off) bounds a single round trip: the
+ * signal passed to the transport is the user's signal OR'd with the deadline,
+ * so Stop still aborts instantly. A local model should answer in seconds —
+ * a step past that is usually stuck, and a timeout is retryable.
  */
 export async function chatOnce(
   endpoint: string,
@@ -144,10 +177,11 @@ export async function chatOnce(
   transport: Transport = fetchTransport,
   signal?: AbortSignal,
   think?: boolean,
+  timeoutMs = 30_000,
 ): Promise<Message> {
   const body: ChatRequest = { model, messages, tools, stream: false };
   if (think !== undefined) body.think = think;
-  const res = (await transport.post(join(endpoint, '/api/chat'), body, signal)) as OllamaChatResponse;
+  const res = (await transport.post(join(endpoint, '/api/chat'), body, linkedSignal(signal, timeoutMs))) as OllamaChatResponse;
   const msg = res?.message;
   const content = typeof msg?.content === 'string' ? msg.content : '';
   const tool_calls = parseToolCalls(msg);

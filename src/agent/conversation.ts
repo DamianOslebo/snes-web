@@ -77,23 +77,58 @@ export function sanitizeHistory(messages: Message[]): Message[] {
     out.splice(0, out.length - MAX_HISTORY_MESSAGES); // keep the newest tail
   }
 
+  // The invariants below apply to the first NON-system message: a stored
+  // conversation starts with the system prompt, and a broken batch right
+  // after it (a dangling tool result, or a call with fewer results than it
+  // made) is still a wire error.
+  const sys = out[0] && out[0].role === 'system' ? 1 : 0;
+
   for (;;) {
-    const head = out[0];
+    const head = out[sys];
     if (!head) return out;
     if (head.role === 'tool') {
-      out.shift();
+      out.splice(sys, 1);
       continue;
     }
     if (head.role === 'assistant' && (head.tool_calls?.length ?? 0) > 0) {
       const n = head.tool_calls!.length;
-      let i = 1;
+      let i = sys + 1;
       while (i < out.length && out[i].role === 'tool') i++;
-      if (i - 1 >= n) return out; // complete batch — a valid head
-      out.splice(0, i); // incomplete: drop the call and its orphan results
+      if (i - (sys + 1) >= n) return out; // complete batch — a valid head
+      out.splice(sys, i - sys); // incomplete: drop the call and its orphan results
       continue;
     }
     return out;
   }
+}
+
+/**
+ * Tail sizes (total messages, system included) tried in order when Ollama
+ * rejects a request as longer than the model's context window. Each round
+ * shows the model less of the old conversation until only the system prompt
+ * plus the last couple of messages remain.
+ */
+export const CONTEXT_TRIM_TAILS = [8, 4, 2] as const;
+
+/**
+ * Shrink `messages` for a context-length failure: keep the last
+ * `CONTEXT_TRIM_TAILS[round]` messages (the budget includes the system
+ * prompt, so the model keeps its instructions), then run `sanitizeHistory`
+ * to repair the cut — it can orphan a leading tool result or split an
+ * assistant call/result batch, and it also drops a trailing dangling tool
+ * call. `round` = how many times this step has already been trimmed
+ * (0 → 8, 1 → 4, ≥2 → 2 total).
+ *
+ * The trim is LOSSY on purpose (that's what "it doesn't fit" means): the
+ * newest work stays in context, the oldest is what the model can most afford
+ * to have forgotten, and the loop re-asks the model for the final answer.
+ */
+export function trimForContext(messages: Message[], round: number): Message[] {
+  const keep = CONTEXT_TRIM_TAILS[Math.min(Math.max(round, 0), CONTEXT_TRIM_TAILS.length - 1)];
+  const sys = messages[0] && messages[0].role === 'system' ? 1 : 0;
+  const body = messages.slice(sys);
+  const tail = body.slice(Math.max(body.length + sys - keep, 0));
+  return sanitizeHistory([...messages.slice(0, sys), ...tail]);
 }
 
 /** Load + validate + sanitize the shared conversation; `[]` on any problem. */

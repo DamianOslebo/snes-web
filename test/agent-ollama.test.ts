@@ -3,6 +3,8 @@ import {
   baseUrl,
   chatOnce,
   checkHealth,
+  httpError,
+  linkedSignal,
   listModels,
   parseArgs,
 } from '../src/agent/ollama';
@@ -171,6 +173,44 @@ describe('listModels', () => {
   it('returns [] when the response has no model list', async () => {
     const { t } = fake(() => ({ error: 'weird' }));
     await expect(listModels('http://h', t)).resolves.toEqual([]);
+  });
+});
+
+describe('httpError', () => {
+  it('is an Error carrying the HTTP status, so the loop can classify it', () => {
+    const e = httpError(404, 'model "nope" not found');
+    expect(e).toBeInstanceOf(Error);
+    expect(e.message).toBe('model "nope" not found');
+    expect((e as { status?: number }).status).toBe(404);
+  });
+});
+
+describe('linkedSignal', () => {
+  it('returns the user signal unchanged (or undefined) when the deadline is off', () => {
+    expect(linkedSignal(undefined, 0)).toBeUndefined();
+    const ac = new AbortController();
+    expect(linkedSignal(ac.signal, 0)).toBe(ac.signal);
+  });
+
+  it('links the user signal with a deadline when a timeout is set', () => {
+    const ac = new AbortController();
+    const s = linkedSignal(ac.signal, 30_000);
+    expect(s).toBeDefined();
+    const sig = s as AbortSignal;
+    expect(sig).toBeInstanceOf(AbortSignal);
+    expect(sig).not.toBe(ac.signal);
+    expect(sig.aborted).toBe(false);
+    // A user Stop still fires through the linked signal.
+    ac.abort();
+    expect(sig.aborted).toBe(true);
+  });
+
+  it('gives a bare deadline signal when there is no user signal', () => {
+    const s = linkedSignal(undefined, 30_000);
+    expect(s).toBeDefined();
+    const sig = s as AbortSignal;
+    expect(sig).toBeInstanceOf(AbortSignal);
+    expect(sig.aborted).toBe(false);
   });
 });
 
