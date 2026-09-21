@@ -66,6 +66,7 @@ With music too, add \`jsr spc_load\` right after the \`jsr vram_load\` line. Tha
 - Labels \`name:\`; \`ld #$10\`, \`lda $4200\`, \`sta $2105\`; \`jsr label\` / \`jsr $F000\`; \`bra done\`; \`jmp $008000\` (long) / \`jmp ($xx\`) (indirect); \`lda ($20),Y\` (zero-page pointer read, Y=0); \`pea label\` / \`pla\` (push/pop a 16-bit value); \`rep\`/\`sep\` (16-bit mode — optional, the glue is pure 8-bit).
 - Directives: \`.byte\`/\`.word\` (aliases db/dw), \`.ascii\`, \`.asciz\`, \`.text\`, \`.incbin "name"\`. Comments with \`;\`.
 - **Not supported (do not use):** \`pcsh\`/\`pcsw\`, \`x=0/1\` bank toggle, \`<\`/\`>\` byte-offset operators, immediate labels (\`#hi(label)\`), or \`label+1\` arithmetic.
+- **Pad polling (buttons):** A/B/X/Y live at \`$4016\` (A = $01, B = $02, X = $04, Y = $08). To act on button A: \`lda $4016\`, then \`and #$01\` + \`bne pressed\`. (\`bit $4016\` tests "any button".) There are NO labels like \`pad1\`/\`pad2\` — the address itself is what you code against.
 - Data files: \`.incbin "name"\` inlines that file's bytes at the site; they count toward code size.
 - Assembler errors come back as \`{line, message}\` with 1-based line numbers. Fix and re-assemble.
 

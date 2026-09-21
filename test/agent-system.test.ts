@@ -11,6 +11,7 @@ describe('buildSystemPrompt', () => {
       expect(p).toContain('asm_run');
       expect(p).toContain('gfx_set_map_grid');
       expect(p).toContain('trk_set_pattern');
+      expect(p).toContain('$4016');
       expect(p).toContain('STATE: 1 tile, 2 files');
     }
   });

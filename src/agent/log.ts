@@ -44,6 +44,7 @@ export type LogEntry =
   | { t: number; type: 'tool-call'; name: string; args: Record<string, unknown> }
   | { t: number; type: 'tool-result'; name: string; ok: boolean; content: string }
   | { t: number; type: 'assistant'; text: string }
+  | { t: number; type: 'retry'; runId: string; attempt: number; max: number; error: string }
   | { t: number; type: 'error'; phase: string; message: string }
   | {
       t: number;

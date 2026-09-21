@@ -162,6 +162,7 @@ const CSS = `
 .agc-user{align-self:flex-end;background:#2f6feb22;border:1px solid #2f6feb55}
 .agc-asst{align-self:flex-start;background:#1c212b;border:1px solid #2e3440}
 .agc-error{align-self:flex-start;background:#f0883e1a;border:1px solid #f0883e66;color:#ffb27a}
+.agc-retry{align-self:flex-start;background:#f0883e12;border-radius:8px;color:#ffb27a;font-size:12px;padding:2px 10px}
 .agc-chip{align-self:flex-start;display:flex;flex-direction:column;gap:4px;background:#171b22;border:1px solid #2a3140;border-radius:8px;padding:6px 9px;font-size:12px}
 .agc-chip .top{display:flex;align-items:center;gap:6px}
 .agc-chip .name{font-weight:600;color:#9db1d8;font-family:ui-monospace,monospace}
@@ -519,6 +520,11 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
         msgs.appendChild(renderChip(it));
       }
     }
+    if (retryNote) {
+      const r = el('div', 'agc-retry');
+      r.textContent = retryNote;
+      msgs.appendChild(r);
+    }
     if (thinking) {
       const t = el('div', 'agc-think');
       t.innerHTML = '<i></i><i></i><i></i>';
@@ -572,11 +578,14 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
     renderAll();
 
     const pending: (UiItem & { kind: 'chip' })[] = [];
+    let retryNote = '';
     const onEvent = (ev: AgentEvent): void => {
       if (ev.type === 'thinking') {
+        retryNote = '';
         thinking = true;
         renderAll();
       } else if (ev.type === 'tool-call') {
+        retryNote = '';
         const chip: UiItem & { kind: 'chip' } = { kind: 'chip', name: ev.name, args: ev.args };
         items.push(chip);
         pending.push(chip);
@@ -584,6 +593,7 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
         renderAll();
       } else if (ev.type === 'tool-result') {
         // The loop dispatches calls in order, so pop the first open chip.
+        retryNote = '';
         const chip = pending.shift();
         const target = chip && chip.name === ev.name ? chip : items[items.length - 1];
         if (target && target.kind === 'chip') {
@@ -593,10 +603,17 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
         log = append(log, { type: 'tool-result', name: ev.name, ok: ev.ok, content: ev.content });
         renderAll();
       } else if (ev.type === 'message') {
+        retryNote = '';
         if (ev.content.trim() !== '') {
           items.push({ kind: 'assistant', text: ev.content });
           log = append(log, { type: 'assistant', text: ev.content });
         }
+        renderAll();
+      } else if (ev.type === 'retry') {
+        // Transient model/server hiccup — the loop is retrying; stay alive,
+        // show it, and keep a per-attempt trail in the journal.
+        retryNote = `↻ hiccup — retrying ${ev.attempt}/${ev.max}…`;
+        log = append(log, { type: 'retry', runId, attempt: ev.attempt, max: ev.max, error: ev.error });
         renderAll();
       }
     };
@@ -635,8 +652,11 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
           perStep: res.perStep,
         });
       } catch (err) {
-        items.push({ kind: 'error', text: `Ollama error: ${(err as Error).message}` });
-        log = append(log, { type: 'error', phase: 'model', message: (err as Error).message });
+        // Only reachable after the retry budget is exhausted (or a hard
+        // failure) — the loop already burned ~10 attempts with backoff.
+        const msg = (err as Error).message;
+        items.push({ kind: 'error', text: `Ollama error: ${msg} — kept retrying, still failing. Send “continue” to try again, or Stop.` });
+        log = append(log, { type: 'error', phase: 'model', message: msg });
       } finally {
         thinking = false;
         running = false;

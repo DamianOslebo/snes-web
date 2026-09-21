@@ -23,7 +23,8 @@ export type AgentEvent =
   | { type: 'thinking' }
   | { type: 'tool-call'; name: string; args: Record<string, unknown> }
   | { type: 'tool-result'; name: string; ok: boolean; content: string }
-  | { type: 'message'; content: string };
+  | { type: 'message'; content: string }
+  | { type: 'retry'; attempt: number; max: number; error: string };
 
 export interface RunAgentOptions {
   endpoint: string;
@@ -38,7 +39,12 @@ export interface RunAgentOptions {
   maxTurns?: number;
   /** Ollama `think` toggle for models that support it; `undefined` = model default. */
   think?: boolean;
-  /** Retries per model call for transient server errors (default 2). Aborts never retry. */
+  /**
+   * Retries per model call for transient errors (default 10). The loop
+   * deliberately keeps retrying — Ollama's flaky tool-call parse ("XML syntax
+   * error …") and tunnel hiccups clear on the next sample; the user's Stop
+   * button (abort) is what ends a run, not a bad step. Aborts never retry.
+   */
   retries?: number;
   /** Delay before retry *n*, in ms (default 400*n; tests pass 0). */
   retryDelayMs?: number;
@@ -99,10 +105,12 @@ function errText(err: unknown): string {
 }
 
 /**
- * `chatOnce` with bounded retries for transient server errors. Safe because a
- * failed step has no side effects yet (nothing is dispatched or appended
- * until the call succeeds), so a retry just re-sends the identical
- * conversation. Aborts rethrow immediately — a Stop is never retried.
+ * `chatOnce` with bounded retries for transient errors. Safe because a failed
+ * step has no side effects yet (nothing is dispatched or appended until the
+ * call succeeds), so a retry just re-sends the identical conversation and the
+ * model re-samples its answer. Aborts rethrow immediately — a Stop is never
+ * retried. `onRetry` is notified (but never blocks) on each failed attempt so
+ * the UI can show "retrying n/m…" instead of looking frozen.
  */
 async function chatWithRetry(
   endpoint: string,
@@ -113,6 +121,7 @@ async function chatWithRetry(
   think: boolean | undefined,
   retries: number,
   retryDelayMs: number,
+  onRetry?: (attempt: number, max: number, error: string) => void,
 ): Promise<ChatOutcome> {
   const retryErrors: string[] = [];
   let lastErr: unknown;
@@ -124,7 +133,9 @@ async function chatWithRetry(
     } catch (err) {
       if (isAbort(err, signal)) throw err;
       lastErr = err;
-      retryErrors.push(errText(err));
+      const text = errText(err);
+      retryErrors.push(text);
+      if (attempt < retries) onRetry?.(attempt + 1, retries, text);
     }
   }
   throw lastErr;
@@ -145,7 +156,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     transport = fetchTransport,
     maxTurns = 14,
     think,
-    retries = 2,
+    retries = 10,
     retryDelayMs = 400,
     signal,
     onEvent,
@@ -168,7 +179,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     const modelStart = Date.now();
     let outcome: ChatOutcome;
     try {
-      outcome = await chatWithRetry(endpoint, model, messages, transport, signal, think, retries, retryDelayMs);
+      outcome = await chatWithRetry(
+        endpoint,
+        model,
+        messages,
+        transport,
+        signal,
+        think,
+        retries,
+        retryDelayMs,
+        (attempt, max, error) => onEvent?.({ type: 'retry', attempt, max, error }),
+      );
     } catch (err) {
       if (isAbort(err, signal)) {
         stopped = 'aborted';
