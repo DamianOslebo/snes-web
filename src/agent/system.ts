@@ -20,6 +20,16 @@ export function buildSystemPrompt(page: PageKind, stateSummary: string): string 
   return `You are the authoring agent for a web-based SNES (Super Nintendo) studio. The user talks to you in a chat panel on one of three authoring pages, and you drive ALL THREE pages with tools:
 ${PAGE_HINTS[page]}
 
+## TOOL CALLING PROTOCOL — how a tool call actually works (READ THIS)
+There is no separate "call a function" button. Your REPLY TEXT is the call:
+- To call ONE tool, reply with exactly one JSON object:
+  {"tool": "asm_assemble", "args": {}}
+- To call MORE THAN ONE tool in a single step, reply with a JSON array of such objects:
+  [ {"tool": "asm_assemble", "args": {}}, {"tool": "asm_run", "args": {}} ]
+- "tool" is one of the tool names in the Tools section below (for example: asm_assemble, gfx_export_vram, trk_export_spc). "args" is that tool's argument object, or {} when it takes none.
+- When the task is COMPLETE, stop calling tools and reply with a short plain-English summary. That sentence is what the user reads.
+- Do NOT wrap the JSON in markdown code fences. Do NOT emit XML or any angle-bracket tags. Do NOT invent tool names. If a tool returns an error, read the message, fix "args", and reply with the corrected JSON object.
+
 ## What a finished game looks like
 A 256 KB **LoROM** SFC that runs in the emulator: a small 65C816 reset program, PPU graphics brought up by generated glue, and (optionally) an SPC700 song loaded into SPU RAM by generated glue. You author the graphics and music, write the tiny program, export the data (which auto-appends the loader glue), assemble, build, and launch.
 

@@ -1,16 +1,27 @@
 /**
  * `loop` — drives one agent conversation to completion.
  *
- * One loop = one non-streaming `POST /api/chat` per step:
+ * One loop = one streamed `POST /api/chat` per step (idle-timeout bounded, so
+ * a slow-but-alive generation is never killed by a flat wall-clock deadline):
  *   model replies → if it requested tool calls, run each in order (dispatched
  *   against `AgentControllers`), append the results as `role:"tool"` messages,
  *   and send the whole conversation back → repeat until the model answers with
  *   a plain text reply, hits `maxTurns`, is aborted, or is detected spinning
  *   (the same step producing the same result again and again).
  *
+ * Tool calls come from TWO sources, tried in order (see `./tool-protocol`):
+ *   - native `message.tool_calls` (back-compat for models/transports that
+ *     still emit them);
+ *   - a JSON object/array inside the reply TEXT (the primary path — Ollama's
+ *     server-side `tools:` template is deliberately NOT used, because its
+ *     text/XML templater is the source of the "XML syntax error" failures).
+ * A reply that clearly TRIED to call a tool but nothing valid parsed
+ * ("malformed") is NUDGED back to the exact JSON contract instead of failing.
+ *
  * Failure handling is classified, because the right response differs:
- *   - transient (network blip, 5xx, 429, a per-request timeout, Ollama's
- *     flaky tool-call parse) → retried, with backoff and "retrying n/m";
+ *   - transient (network blip, 5xx, 429, an idle timeout, a worker crash) →
+ *     retried, with PATIENT exponential backoff and "retrying n/m" — never
+ *     fail-fast on a step that a re-sample could clear;
  *   - context overflow → the conversation is trimmed (oldest first) and the
  *     step re-sent, a few rounds before giving up with an actionable error;
  *   - permanent (a 4xx — bad model name, rejected request) → fails fast on
@@ -26,7 +37,16 @@ import type { Transport } from './ollama';
 import { CONTEXT_TRIM_TAILS, trimForContext } from './conversation';
 import { dispatchTool, TOOL_SPECS } from './tools';
 import type { ToolCtx } from './tools';
+import { parseToolReply } from './tool-protocol';
 import type { AgentControllers, Message } from './types';
+
+/**
+ * Consecutive malformed tool-call replies before we stop with an explanation.
+ * Malformed is the ONE case where a nudge can loop (the model keeps mis-firing
+ * the protocol), so it is bounded — but generously, since a re-sample often
+ * clears it and the user's Stop button is the real escape hatch.
+ */
+const MALFORMED_MAX = 4;
 
 /** UI events, in order, as the loop progresses. */
 export type AgentEvent =
@@ -57,8 +77,13 @@ export interface RunAgentOptions {
    * and permanent 4xx responses don't count against this budget at all.
    */
   retries?: number;
-  /** Delay before retry *n*, in ms (default 400*n; tests pass 0). */
+  /** Base delay before the first retry, in ms (default 400; tests pass 0).
+   * Retry delays grow exponentially from here (×2 each attempt) up to a cap. */
   retryDelayMs?: number;
+  /** Cap on the backoff delay between retries, in ms (default 8000). Keeps a
+   * long crash-and-recover sequence patient without any single wait going
+   * absurdly long. */
+  retryCapMs?: number;
   /**
    * Per-request deadline in ms (default 30 s, `0` = no deadline). Bounds a
    * single `/api/chat` round trip so a silent Ollama/dead tunnel fails as a
@@ -183,6 +208,38 @@ function stepSignature(calls: { name: string; args: unknown }[], results: { ok: 
   return stableJson(calls) + '|' + stableJson(results);
 }
 
+/** A tool call, args normalized to the object shape `dispatchTool` wants. */
+interface StepCall {
+  name: string;
+  args: Record<string, unknown>;
+}
+
+function normalizeArgs(a: unknown): Record<string, unknown> {
+  return a && typeof a === 'object' && !Array.isArray(a) ? (a as Record<string, unknown>) : {};
+}
+
+/**
+ * Resolve a model reply into the tool calls to run, from either source:
+ *   1. native `message.tool_calls` (back-compat; some models/transports emit it);
+ *   2. the text protocol (primary) — a JSON object/array in the reply text.
+ * `malformed` is true when the reply clearly TRIED to call a tool (a tool name /
+ * XML / tool keyword is present) but nothing valid parsed — the loop nudges the
+ * model back to the exact JSON contract instead of failing. A clean prose reply
+ * is `calls: [], malformed: false`.
+ */
+function resolveCalls(reply: Message): { calls: StepCall[]; malformed: boolean } {
+  if (reply.tool_calls && reply.tool_calls.length > 0) {
+    return {
+      calls: reply.tool_calls.map((c) => ({ name: c.name, args: normalizeArgs(c.args) })),
+      malformed: false,
+    };
+  }
+  const parsed = parseToolReply(reply.content);
+  if (parsed.kind === 'call') return { calls: parsed.calls, malformed: false };
+  if (parsed.kind === 'malformed') return { calls: [], malformed: true };
+  return { calls: [], malformed: false };
+}
+
 /** A successful model call plus how many failed attempts preceded it. */
 interface ChatOutcome {
   reply: Message;
@@ -200,6 +257,11 @@ interface ChatOutcome {
  * attempt (the loop handles them — a trim, or a fail-fast message). `onRetry`
  * is notified (but never blocks) on each failed attempt so the UI can show
  * "retrying n/m…" instead of looking frozen.
+ *
+ * Backoff is EXPOENTIAL (patient): the wait before retry *n* is
+ * `min(retryDelayMs * 2^(n-1), retryCapMs)`. A worker-crash-and-recover
+ * sequence (ROCm "illegal memory access" → Ollama respawns) needs a growing
+ * pause so we let the backend settle, rather than hammering it back to a crash.
  */
 async function chatWithRetry(
   endpoint: string,
@@ -210,13 +272,17 @@ async function chatWithRetry(
   think: boolean | undefined,
   retries: number,
   retryDelayMs: number,
+  retryCapMs: number,
   timeoutMs: number,
   onRetry?: (attempt: number, max: number, error: string) => void,
 ): Promise<ChatOutcome> {
   const retryErrors: string[] = [];
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    if (attempt > 0 && retryDelayMs > 0) await sleep(retryDelayMs * attempt, signal);
+    if (attempt > 0 && retryDelayMs > 0) {
+      const delay = Math.min(retryDelayMs * 2 ** (attempt - 1), retryCapMs);
+      await sleep(delay, signal);
+    }
     try {
       const reply = await chatOnce(endpoint, model, messages, TOOL_SPECS, transport, signal, think, timeoutMs);
       return { reply, retries: attempt, retryErrors };
@@ -249,8 +315,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     transport = fetchTransport,
     maxTurns = 14,
     think,
-    retries = 10,
+    retries = 12,
     retryDelayMs = 400,
+    retryCapMs = 8_000,
     timeoutMs = 30_000,
     signal,
     onEvent,
@@ -264,6 +331,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   const perStep: StepMetrics[] = [];
   let trimRounds = 0; // context-trims tried for the current step (reset on success)
   let emptyStreak = 0; // consecutive empty replies (a nudge is allowed, not a loop)
+  let malformedStreak = 0; // consecutive malformed tool-call replies (nudged, not failed)
   const sigs: string[] = []; // recent step signatures, for spin detection
 
   for (;;) {
@@ -285,6 +353,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         think,
         retries,
         retryDelayMs,
+        retryCapMs,
         timeoutMs,
         (attempt, max, error) => onEvent?.({ type: 'retry', attempt, max, error }),
       );
@@ -322,7 +391,35 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     messages.push(reply);
     finalContent = reply.content;
 
-    const calls = reply.tool_calls ?? [];
+    const resolved = resolveCalls(reply);
+
+    // Malformed: the model clearly TRIED to call a tool (a tool name / XML /
+    // a tool keyword is present) but nothing valid parsed. This used to be a
+    // hard failure (Ollama's "XML syntax error"); now it's a NUDGE — we show
+    // the model what it sent and restate the exact JSON contract. Bounded by
+    // MALFORMED_MAX so a model that can't follow the protocol eventually stops
+    // with an explanation instead of looping forever.
+    if (resolved.malformed) {
+      perStep.push({ index: stepIndex, modelMs, retries: outcome.retries, retryErrors: outcome.retryErrors, toolCalls: 0, toolMs: 0 });
+      if (malformedStreak >= MALFORMED_MAX) {
+        const note = 'The model kept sending tool calls that did not parse, so I stopped. Send your request again — or switch models — and I\'ll pick up from here.';
+        finalContent = note;
+        onEvent?.({ type: 'message', content: note });
+        stopped = 'reply';
+        break;
+      }
+      malformedStreak += 1;
+      onEvent?.({ type: 'message', content: reply.content });
+      messages.push({
+        role: 'user',
+        content:
+          'Your last reply looked like a tool call but did not parse. Reply with ONE valid JSON object on its own — exactly in this shape: {"tool": "asm_assemble", "args": {}} — using the real tool name and its args. No markdown fences, no XML, no angle-bracket tags. If the task is already done, reply with a short plain-English summary instead.',
+      });
+      continue;
+    }
+    malformedStreak = 0;
+
+    const calls = resolved.calls;
     if (calls.length === 0) {
       // A content-less reply with no tool call is NOT an answer. Nudge once;
       // a second empty reply ends the run with a visible explanation rather
@@ -346,25 +443,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       stopped = 'reply';
       break;
     }
+    emptyStreak = 0;
 
     let toolMs = 0;
     const results: { ok: boolean; content: string }[] = [];
     for (const call of calls) {
-      // `ToolCall.args` is `unknown` for tolerance; dispatch wants an object.
-      const args: Record<string, unknown> =
-        call.args && typeof call.args === 'object' && !Array.isArray(call.args)
-          ? (call.args as Record<string, unknown>)
-          : {};
-      onEvent?.({ type: 'tool-call', name: call.name, args });
+      onEvent?.({ type: 'tool-call', name: call.name, args: call.args });
       const toolStart = Date.now();
-      const result = dispatchTool(call.name, args, ctx);
+      const result = dispatchTool(call.name, call.args, ctx);
       toolMs += Date.now() - toolStart;
       results.push(result);
       onEvent?.({ type: 'tool-result', name: call.name, ok: result.ok, content: result.content });
       messages.push({ role: 'tool', content: result.content, tool_name: call.name });
     }
     perStep.push({ index: stepIndex, modelMs, retries: outcome.retries, retryErrors: outcome.retryErrors, toolCalls: calls.length, toolMs });
-    emptyStreak = 0;
 
     if (++turns >= maxTurns) {
       stopped = 'max-turns';

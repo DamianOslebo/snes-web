@@ -1,127 +1,171 @@
 /**
- * `ollama` — a thin, injectable client for Ollama's HTTP API.
+ * `ollama` — the Ollama transport + request layer. This is the ONLY file that
+ * does I/O; everything above it (loop, conversation, tools) is pure and
+ * node-testable.
  *
- * The only place in the agent that does I/O. A `Transport` is a small
- * `post(url, body)` / `get(url)` pair (JSON in, JSON out), so the node tests
- * can substitute a fake (no network, no fetch) and pin the exact request
- * shapes. The browser
- * passes `fetchTransport` (native `fetch`, CORS to the Ollama host).
+ * Wire protocol (deliberately NOT Ollama's `tools:` template):
+ *   - We send `stream: true` and NO `tools` field. Ollama's server-side tool
+ *     templater is the source of the "XML syntax error" failures, so we bypass
+ *     it. The tool catalog + JSON contract live in the system prompt.
+ *   - The model returns its tool calls as JSON inside `content`; the agent loop
+ *     parses that (see `./tool-protocol`). A plain prose reply is a SUCCESS.
+ *   - We STREAM, so a slow-but-alive generation is not killed by a flat
+ *     wall-clock deadline. Instead an IDLE timeout aborts a step only when no
+ *     token has arrived for `timeoutMs` (default 30s).
  *
- * Non-streaming by design: one `POST /api/chat` per agent step (the loop in
- * loop.ts does the stepping), so the panel shows a single "thinking…" state
- * and a Stop button that aborts the in-flight request.
- *
- * Pure except for `fetchTransport`, which is the only function that touches
- * `fetch` — and it is only ever called from browser code.
+ * `fetchTransport` is the browser path (native fetch + NDJSON reader). Tests
+ * inject a fake `Transport` (a `post` method, and optionally `postStream`) and
+ * never touch the network.
  */
 
 import type {
-  ChatRequest,
   Message,
   OllamaChatResponse,
-  OllamaTagResponse,
   ToolCall,
   ToolSpec,
 } from './types';
 
-/**
- * A transport issues JSON requests and resolves with the parsed JSON
- * response. `signal` (optional) aborts the request; reject with an
- * `AbortError`-like error when aborted so callers can detect it.
- *
- * `post` is for `/api/chat` (JSON body). `get` is for `/api/tags` — Ollama
- * answers that route GET-only (a POST gets a 405), and a plain GET is a
- * "simple" request, so it needs no CORS preflight either.
- */
+// --- Transport ----------------------------------------------------------------
+//
+// The single seam between the agent and I/O. `post` + `get` are required
+// (listModels/checkHealth use `get`). `postStream` is OPTIONAL: when present,
+// `chatOnce` streams with an idle timeout; when absent it falls back to a
+// single `post` (hard deadline). Fakes that only implement `post`/`get` keep
+// working unchanged.
+
+export interface StreamChunk {
+  content?: unknown;
+  message?: {
+    role?: string;
+    content?: unknown;
+    tool_calls?: unknown;
+  };
+  done?: boolean;
+  error?: unknown;
+  [key: string]: unknown;
+}
+
 export interface Transport {
   post(url: string, body: unknown, signal?: AbortSignal): Promise<unknown>;
   get(url: string, signal?: AbortSignal): Promise<unknown>;
+  /**
+   * Optional streaming POST. `onChunk` fires once per parsed NDJSON line (an
+   * Ollama chat chunk); resolve when the stream ends, reject on a non-2xx
+   * status or a network abort. When present, `chatOnce` uses it.
+   */
+  postStream?(
+    url: string,
+    body: unknown,
+    onChunk: (chunk: StreamChunk) => void,
+    signal?: AbortSignal,
+  ): Promise<void>;
 }
 
+// --- small utilities ------------------------------------------------------------
+
 /**
- * Parse a tool call's `arguments`, which Ollama sends as a JSON object but
- * which some frontends/proxies deliver as a JSON *string*. Always returns an
- * object (never throws): a bad payload becomes `{}` so the caller can report a
- * clean "bad arguments" tool result instead of crashing the loop.
+ * Parse a tool call's `arguments`. Ollama may deliver them as an object or as
+ * a JSON string. Never throws — an unparseable payload becomes `{}` so the
+ * dispatcher can report the missing field rather than crash the whole step.
  */
 export function parseArgs(args: unknown): Record<string, unknown> {
-  if (args === null || args === undefined) return {};
-  if (typeof args === 'object' && !Array.isArray(args)) {
+  if (args && typeof args === 'object' && !Array.isArray(args)) {
     return args as Record<string, unknown>;
   }
-  if (typeof args === 'string') {
-    const t = args.trim();
-    if (t === '') return {};
+  if (typeof args === 'string' && args.trim() !== '') {
     try {
-      const v: unknown = JSON.parse(t);
+      const v: unknown = JSON.parse(args);
       if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, unknown>;
-      return {};
     } catch {
-      return {};
+      /* fall through to {} */
     }
   }
   return {};
 }
 
-/** Normalize one raw Ollama tool call (handles both wire shapes). */
-export function parseToolCalls(raw: OllamaChatResponse['message']): ToolCall[] {
-  const calls = raw?.tool_calls;
-  if (!Array.isArray(calls)) return [];
+/**
+ * Normalize an Ollama `tool_calls` array into `ToolCall[]`, tolerating both the
+ * `{ function: { name, arguments } }` and flat `{ name, arguments }` shapes.
+ * This is a BACK-COMPAT path (transports/models that still emit native
+ * tool_calls); the primary path is the text protocol in `./tool-protocol`.
+ */
+export function parseToolCalls(raw: unknown): ToolCall[] {
+  if (!Array.isArray(raw)) return [];
   const out: ToolCall[] = [];
-  for (const c of calls) {
-    if (!c) continue;
-    const name = c.function?.name ?? c.name;
+  for (const c of raw) {
+    if (!c || typeof c !== 'object') continue;
+    const o = c as {
+      function?: { name?: unknown; arguments?: unknown };
+      name?: unknown;
+      arguments?: unknown;
+    };
+    const name = (o.function?.name ?? o.name) as string | undefined;
     if (typeof name !== 'string' || name === '') continue;
-    const args = c.function?.arguments !== undefined ? c.function.arguments : c.arguments;
-    out.push({ name, args: parseArgs(args) });
+    const args = parseArgs(o.function?.arguments ?? o.arguments);
+    out.push({ name, args });
   }
   return out;
 }
 
-/** Strip the base to an absolute Ollama URL: accept `http://host[:port]` or `/api/...`-less paths. */
 export function baseUrl(endpoint: string): string {
-  const t = endpoint.trim().replace(/\/+$/, '');
-  return t;
+  return endpoint.trim().replace(/\/+$/, '');
 }
 
-function join(endpoint: string, path: string): string {
+export function join(endpoint: string, path: string): string {
   return `${baseUrl(endpoint)}${path}`;
 }
 
-/**
- * An `Error` carrying the HTTP status. The loop uses it to classify the
- * failure: a 4xx (except 408/429) is permanent — a bad model name or a
- * rejected request that retrying can never fix — while a 5xx is transient.
- */
-export function httpError(status: number, message: string): Error {
-  const e = new Error(message) as Error & { status?: number };
-  e.status = status;
+export function httpError(status: number, message?: string): Error {
+  const e = new Error(message ?? `HTTP ${status}`);
+  (e as Error & { status?: number }).status = status;
   return e;
 }
 
-/** Parse a response body as JSON; throw a status-carrying `Error` on non-2xx or non-JSON. */
-async function parseJson(res: Response): Promise<unknown> {
-  const text = await res.text();
-  let parsed: unknown;
-  try {
-    parsed = text === '' ? {} : JSON.parse(text);
-  } catch {
-    throw httpError(res.status, `Ollama returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
-  }
+async function parseJson(res: { status: number; ok: boolean; text: () => Promise<string> }): Promise<unknown> {
   if (!res.ok) {
-    const msg = (parsed as { error?: string })?.error ?? `HTTP ${res.status}`;
-    throw httpError(res.status, String(msg));
+    let detail: string | undefined;
+    try {
+      const j: unknown = JSON.parse(await res.text());
+      if (j && typeof j === 'object' && 'error' in j) detail = String((j as { error: unknown }).error);
+    } catch {
+      /* body was not JSON */
+    }
+    throw httpError(res.status, detail);
   }
-  return parsed;
+  const text = await res.text();
+  if (text.trim() === '') return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
 }
 
+// --- the browser transport (fetch + NDJSON streaming) ---------------------------
+
 /**
- * The default transport: native `fetch`, JSON in / JSON out. Throws a plain
- * `Error` (with the HTTP status) on a non-2xx response so the loop can surface
- * a useful message; honors `signal` for Stop.
+ * Split a growing NDJSON buffer into complete lines, invoking `onChunk` per
+ * parsed line. Returns the leftover (incomplete) tail. Tolerates keep-alives
+ * and partial lines (a line that fails JSON.parse is skipped).
  */
+function emitLines(buf: string, onChunk: (c: StreamChunk) => void): string {
+  let out = buf;
+  let idx: number;
+  while ((idx = out.indexOf('\n')) >= 0) {
+    const line = out.slice(0, idx).trim();
+    out = out.slice(idx + 1);
+    if (line === '') continue;
+    try {
+      onChunk(JSON.parse(line) as StreamChunk);
+    } catch {
+      /* not a chunk (keep-alive / partial) — skip */
+    }
+  }
+  return out;
+}
+
 export const fetchTransport: Transport = {
-  async post(url, body, signal) {
+  async post(url: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -130,44 +174,152 @@ export const fetchTransport: Transport = {
     });
     return parseJson(res);
   },
-  async get(url, signal) {
-    // No custom headers → a "simple" request → no CORS preflight.
-    const res = await fetch(url, { signal });
+  async get(url: string, signal?: AbortSignal): Promise<unknown> {
+    const res = await fetch(url, { method: 'GET', signal });
     return parseJson(res);
+  },
+  async postStream(
+    url: string,
+    body: unknown,
+    onChunk: (c: StreamChunk) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) {
+      let detail: string | undefined;
+      try {
+        const j: unknown = JSON.parse(await res.text());
+        if (j && typeof j === 'object' && 'error' in j) detail = String((j as { error: unknown }).error);
+      } catch {
+        /* not JSON */
+      }
+      throw httpError(res.status, detail ?? `HTTP ${res.status}`);
+    }
+    // No body stream (rare) — read the whole thing and emit line by line.
+    if (!res.body) {
+      const text = await res.text();
+      emitLines(text, onChunk);
+      return;
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder('utf-8');
+    let buf = '';
+    for (;;) {
+      const r = await reader.read();
+      if (r.done) break;
+      buf += dec.decode(r.value, { stream: true });
+      buf = emitLines(buf, onChunk);
+    }
+    const tail = buf.trim();
+    if (tail !== '') {
+      try {
+        onChunk(JSON.parse(tail) as StreamChunk);
+      } catch {
+        /* ignore a trailing partial line */
+      }
+    }
   },
 };
 
-/**
- * Link the user's abort signal with an optional per-request deadline. The
- * user's Stop always wins; the deadline only turns "Ollama went silent" (a
- * dead tunnel, a stuck first-token load) into a retryable error instead of an
- * infinite hang. `0`/no deadline → the user signal unchanged (or undefined).
- * Falls back to the user signal alone on runtimes without `AbortSignal.any`.
- */
-export function linkedSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal | undefined {
-  if (!timeoutMs) return signal;
-  const A = AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal };
-  if (typeof A.any !== 'function') return signal;
-  const deadline = AbortSignal.timeout(timeoutMs);
-  // Node (and some browsers) want the signals as an ARRAY — the rest-argument
-  // form throws "Value can not be converted to sequence" on Node 22.
-  return signal ? A.any([signal, deadline]) : deadline;
+// --- chat ----------------------------------------------------------------------
+
+function chunkText(c: StreamChunk): string {
+  if (typeof c.content === 'string') return c.content;
+  if (c.message && typeof c.message.content === 'string') return c.message.content;
+  return '';
+}
+
+function finalize(content: string, nativeCalls: ToolCall[] | undefined): Message {
+  const m: Message = { role: 'assistant', content };
+  if (nativeCalls && nativeCalls.length > 0) m.tool_calls = nativeCalls;
+  return m;
 }
 
 /**
- * One non-streaming chat turn. Sends `messages` + `tools` to `/api/chat` and
- * returns the model's message (its `content` and any `tool_calls`). The
- * response is normalized to a `Message` (assistant role) plus the parsed tool
- * calls, so the loop never has to know Ollama's exact wire shape.
+ * Read a streamed response, accumulating the assistant text. The stream is cut
+ * only if NO token arrives for `timeoutMs` (idle). A user abort (the caller's
+ * signal) is rethrown as-is so the loop can treat it as an abort; an idle
+ * expiry is rethrown as a retryable TimeoutError so the loop backs off and
+ * retries patiently.
+ */
+async function streamCollect(
+  transport: Transport,
+  url: string,
+  body: unknown,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<{ content: string; nativeCalls: ToolCall[] | undefined }> {
+  const parts: string[] = [];
+  let nativeCalls: ToolCall[] | undefined;
+  const ctrl = new AbortController();
+  let idleFired = false;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // A user abort (the caller's signal) cuts the stream the same way an idle
+  // expiry does — both route through `ctrl`, so the read loop below stays blind
+  // to which one fired (the catch distinguishes them via `idleFired`).
+  if (signal) {
+    if (signal.aborted) ctrl.abort();
+    else signal.addEventListener('abort', () => ctrl.abort(), { once: true });
+  }
+
+  const clearIdle = (): void => {
+    if (idleTimer !== undefined) {
+      clearTimeout(idleTimer);
+      idleTimer = undefined;
+    }
+  };
+  const armIdle = (): void => {
+    clearIdle();
+    if (timeoutMs <= 0) return;
+    idleTimer = setTimeout(() => {
+      idleTimer = undefined;
+      idleFired = true;
+      ctrl.abort();
+    }, timeoutMs);
+  };
+
+  armIdle();
+  try {
+    await transport.postStream!(url, body, (c) => {
+      if (c && typeof c === 'object') {
+        if (c.error) {
+          throw new Error(typeof c.error === 'string' ? c.error : JSON.stringify(c.error));
+        }
+        const s = chunkText(c);
+        if (s !== '') parts.push(s);
+        if (c.message && c.message.tool_calls) nativeCalls = parseToolCalls(c.message.tool_calls);
+      }
+      armIdle();
+    }, ctrl.signal);
+    clearIdle();
+    return { content: parts.join(''), nativeCalls };
+  } catch (err) {
+    clearIdle();
+    if (idleFired) {
+      const e = new Error(`idle: no model tokens for ${timeoutMs} ms`);
+      e.name = 'TimeoutError';
+      throw e;
+    }
+    throw err;
+  }
+}
+
+/**
+ * One model turn. Streams when the transport supports it (idle-timeout
+ * bounded), otherwise falls back to a single non-streaming `post` (hard
+ * deadline). Returns the assistant `Message`; tool-call interpretation is the
+ * loop's job (`./tool-protocol`), with `tool_calls` preserved for transports
+ * that still emit native calls.
  *
- * `think` (optional) forwards Ollama's thinking toggle to models that
- * support it (e.g. Qwen3): `false` skips the reasoning phase — the biggest
- * per-step latency win; omitted leaves it to the model default.
- *
- * `timeoutMs` (default 30 s, `0` = off) bounds a single round trip: the
- * signal passed to the transport is the user's signal OR'd with the deadline,
- * so Stop still aborts instantly. A local model should answer in seconds —
- * a step past that is usually stuck, and a timeout is retryable.
+ * `tools` is accepted for signature compatibility but NOT sent: the tool
+ * catalog + JSON contract are in the system prompt, and sending Ollama's
+ * `tools:` is what triggered the fragile XML templating path.
  */
 export async function chatOnce(
   endpoint: string,
@@ -179,42 +331,77 @@ export async function chatOnce(
   think?: boolean,
   timeoutMs = 30_000,
 ): Promise<Message> {
-  const body: ChatRequest = { model, messages, tools, stream: false };
+  void tools;
+  const body: Record<string, unknown> = { model, messages, stream: true };
   if (think !== undefined) body.think = think;
-  const res = (await transport.post(join(endpoint, '/api/chat'), body, linkedSignal(signal, timeoutMs))) as OllamaChatResponse;
+  const url = join(endpoint, '/api/chat');
+
+  if (typeof transport.postStream === 'function') {
+    const { content, nativeCalls } = await streamCollect(transport, url, body, signal, timeoutMs);
+    return finalize(content, nativeCalls);
+  }
+
+  // Non-streaming fallback (fakes / older transports): one request, hard deadline.
+  const res = (await transport.post(url, body, linkedSignal(signal, timeoutMs))) as OllamaChatResponse;
   const msg = res?.message;
   const content = typeof msg?.content === 'string' ? msg.content : '';
-  const tool_calls = parseToolCalls(msg);
-  const out: Message = { role: 'assistant', content };
-  if (tool_calls.length) out.tool_calls = tool_calls;
-  return out;
-}
-
-/** List installed models (`GET /api/tags` → `{ models: [{ name, … }] }`). */
-export async function listModels(
-  endpoint: string,
-  transport: Transport = fetchTransport,
-  signal?: AbortSignal,
-): Promise<string[]> {
-  const res = (await transport.get(join(endpoint, '/api/tags'), signal)) as OllamaTagResponse;
-  const models = res?.models;
-  if (!Array.isArray(models)) return [];
-  return models.map((m) => m?.name).filter((n): n is string => typeof n === 'string' && n !== '');
+  const native = msg?.tool_calls ? parseToolCalls(msg.tool_calls) : undefined;
+  return finalize(content, native);
 }
 
 /**
- * Health check for "test connection": resolves `true` when Ollama answers with
- * a model list (even an empty one), `false` on any transport error.
+ * Link the caller's abort signal with a wall-clock deadline. Uses
+ * `AbortSignal.any` when available; otherwise falls back to the caller's signal
+ * alone (never to a bare `AbortSignal.timeout`, which would ignore an in-flight
+ * user abort).
  */
+export function linkedSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const parts: AbortSignal[] = [];
+  if (signal) parts.push(signal);
+  // `0`/negative means "no deadline" — do NOT add a 0ms abort (that fires
+  // immediately and would kill an otherwise-fine request).
+  if (timeoutMs > 0) parts.push(AbortSignal.timeout(timeoutMs));
+  if (parts.length === 0) return new AbortController().signal;
+  if (parts.length === 1) return parts[0];
+  const any = (AbortSignal as { any?: (s: AbortSignal[]) => AbortSignal }).any;
+  if (typeof any === 'function') return any(parts);
+  // No AbortSignal.any: keep the user signal (so an in-flight Stop is honored);
+  // the deadline component can't be represented without `any`.
+  return parts[0];
+}
+
+export async function listModels(
+  endpoint: string,
+  transport: Transport = fetchTransport,
+  timeoutMs = 10_000,
+): Promise<string[]> {
+  const res = (await transport.get(join(endpoint, '/api/tags'), linkedSignal(undefined, timeoutMs))) as {
+    models?: unknown;
+  };
+  // Ollama's `/api/tags` is well-formed, but be tolerant of junk entries
+  // (strings, nulls) and empty names rather than crashing the model picker.
+  const arr = Array.isArray(res?.models) ? (res.models as unknown[]) : [];
+  return arr
+    .filter((m): m is { name?: unknown; model?: unknown } => m !== null && typeof m === 'object')
+    .map((m) => (typeof m.name === 'string' ? m.name : typeof m.model === 'string' ? m.model : ''))
+    .filter((s) => s !== '');
+}
+
+/** The shape the "Test" button and the panel render against. */
+export interface HealthReport {
+  ok: boolean;
+  models: string[];
+  error?: string;
+}
+
 export async function checkHealth(
   endpoint: string,
   transport: Transport = fetchTransport,
-  signal?: AbortSignal,
-): Promise<{ ok: boolean; models: string[]; error?: string }> {
+  timeoutMs = 10_000,
+): Promise<HealthReport> {
   try {
-    const models = await listModels(endpoint, transport, signal);
-    return { ok: true, models };
+    return { ok: true, models: await listModels(endpoint, transport, timeoutMs) };
   } catch (err) {
-    return { ok: false, models: [], error: (err as Error).message };
+    return { ok: false, models: [], error: err instanceof Error ? err.message : String(err) };
   }
 }

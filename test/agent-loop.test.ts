@@ -99,10 +99,12 @@ describe('runAgent', () => {
     expect(r.finalContent).toBe('done!');
     expect(r.messages.map((m) => m.role)).toEqual(['system', 'user', 'assistant']);
     expect(events.map((e) => e.type)).toEqual(['thinking', 'message']);
-    // The request carries the system prompt, the tools, and no streaming.
-    const body = calls[0].body as { system?: unknown; stream: boolean; tools: unknown[] };
-    expect(body.stream).toBe(false);
-    expect(Array.isArray(body.tools)).toBe(true);
+    // The request streams (idle-timeout bounded) and carries NO native tools —
+    // the system prompt is the first message and the tool contract lives there.
+    const body = calls[0].body as { messages: Message[]; stream: boolean; tools?: unknown };
+    expect(body.stream).toBe(true);
+    expect('tools' in body).toBe(false);
+    expect(body.messages[0].role).toBe('system');
     expect(calls[0].url).toBe('http://ollama.test/api/chat');
   });
 
@@ -559,6 +561,91 @@ describe('spin detection', () => {
     const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 });
     expect(r.stopped).toBe('reply');
     expect(r.finalContent).toBe('done');
+  });
+});
+
+describe('the structured tool protocol (JSON in the reply text)', () => {
+  it('dispatches a tool call emitted as JSON in the reply text', async () => {
+    const { controllers, log } = miniControllers();
+    const { t } = scripted([
+      reply('{"tool":"asm_set_source","args":{"source":"RTI"}}'),
+      reply('{"tool":"asm_assemble","args":{}}'),
+      reply('built it'),
+    ]);
+    const r = await runAgent({ ...base, controllers, transport: t, retryDelayMs: 0 });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(2);
+    expect(log).toContain('setSource:RTI');
+    const toolMsgs = r.messages.filter((m) => m.role === 'tool') as Message[];
+    expect(toolMsgs.map((m) => m.tool_name)).toEqual(['asm_set_source', 'asm_assemble']);
+    // The JSON-in-text reply is NOT the final answer — a real reply ends the run.
+    expect(r.finalContent).toBe('built it');
+  });
+
+  it('dispatches a JSON ARRAY of calls in order (parallel tools in one step)', async () => {
+    const { controllers } = miniControllers();
+    const { t } = scripted([
+      reply('[{"tool":"asm_get_source","args":{}},{"tool":"asm_assemble","args":{}}]'),
+      reply('done'),
+    ]);
+    const r = await runAgent({ ...base, controllers, transport: t, retryDelayMs: 0 });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(1);
+    const toolMsgs = r.messages.filter((m) => m.role === 'tool') as Message[];
+    expect(toolMsgs.map((m) => m.tool_name)).toEqual(['asm_get_source', 'asm_assemble']);
+  });
+
+  it('tolerates a markdown-fenced tool call (models love to wrap JSON)', async () => {
+    const { controllers } = miniControllers();
+    const { t } = scripted([
+      reply('```json\n{"tool":"asm_assemble","args":{}}\n```'),
+      reply('assembled'),
+    ]);
+    const r = await runAgent({ ...base, controllers, transport: t, retryDelayMs: 0 });
+    expect(r.stopped).toBe('reply');
+    expect(r.finalContent).toBe('assembled');
+    const toolMsgs = r.messages.filter((m) => m.role === 'tool') as Message[];
+    expect(toolMsgs.map((m) => m.tool_name)).toEqual(['asm_assemble']);
+  });
+});
+
+describe('malformed tool attempts (strong intent, nothing parsed)', () => {
+  const MALFORMED = '{"tool":"asm_assemble","args":{'; // a "tool": …, but truncated JSON
+
+  it('nudges a malformed attempt back to the exact contract, then recovers', async () => {
+    const { controllers } = miniControllers();
+    const { t } = scripted([
+      reply(MALFORMED),
+      reply('{"tool":"asm_assemble","args":{}}'),
+      reply('recovered'),
+    ]);
+    const r = await runAgent({ ...base, controllers, transport: t, retryDelayMs: 0 });
+    expect(r.stopped).toBe('reply');
+    expect(r.finalContent).toBe('recovered');
+    // The model got a nudge restating the exact JSON shape before it recovered.
+    expect(r.messages.some((m) => m.role === 'user' && /did not parse/i.test(m.content))).toBe(true);
+    // And it eventually dispatched the call it meant to make.
+    const toolMsgs = r.messages.filter((m) => m.role === 'tool') as Message[];
+    expect(toolMsgs.some((m) => m.tool_name === 'asm_assemble')).toBe(true);
+  });
+
+  it('stops after repeated malformed attempts — bounded, with a visible note', async () => {
+    const { controllers } = miniControllers();
+    const { t, calls } = scripted([reply(MALFORMED)]); // the same broken attempt, forever
+    const events: AgentEvent[] = [];
+    const r = await runAgent({
+      ...base,
+      controllers,
+      transport: t,
+      retryDelayMs: 0,
+      onEvent: (e) => events.push(e),
+    });
+    expect(r.stopped).toBe('reply');
+    expect(r.finalContent).toMatch(/did not parse/i);
+    // Nudged a bounded number of times (not infinite), then stopped.
+    expect(calls.length).toBeLessThanOrEqual(6);
+    // The stop note was shown as a message, not just returned.
+    expect(events.some((e) => e.type === 'message' && /did not parse/i.test((e as { content: string }).content))).toBe(true);
   });
 });
 
