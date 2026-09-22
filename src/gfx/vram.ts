@@ -110,7 +110,10 @@ export interface VramCompact {
   blob: Uint8Array;
   /** Where each slice of `blob` lands in VRAM (each ≤ 255 words). */
   blocks: VramBlock[];
-  /** Re-homed tilemap base — a displayable 4 KB NameBase (≤ $7000). */
+  /**
+   * Re-homed tilemap base — a byte offset selectable by SCBase (BG0SC): 2 KB
+   * aligned and ≤ $7000 so BG0's 32×32 tilemap fits in the lower 32 KB VRAM.
+   */
   mapBase: number;
   /** Background mode (0-7) the glue should program into BGMODE. */
   bgmode: number;
@@ -120,11 +123,13 @@ export interface VramCompact {
  * Build a compact VRAM export: only the char (tile) region, the tilemap, and
  * the CGRAM palettes are included — everything else of the 64 KB is dropped.
  *
- * Unlike `buildVram`, the tilemap is **re-homed** into a displayable NameBase:
- * the SNES can only point BG0-3 at one of 8 windows ($0000, $1000 … $7000), so
- * an authoring `mapBase` above $7000 (the editor default is $8000) would never
- * render. Here the tilemap is placed at the first 4 KB boundary at or past the
- * tile region and ≤ $7000, and the glue sets BG12NBA accordingly.
+ * Unlike `buildVram`, the tilemap is **re-homed** into a displayable SCBase
+ * window: the SNES can only point BG0-3's tilemap at 2 KB-aligned bases
+ * ($0000, $0800, $1000 … $7000), so an authoring `mapBase` above $7000 (the
+ * editor default is $8000) would never render. Here the tilemap is placed at
+ * the first 4 KB boundary at or past the tile region and ≤ $7000, and the glue
+ * programs the two bases correctly — BG0SC (SCBase) for the tilemap, BG12NBA
+ * (NameBase) for the tile char data — instead of conflating them.
  */
 export function buildVramCompact(opts: BuildVramOptions): VramCompact {
   const {
@@ -150,12 +155,12 @@ export function buildVramCompact(opts: BuildVramOptions): VramCompact {
   const charLen = tiles.length * stride * cb;
   if (charLen > 0) regions.push({ dest: charStart, bytes: full.slice(charStart, charStart + charLen) });
 
-  // 2) Tilemap — re-homed into a displayable NameBase past the tiles.
+  // 2) Tilemap — re-homed into a displayable SCBase window past the tiles.
   let mapDest = 0;
   if (tilemap && tilemap.length) {
     mapDest = Math.ceil((charStart + charLen) / 0x1000) * 0x1000;
     if (mapDest > 0x7000) {
-      throw new Error('buildVramCompact: tilemap does not fit a displayable NameBase (≤ $7000)');
+      throw new Error('buildVramCompact: tilemap does not fit a displayable SCBase (≤ $7000)');
     }
     // The bytes are position-independent — source them from wherever buildVram placed them.
     regions.push({ dest: mapDest, bytes: full.slice(mapBase, mapBase + MAP_BYTES) });
@@ -197,18 +202,41 @@ export function buildVramCompact(opts: BuildVramOptions): VramCompact {
  * assembler with no bank-switching or native-mode tricks.
  *
  * The program only has to `JSR vram_load`. The routine:
- *   1. un-blanks + sets full brightness (INIDISP twice — the reset state is
- *      forced-blank with brightness 0, i.e. a fully black screen),
+ *   1. keeps forced-blank ON through the whole fill (INIDISP=$80 — lifting it
+ *      early would trip snes9x's BlockInvalidVRAMAccess and drop the writes),
  *   2. programs BGMODE / BG0SC / BG12NBA, enables BG0 (TM), sets VMAIN so the
  *      $2118/$2119 word pair auto-advances,
  *   3. walks a block table `(dest_lo, dest_hi, len)` and streams each slice of
- *      the embedded data word-by-word, stopping at the `len == 0` terminator.
+ *      the embedded data, stopping at the `len == 0` terminator:
+ *        - char / tilemap blocks (word addr ≤ $3FFF) go through the generic
+ *          $2118/$2119 VRAM path;
+ *        - CGRAM palette blocks (word addr ≥ $6000, i.e. dest_hi ≥ $60) go
+ *          through the dedicated colour registers: $2121 sets the CGADD base,
+ *          then each (low, high) pair is written to $2122, which populates
+ *          PPU.CGDATA *and* IPPU.ScreenColors (the array the rasterizer actually
+ *          reads). The generic $2118/$2119 path only touches Memory.VRAM, which
+ *          the rasterizer never consults for colour — that was the black screen.
  *
- * Scratch is zero-page $20-$26 — deliberately clear of spcGlue's $10-$17, so the
- * two routines can coexist in one ROM.
+ * Scratch is zero-page $20-$29 — deliberately clear of spcGlue's $10-$17, so the
+ * two routines can coexist in one ROM. ($28/$29 hold the current block's
+ * dest_hi/dest_lo for the CGRAM test.)
  */
 export function vramGlue(mapBase: number, bgmode: number, blocks: VramBlock[], dataName = 'vram.bin'): string {
-  const nba = (mapBase >> 12) & 7;
+  // The SNES PPU has TWO independent bases into the same 64 KB VRAM — and they
+  // are NOT the same knob (this was the black screen):
+  //
+  //   * BG12NBA ($210b) → NameBase → tile (CHAR) DATA base.
+  //       ppu.c:3329  PPU.BG[0].NameBase = (Byte & 7) << 12;
+  //       ppu.c:738   BG.TileAddress     = NameBase << 1;
+  //     So char data must live at a 0x2000-aligned byte offset. Our layout puts
+  //     tiles at byte $0000 → NameBase = 0.
+  //
+  //   * BG0SC ($2107) → SCBase → TILEMAP base.
+  //       ppu.c:3319  PPU.BG[bg].SCBase = (Byte & 0x7c) << 8;
+  //       ppu.c:740   SC0               = &VRAM[SCBase << 1];
+  //     So the tilemap byte offset = (Byte & 0x7c) << 9 → Byte = (mapBase>>9)&0x7c.
+  const scByte = (mapBase >> 9) & 0x7c;   // BG0SC — SCBase window selecting the tilemap
+  const nba = 0;                          // BG12NBA — NameBase=0, tile char data at byte $0000
   const h = (n: number, w: number) => '$' + n.toString(16).padStart(w, '0');
   const table = blocks
     .map((b) => `  .byte ${h(b.dest & 0xff, 2)}, ${h((b.dest >> 8) & 0xff, 2)}, ${h(b.len, 2)}`)
@@ -218,17 +246,17 @@ export function vramGlue(mapBase: number, bgmode: number, blocks: VramBlock[], d
 ; Brings up BG0 and loads the compact ${dataName} into VRAM. Pure 8-bit mode.
 ; The program just calls:  JSR vram_load
 vram_load:
-  ; un-blank + full brightness: INIDISP bit7 edge lifts forced-blanking, and the
-  ; low nibble (brightness) must be non-zero or the PPU renders fully black.
+  ; Forced-blank ON — and keep it ON through the ENTIRE VRAM fill. The wasm build
+  ; ships with snes9x's BlockInvalidVRAMAccess, which drops every $2118/$2119
+  ; write unless INIDISP bit7 (forced-blanking) is set. So we must NOT un-blank
+  ; until the last word is in (see vram_done); brightness is set there too.
   lda #$80
   sta $2100
-  lda #$0f
-  sta $2100
-  lda ${h(bgmode & 7, 2)}     ; BGMODE
+  lda #${h(bgmode & 7, 2)}  ; BGMODE (immediate — a bare value would be a zero-page read)
   sta $2105
-  lda #$00                 ; BG0SC (8x8, char slots from $0000)
+  lda #${h(scByte, 2)}      ; BG0SC: SCBase window — selects the TILEMAP at mapBase
   sta $2107
-  lda ${h(nba, 2)}           ; BG12NBA = tilemap 4 KB window
+  lda #${h(nba, 2)}         ; BG12NBA: NameBase=0 — tile CHAR DATA at byte $0000
   sta $210b
   lda #$01                 ; TM: BG0 main screen on
   sta $212c
@@ -249,12 +277,14 @@ vram_load:
 vram_blk:
   lda ($22),Y             ; dest_lo
   sta $2116                ; VMADDL
+  sta $29                  ; keep dest_lo (CGRAM base colour index)
   inc $22
   bne vram_t1
   inc $23
 vram_t1:
   lda ($22),Y             ; dest_hi
   sta $2117                ; VMADDH
+  sta $28                  ; keep dest_hi for the CGRAM test
   inc $22
   bne vram_t2
   inc $23
@@ -266,6 +296,34 @@ vram_t2:
   bne vram_t3
   inc $23
 vram_t3:
+  lda $28                 ; CGRAM lives in the upper 32 KB (word addr >= $6000)
+  cmp #$60
+  bcc vram_w               ; char / tilemap -> generic $2118/$2119 word writes
+  ; ---- CGRAM palette block: the dedicated colour registers ------------------
+  ; $2118/$2119 only touch Memory.VRAM, which the rasterizer never reads for
+  ; colour. $2121/$2122 populate PPU.CGDATA *and* IPPU.ScreenColors, and $2121
+  ; resets CGFLIP to 0 so the first $2122 write is the low byte. CGADD then
+  ; auto-increments after each high byte, so a contiguous palette streams with
+  ; one $2121 setup.
+  lda $29                 ; base CGRAM colour index for this block
+  sta $2121
+cgram_w:
+  lda ($20),Y             ; colour low byte
+  sta $2122                ; CGFLIP 0->1
+  inc $20
+  bne cgram_a
+  inc $21
+cgram_a:
+  lda ($20),Y             ; colour high byte
+  sta $2122                ; CGFLIP 1->0, CGADD++
+  inc $20
+  bne cgram_b
+  inc $21
+cgram_b:
+  dec $26
+  bne cgram_w
+  jmp vram_blk             ; next block (table pointer already advanced)
+; ---- generic char / tilemap block -------------------------------------------
 vram_w:
   lda ($20),Y             ; word low byte (data pointer at byte 0 of the word)
   sta $2118
@@ -283,6 +341,11 @@ vram_b:
   bne vram_w
   jmp vram_blk
 vram_done:
+  ; Un-blank + full brightness, NOW that every word has landed in VRAM. Lifting
+  ; forced-blanking before the fill would trip snes9x's BlockInvalidVRAMAccess
+  ; and silently drop the $2118/$2119 writes (the pure-black-screen bug).
+  lda #$0f
+  sta $2100
   rts
 vram_blocks:
 ${table}

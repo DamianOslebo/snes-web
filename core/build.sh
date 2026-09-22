@@ -145,7 +145,17 @@ EXPORTED_FUNCTIONS='[
   "_core_breakpoint_addr",
   "_core_sram_ptr",
   "_core_wram_ptr",
-  "_core_vram_ptr"
+  "_core_vram_ptr",
+  "_core_fillsram_ptr",
+  "_core_dbg_ppu",
+  "_core_dbg_clipcount",
+  "_core_dbg_clipdrawmode",
+  "_core_dbg_clipleft",
+  "_core_dbg_clipright",
+  "_core_screen_raw",
+  "_core_screen_pitch_px",
+  "_core_screen_nonzero",
+  "_core_dbg_lines"
 ]'
 
 SOURCES=("$SHIM")

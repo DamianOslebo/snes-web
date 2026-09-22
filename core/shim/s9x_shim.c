@@ -559,3 +559,130 @@ EMSCRIPTEN_KEEPALIVE
 unsigned char *core_vram_ptr(void) {
     return g_ready ? Memory.VRAM : NULL;
 }
+
+/*
+ * Diagnostic accessors (debugging the PPU bring-up path). S9xGetPPU's read
+ * path is OpenBus/unreliable, so these expose the RELIABLE sources of truth
+ * directly: Memory.FillRAM (the last byte actually written to each PPU register)
+ * and the derived PPU state fields the rasterizer gates on.
+ */
+
+EMSCRIPTEN_KEEPALIVE
+unsigned char *core_fillsram_ptr(void) {
+    return g_ready ? Memory.FillRAM : NULL;
+}
+
+/*
+ * Packed PPU state:
+ *   bit 0  = PPU.ForcedBlanking (if 1, S9xUpdateScreen skips ALL drawing)
+ *   bit 1..4 = PPU.Brightness
+ *   bit 5  = PPU.RecomputeClipWindows
+ *   bit 6  = (PPU.BG[0].BGSize) & 1
+ *   bit 7  = (PPU.BG[0].NameBase) & 1  (NameBase is a 0-7 index, low bit)
+ */
+EMSCRIPTEN_KEEPALIVE
+int core_dbg_ppu(void) {
+    if (!g_ready) return -1;
+    int v = 0;
+    v |= (PPU.ForcedBlanking ? 1 : 0);
+    v |= (PPU.Brightness & 0xf) << 1;
+    v |= (PPU.RecomputeClipWindows ? 1 : 0) << 5;
+    v |= ((PPU.BG[0].BGSize & 1) << 6);
+    v |= ((PPU.BG[0].NameBase & 1) << 7);
+    return v;
+}
+
+/*
+ * Clip-window diagnostics (the remaining render gate). sub=0 main / 1 sub,
+ * bg=0-5 (0-3 backgrounds, 4 OBJ, 5 backdrop). Count=0 means "draw nothing".
+ */
+EMSCRIPTEN_KEEPALIVE
+int core_dbg_clipcount(int sub, int bg) {
+    if (!g_ready) return -1;
+    return (int)IPPU.Clip[sub & 1][bg & 7].Count;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int core_dbg_clipdrawmode(int sub, int bg, int i) {
+    if (!g_ready) return -1;
+    return (int)IPPU.Clip[sub & 1][bg & 7].DrawMode[i & 7];
+}
+
+EMSCRIPTEN_KEEPALIVE
+int core_dbg_clipleft(int sub, int bg, int i) {
+    if (!g_ready) return -1;
+    return (int)IPPU.Clip[sub & 1][bg & 7].Left[i & 7];
+}
+
+EMSCRIPTEN_KEEPALIVE
+int core_dbg_clipright(int sub, int bg, int i) {
+    if (!g_ready) return -1;
+    return (int)IPPU.Clip[sub & 1][bg & 7].Right[i & 7];
+}
+
+/*
+ * Raw framebuffer access — bypasses convertVideo() so we can tell, directly,
+ * whether the PPU rendered any non-zero pixel into GFX.Screen. This separates
+ * "the rasterizer drew nothing" (all-zero buffer) from "convertVideo misreads"
+ * (non-zero buffer, wrong RGBA out).
+ */
+
+EMSCRIPTEN_KEEPALIVE
+unsigned short *core_screen_raw(void) {
+    return GFX.Screen;
+}
+
+EMSCRIPTEN_KEEPALIVE
+unsigned int core_screen_pitch_px(void) {
+    return (unsigned int)(GFX.Pitch / sizeof(uint16_t));
+}
+
+/* Count of non-zero 16-bit pixels in the top 256x224 of GFX.Screen.
+   0xFFFFFFFF = buffer not allocated; 0xEEEEEEEE = bad row pitch. */
+EMSCRIPTEN_KEEPALIVE
+unsigned int core_screen_nonzero(void) {
+    if (!GFX.Screen) return 0xFFFFFFFFu;
+    unsigned int pitch = (unsigned int)(GFX.Pitch / sizeof(uint16_t));
+    if (pitch < 256u) return 0xEEEEEEEEu;
+    unsigned int n = 0;
+    for (unsigned int y = 0; y < 224u; y++) {
+        const unsigned short *row = GFX.Screen + (size_t)y * pitch;
+        for (unsigned int x = 0; x < 256u; x++) if (row[x]) n++;
+    }
+    return n;
+}
+
+/*
+ * Frame / render-line diagnostics — the decisive gate between "RenderLine
+ * never fired" and "RenderScreen drew nothing". Packed:
+ *   bits  0-7   = IPPU.PreviousLine  (lines already flushed into GFX.Screen)
+ *   bits  8-15  = IPPU.CurrentLine   (lines populated into LineData this frame)
+ *   bits 16-23  = PPU.ScreenHeight
+ *   bit  24     = PPU.SFXSpeedupHack   (if set, RenderScreen takes the hack path)
+ *   bit  25     = PPU.ForcedBlanking
+ *   bit  26     = IPPU.RenderThisFrame
+ *   bit  27     = Settings.SupportHiRes
+ *
+ * Read it AFTER core_frame():
+ *   CurrentLine == 0                -> the render event never ran (no HBlank/
+ *                                      VBlank frame-end) — the CPU frame is not
+ *                                      completing a full visible span.
+ *   CurrentLine == PreviousLine ==  ScreenHeight  -> everything was flushed;
+ *                                      if GFX.Screen is still zero, the
+ *                                      rasterizer itself drew nothing.
+ *   CurrentLine  >  PreviousLine    -> a flush is pending (register-write or
+ *                                      frame-end) but the line data is there.
+ */
+EMSCRIPTEN_KEEPALIVE
+unsigned int core_dbg_lines(void) {
+    if (!g_ready) return 0xFFFFFFFFu;
+    unsigned int v = 0;
+    v |= (unsigned int)(IPPU.PreviousLine & 0xff);
+    v |= (unsigned int)(IPPU.CurrentLine & 0xff) << 8;
+    v |= (unsigned int)(PPU.ScreenHeight & 0xff) << 16;
+    v |= (PPU.SFXSpeedupHack ? 1u : 0u) << 24;
+    v |= (PPU.ForcedBlanking ? 1u : 0u) << 25;
+    v |= (IPPU.RenderThisFrame ? 1u : 0u) << 26;
+    v |= (Settings.SupportHiRes ? 1u : 0u) << 27;
+    return v;
+}
