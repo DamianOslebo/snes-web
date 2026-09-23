@@ -71,6 +71,8 @@ interface EdState {
   colIdx: number;
   paint: number;
   map: Array<TilemapEntry | null>;
+  /** The SECOND (alt) tilemap — the runtime-switchable screen. Data-only; the editor pane paints the primary `map`. */
+  mapAlt: Array<TilemapEntry | null>;
   mapBrush: TilemapEntry;
   eraseBrush: boolean;
   tileBase: number;
@@ -130,6 +132,7 @@ const ed = {
   colIdx: 0,
   paint: 1,
   map: new Array<TilemapEntry | null>(MAP_ENTRIES).fill(null),
+  mapAlt: new Array<TilemapEntry | null>(MAP_ENTRIES).fill(null),
   mapBrush: { tile: 0, palette: 0, flipX: false, flipY: false, priority: false },
   eraseBrush: false,
   tileBase: 0,
@@ -151,6 +154,8 @@ interface GfxStore {
   tiles: number[][][];
   palette: Rgb15[];
   map: Array<TilemapEntry | null>;
+  /** Optional: the second (alt) tilemap. Absent in v1 stores predating the toggle feature. */
+  mapAlt?: Array<TilemapEntry | null>;
   tileBase: number;
   paletteBase: number;
   mapBase: number;
@@ -166,6 +171,7 @@ const isGfxStore = (v: unknown): v is GfxStore => {
         typeof c.b !== 'number' || typeof c.transparent !== 'boolean') return false;
   }
   if (!Array.isArray(g.map) || g.map.length !== MAP_ENTRIES) return false;
+  if (g.mapAlt !== undefined && (!Array.isArray(g.mapAlt) || g.mapAlt.length !== MAP_ENTRIES)) return false;
   return typeof g.tileBase === 'number' && typeof g.paletteBase === 'number' && typeof g.mapBase === 'number';
 };
 
@@ -201,6 +207,10 @@ function ensureGfxState(): void {
   ed.tiles = value.tiles.length ? value.tiles : [blankTile()];
   ed.palette = value.palette;
   ed.map = value.map;
+  // Optional in the store; fall back to a blank alt map (v1 predates the toggle).
+  ed.mapAlt = value.mapAlt && value.mapAlt.length === MAP_ENTRIES
+    ? value.mapAlt
+    : new Array<TilemapEntry | null>(MAP_ENTRIES).fill(null);
   ed.tileBase = value.tileBase;
   ed.paletteBase = value.paletteBase;
   ed.mapBase = value.mapBase;
@@ -213,6 +223,7 @@ function gfxPersist(): void {
     tiles: ed.tiles,
     palette: ed.palette,
     map: ed.map,
+    mapAlt: ed.mapAlt,
     tileBase: ed.tileBase,
     paletteBase: ed.paletteBase,
     mapBase: ed.mapBase,
@@ -1220,6 +1231,7 @@ export function makeGfxController(): GfxController {
         tiles: ed.tiles.length,
         palette: ed.palette.length,
         mapEntries: ed.map.reduce((n, e) => n + (e !== null ? 1 : 0), 0),
+        altMapEntries: ed.mapAlt.reduce((n, e) => n + (e !== null ? 1 : 0), 0),
       };
     },
 
@@ -1303,6 +1315,54 @@ export function makeGfxController(): GfxController {
       scheduleGfxPersist();
     },
 
+    // --- second (alt) tilemap: the runtime-switchable screen ----------------
+    // Data-only — the editor pane paints the PRIMARY `ed.map`, so these mutate
+    // `ed.mapAlt` without any DOM refresh. Once any cell is set, `gfxVramOpts`
+    // picks the alt map up and the generated glue emits `vram_toggle`.
+
+    setAltMapEntry(col, row, entry) {
+      if (row < 0 || row > 31 || col < 0 || col > 31) return;
+      const i = row * 32 + col;
+      ed.mapAlt[i] = {
+        tile: Math.max(0, Math.min(0x3ff, Math.round(entry.tile))),
+        palette: entry.palette & 3,
+        flipX: !!entry.flipX,
+        flipY: !!entry.flipY,
+        priority: !!entry.priority,
+      };
+      scheduleGfxPersist();
+    },
+
+    fillAltMap(tile, palette) {
+      const t = Math.max(0, Math.min(0x3ff, Math.round(tile)));
+      const p = palette & 3;
+      for (let i = 0; i < MAP_ENTRIES; i++) {
+        ed.mapAlt[i] = { tile: t, palette: p, flipX: false, flipY: false, priority: false };
+      }
+      scheduleGfxPersist();
+    },
+
+    setAltMapFromGrid(grid, palette) {
+      const p = palette & 3;
+      for (let row = 0; row < 32; row++) {
+        for (let col = 0; col < 32; col++) {
+          const v = grid[row]?.[col];
+          if (typeof v === 'number' && Number.isFinite(v) && v >= 1) {
+            ed.mapAlt[row * 32 + col] = {
+              tile: Math.round(v) & 0x3ff,
+              palette: p,
+              flipX: false,
+              flipY: false,
+              priority: false,
+            };
+          } else {
+            ed.mapAlt[row * 32 + col] = null;
+          }
+        }
+      }
+      scheduleGfxPersist();
+    },
+
     buildVram() {
       ensureGfxState();
       return buildVramImage(gfxVramOpts());
@@ -1315,18 +1375,26 @@ export function makeGfxController(): GfxController {
 
     vramGlue(dataName) {
       const c = buildVramCompact(gfxVramOpts());
-      return vramGlueGen(c.mapBase, c.bgmode, c.blocks, dataName);
+      // `c.altMapBase` (present only when an alt tilemap was authored) is what
+      // makes the generated glue emit the `vram_toggle` service routine.
+      return vramGlueGen(c.mapBase, c.bgmode, c.blocks, dataName, c.altMapBase);
     },
   };
 }
 
 /** The shared `BuildVramOptions` for the gfx controller's compile methods. */
 function gfxVramOpts(): BuildVramOptions {
+  // The alt map is only included once at least one cell has been set — that's
+  // the trigger that (a) re-homes it into the next SCBase window and (b) makes
+  // vramGlue emit the `vram_toggle` service routine. An empty alt map keeps
+  // the single-screen build clean (no `vram_toggle`, identical to before).
+  const hasAlt = ed.mapAlt.some((e) => e !== null);
   return {
     mode: ed.mode,
     tiles: ed.tiles.length ? ed.tiles : [blankTile()],
     palettes: [ed.palette],
     tilemap: ed.map.map((e) => e ?? blankEntry()),
+    altTilemap: hasAlt ? ed.mapAlt.map((e) => e ?? blankEntry()) : undefined,
     tileBase: ed.tileBase,
     paletteBase: ed.paletteBase,
     mapBase: ed.mapBase,

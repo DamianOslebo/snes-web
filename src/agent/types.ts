@@ -119,7 +119,7 @@ export interface AsmController {
 /** Graphics page: tiles, palette, tilemap, and the compiled 64 KB VRAM image. */
 export interface GfxController {
   /** A compact snapshot of the editor state (for the agent to inspect). */
-  getState(): { mode: number; tiles: number; palette: number; mapEntries: number };
+  getState(): { mode: number; tiles: number; palette: number; mapEntries: number; altMapEntries: number };
   /** Set palette `index` (0-15) to a 5-5-5 color. */
   setPaletteColor(index: number, r: number, g: number, b: number, transparent: boolean): void;
   /** Paint one pixel of a tile with palette `color`. Creates the tile if needed. */
@@ -137,6 +137,23 @@ export interface GfxController {
    * 32 columns); palette/flags come from `palette` (0/0/0/0/false).
    */
   setMapFromGrid(grid: number[][], palette: number): void;
+
+  // --- second tilemap (the runtime-switchable screen) -----------------------
+  //
+  // These author the ALT tilemap — a distinct 32×32 screen the PPU can be
+  // flipped to at runtime. When at least one alt cell is set, `buildVramCompact`
+  // places it in the next SCBase window and `vramGlue` emits a `vram_toggle`
+  // service routine that flips between the primary and alt screens.
+
+  /** Set the tilemap entry at (col,row) for the 32×32 ALT (second) SC0 map. */
+  setAltMapEntry(col: number, row: number, entry: { tile: number; palette: number; flipX: boolean; flipY: boolean; priority: boolean }): void;
+  /** Fill the whole 32×32 ALT SC0 map with one (tile, palette) entry. */
+  fillAltMap(tile: number, palette: number): void;
+  /**
+   * Replace the ALT SC0 map from a row-major grid of tile indices (32 rows ×
+   * 32 columns); palette/flags come from `palette`.
+   */
+  setAltMapFromGrid(grid: number[][], palette: number): void;
   /** Compile the editor to a 64 KB VRAM image. */
   buildVram(): Uint8Array;
   /**

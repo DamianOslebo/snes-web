@@ -548,13 +548,124 @@ const DEFS: ToolDef[] = [
       return ok({ rows: g.length, cols });
     },
   },
+
+  // --- second tilemap (the runtime-switchable screen) ------------------------
+  // Author the ALT tilemap; once any cell is set, gfx_export_vram places it in
+  // the next SCBase window and the generated glue emits a `vram_toggle` routine
+  // that flips the display between the primary and alt screens.
+
+  {
+    name: 'gfx_set_alt_map_entry',
+    description:
+      'Set one cell of the SECOND (alt) SC0 tilemap — the alternate screen the PPU can be ' +
+      'flipped to at runtime (e.g. the lowercase of a screen). Same (col,row) coordinates as the ' +
+      'primary map. Setting ANY alt cell activates the runtime toggle (vram_toggle) on export.',
+    parameters: {
+      type: 'object',
+      properties: {
+        col: { type: 'integer', minimum: 0, maximum: 31 },
+        row: { type: 'integer', minimum: 0, maximum: 31 },
+        tile: { type: 'integer', minimum: 0, maximum: 4095 },
+        palette: { type: 'integer', minimum: 0, maximum: 15 },
+        flipX: { type: 'boolean' },
+        flipY: { type: 'boolean' },
+        priority: { type: 'boolean' },
+      },
+      required: ['col', 'row', 'tile'],
+    },
+    run: (a, c) => {
+      const col = intF(a, 'col', 0, 31);
+      const row = intF(a, 'row', 0, 31);
+      const tile = intF(a, 'tile', 0, 4095);
+      const palette = optIntF(a, 'palette', 0, 15);
+      const flipX = optBoolF(a, 'flipX');
+      const flipY = optBoolF(a, 'flipY');
+      const priority = optBoolF(a, 'priority');
+      const e = col.e ?? row.e ?? tile.e ?? palette.e ?? flipX.e ?? flipY.e ?? priority.e;
+      if (e) return fail(e);
+      c.gfx.setAltMapEntry(col.v as number, row.v as number, {
+        tile: tile.v as number,
+        palette: palette.v ?? 0,
+        flipX: flipX.v ?? false,
+        flipY: flipY.v ?? false,
+        priority: priority.v ?? false,
+      });
+      return ok({});
+    },
+  },
+  {
+    name: 'gfx_fill_alt_map',
+    description:
+      'Fill the whole SECOND (alt) 32×32 tilemap with one tile (a solid alternate screen). ' +
+      'Activates the runtime toggle (vram_toggle) on export.',
+    parameters: {
+      type: 'object',
+      properties: {
+        tile: { type: 'integer', minimum: 0, maximum: 4095 },
+        palette: { type: 'integer', minimum: 0, maximum: 15 },
+      },
+      required: ['tile'],
+    },
+    run: (a, c) => {
+      const tile = intF(a, 'tile', 0, 4095);
+      const palette = optIntF(a, 'palette', 0, 15);
+      const e = tile.e ?? palette.e;
+      if (e) return fail(e);
+      c.gfx.fillAltMap(tile.v as number, palette.v ?? 0);
+      return ok({});
+    },
+  },
+  {
+    name: 'gfx_set_alt_map_grid',
+    description:
+      'Author the SECOND (alt) 32×32 tilemap in one call: grid[row][col] = tile index (0–4095). ' +
+      'This is the alternate screen (e.g. the lowercase version of the primary). Activates the ' +
+      'runtime toggle (vram_toggle) on export.',
+    parameters: {
+      type: 'object',
+      properties: {
+        grid: {
+          type: 'array',
+          description: 'Up to 32 rows, each up to 32 tile indices',
+          items: { type: 'array', items: { type: 'integer', minimum: 0, maximum: 4095 } },
+        },
+        palette: { type: 'integer', minimum: 0, maximum: 15 },
+      },
+      required: ['grid'],
+    },
+    run: (a, c) => {
+      const g = a.grid;
+      if (!Array.isArray(g) || g.length === 0 || g.length > 32) {
+        return fail('"grid" must be 1–32 rows of tile indices');
+      }
+      let cols = 0;
+      for (const row of g) {
+        if (!Array.isArray(row) || row.length === 0 || row.length > 32) {
+          return fail('each grid row must have 1–32 cells');
+        }
+        cols = Math.max(cols, row.length);
+        for (const cell of row) {
+          if (typeof cell !== 'number' || !Number.isInteger(cell) || cell < 0 || cell > 4095) {
+            return fail('grid cells must be tile indices 0–4095');
+          }
+        }
+      }
+      const palette = optIntF(a, 'palette', 0, 15);
+      if (palette.e) return fail(palette.e);
+      c.gfx.setAltMapFromGrid(g as number[][], palette.v ?? 0);
+      return ok({ rows: g.length, cols });
+    },
+  },
   {
     name: 'gfx_export_vram',
     description:
       'Compile the graphics into a COMPACT VRAM image (only the used palette + tiles + tilemap — a few KB, ' +
       'not 64 KB). With `destName` (standard name "vram.bin"), also register it on the assembler page as an ' +
       '`.incbin` data file AND append the self-contained 65C816 bring-up routine (`vram_load`) to the asm ' +
-      'source. The program then only needs `JSR vram_load` at startup — no manual PPU setup or DMA required.',
+      'source. The program then only needs `JSR vram_load` at startup — no manual PPU setup or DMA required. ' +
+      'If a SECOND tilemap was authored (gfx_set_alt_map_*), the glue ALSO emits `vram_toggle`, which flips ' +
+      'the display between the primary and alt screens at runtime — JSR it to switch. The result\'s ' +
+      'layout.toggleAvailable tells you whether vram_toggle was emitted.',
     parameters: {
       type: 'object',
       properties: {
@@ -566,7 +677,14 @@ const DEFS: ToolDef[] = [
       const bytes = compact.blob;
       const dn = optStrF(a, 'destName');
       if (dn.e) return fail(dn.e);
-      const layout = { bytes: bytes.length, blocks: compact.blocks.length, mapBase: compact.mapBase, bgmode: compact.bgmode };
+      const layout = {
+        bytes: bytes.length,
+        blocks: compact.blocks.length,
+        mapBase: compact.mapBase,
+        altMapBase: compact.altMapBase,
+        toggleAvailable: !!compact.altMapBase,
+        bgmode: compact.bgmode,
+      };
       if (dn.v) {
         c.asm.addDataFile(dn.v, bytes);
         // Idempotent: replaces any previous vram glue block, so re-exporting

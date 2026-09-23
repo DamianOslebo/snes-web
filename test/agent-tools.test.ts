@@ -55,7 +55,7 @@ function mockControllers() {
   };
 
   const gfx: GfxController = {
-    getState: () => ({ mode: 0, tiles: 2, palette: 16, mapEntries: 1024 }),
+    getState: () => ({ mode: 0, tiles: 2, palette: 16, mapEntries: 1024, altMapEntries: 0 }),
     setPaletteColor: (i, r, g, b, t) => call('setPaletteColor', [i, r, g, b, t]),
     setTilePixel: (...a) => call('setTilePixel', a),
     fillTileRect: (...a) => call('fillTileRect', a),
@@ -63,6 +63,9 @@ function mockControllers() {
     setMapEntry: (...a) => call('setMapEntry', a),
     fillMap: (...a) => call('fillMap', a),
     setMapFromGrid: (...a) => call('setMapFromGrid', a),
+    setAltMapEntry: (...a) => call('setAltMapEntry', a),
+    fillAltMap: (...a) => call('fillAltMap', a),
+    setAltMapFromGrid: (...a) => call('setAltMapFromGrid', a),
     buildVram: () => new Uint8Array([0, 1, 2, 3]),
     buildVramCompact: () => ({
       blob: new Uint8Array([0, 1, 2, 3]),
@@ -151,8 +154,8 @@ describe('base64ToBytes', () => {
 // --- catalog shape -----------------------------------------------------------
 
 describe('TOOL_SPECS', () => {
-  it('has the 28 well-formed function specs', () => {
-    expect(TOOL_SPECS).toHaveLength(28);
+  it('has the 31 well-formed function specs', () => {
+    expect(TOOL_SPECS).toHaveLength(31);
     for (const s of TOOL_SPECS) {
       expect(s.type).toBe('function');
       expect(s.function.name).toMatch(/^(asm|gfx|trk)_[a-z_]+$/);
@@ -167,7 +170,8 @@ describe('TOOL_SPECS', () => {
       'asm_get_source', 'asm_set_source', 'asm_append_source', 'asm_list_data_files',
       'asm_add_data_file', 'asm_remove_data_file', 'asm_assemble', 'asm_build_rom', 'asm_run',
       'gfx_get_state', 'gfx_set_palette_color', 'gfx_set_tile_pixel', 'gfx_fill_rect',
-      'gfx_add_tile', 'gfx_set_map_entry', 'gfx_fill_map', 'gfx_set_map_grid', 'gfx_export_vram',
+      'gfx_add_tile', 'gfx_set_map_entry', 'gfx_fill_map', 'gfx_set_map_grid',
+      'gfx_set_alt_map_entry', 'gfx_fill_alt_map', 'gfx_set_alt_map_grid', 'gfx_export_vram',
       'trk_get_song', 'trk_set_cell', 'trk_set_pattern', 'trk_set_tempo', 'trk_set_orders',
       'trk_add_pattern', 'trk_add_instrument', 'trk_preview', 'trk_stop', 'trk_export_spc',
     ]) {
@@ -185,7 +189,7 @@ describe('dispatch contract', () => {
     expect(r.ok).toBe(false);
     const body = JSON.parse(r.content) as { error: string; tools: string[] };
     expect(body.error).toContain('unknown tool');
-    expect(body.tools).toHaveLength(28);
+    expect(body.tools).toHaveLength(31);
   });
 
   it('a throwing controller is caught and reported cleanly', () => {

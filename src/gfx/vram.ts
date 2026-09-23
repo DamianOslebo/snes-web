@@ -34,6 +34,13 @@ export interface BuildVramOptions {
   palettes: Rgb15[][];
   /** Optional tilemap entries (up to 1024) placed at `mapBase`. */
   tilemap?: TilemapEntry[];
+  /**
+   * Optional SECOND tilemap — a distinct screen the PPU can be switched to at
+   * runtime (e.g. "HELLO WORLD" ↔ "hello world"). When present it is placed in
+   * the next displayable SCBase window past the primary tilemap, and the glue
+   * gains a `vram_toggle` service routine that flips the display between them.
+   */
+  altTilemap?: TilemapEntry[];
   /** Base 8×8 char slot for tile 0. Default 0. */
   tileBase?: number;
   /** Base CGRAM palette index for palette 0. Default 0. */
@@ -115,6 +122,12 @@ export interface VramCompact {
    * aligned and ≤ $7000 so BG0's 32×32 tilemap fits in the lower 32 KB VRAM.
    */
   mapBase: number;
+  /**
+   * Re-homed base of the SECOND tilemap (when one was supplied). One SCBase
+   * window past `mapBase`. Present iff `altTilemap` was non-empty; its presence
+   * is what makes the glue emit the `vram_toggle` service routine.
+   */
+  altMapBase?: number;
   /** Background mode (0-7) the glue should program into BGMODE. */
   bgmode: number;
 }
@@ -137,12 +150,14 @@ export function buildVramCompact(opts: BuildVramOptions): VramCompact {
     tiles,
     palettes,
     tilemap,
+    altTilemap,
     tileBase = 0,
     paletteBase = 0,
     mapBase = 0,
   } = opts;
 
   // Full image — reuse the proven encoder just to source the region bytes.
+  // (The alt tilemap is encoded separately below; buildVram holds one map.)
   const full = buildVram(opts);
 
   const cb = charBytesForMode(mode);
@@ -157,6 +172,7 @@ export function buildVramCompact(opts: BuildVramOptions): VramCompact {
 
   // 2) Tilemap — re-homed into a displayable SCBase window past the tiles.
   let mapDest = 0;
+  let altMapDest = 0;
   if (tilemap && tilemap.length) {
     mapDest = Math.ceil((charStart + charLen) / 0x1000) * 0x1000;
     if (mapDest > 0x7000) {
@@ -164,6 +180,20 @@ export function buildVramCompact(opts: BuildVramOptions): VramCompact {
     }
     // The bytes are position-independent — source them from wherever buildVram placed them.
     regions.push({ dest: mapDest, bytes: full.slice(mapBase, mapBase + MAP_BYTES) });
+
+    // 2b) Second tilemap — the NEXT SCBase window past the primary one. The two
+    //     maps must sit in DIFFERENT windows so `vram_toggle` can flip the
+    //     display between them with a single $2107 (BG0SC) eor. Encoded into a
+    //     throwaway buffer (buildVram holds only one map), then sliced out.
+    if (altTilemap && altTilemap.length) {
+      altMapDest = mapDest + 0x1000;
+      if (altMapDest > 0x7000) {
+        throw new Error('buildVramCompact: alt tilemap does not fit a displayable SCBase (≤ $7000)');
+      }
+      const altBuf = new Uint8Array(MAP_BYTES);
+      encodeTilemapAt(altBuf, altTilemap, 0);
+      regions.push({ dest: altMapDest, bytes: altBuf });
+    }
   }
 
   // 3) CGRAM palettes — already at a valid $C000+ address.
@@ -192,7 +222,15 @@ export function buildVramCompact(opts: BuildVramOptions): VramCompact {
   let o = 0;
   for (const p of parts) { blob.set(p, o); o += p.length; }
 
-  return { blob, blocks, mapBase: mapDest, bgmode: mode & 7 };
+  return {
+    blob,
+    blocks,
+    mapBase: mapDest,
+    // Present only when a second tilemap was supplied (non-empty altTilemap);
+    // its presence is what makes the glue emit `vram_toggle`.
+    altMapBase: altMapDest || undefined,
+    bgmode: mode & 7,
+  };
 }
 
 /**
@@ -219,9 +257,20 @@ export function buildVramCompact(opts: BuildVramOptions): VramCompact {
  *
  * Scratch is zero-page $20-$29 — deliberately clear of spcGlue's $10-$17, so the
  * two routines can coexist in one ROM. ($28/$29 hold the current block's
- * dest_hi/dest_lo for the CGRAM test.)
+ * dest_hi/dest_lo for the CGRAM test.) $2a holds the toggle state.
+ *
+ * The glue ALSO always emits two OS service routines the program `JSR`s — the
+ * "OS library" for input + screen switching, so the program never hand-rolls
+ * PPU register writes:
+ *   - `pad_read`    : A <- the raw pad byte ($4016); buttons active-LOW.
+ *   - `vram_toggle` : (only when `altMapBase` is supplied) flip the display
+ *                     between the two tilemaps by writing the ABSOLUTE BG0SC
+ *                     SCBase byte for the target map (state tracked in $2a).
+ *                     It never reads $2107 — this snes9x fork returns OpenBus
+ *                     garbage on PPU register reads, so a read-modify-write
+ *                     would write a random value.
  */
-export function vramGlue(mapBase: number, bgmode: number, blocks: VramBlock[], dataName = 'vram.bin'): string {
+export function vramGlue(mapBase: number, bgmode: number, blocks: VramBlock[], dataName = 'vram.bin', altMapBase?: number): string {
   // The SNES PPU has TWO independent bases into the same 64 KB VRAM — and they
   // are NOT the same knob (this was the black screen):
   //
@@ -237,10 +286,53 @@ export function vramGlue(mapBase: number, bgmode: number, blocks: VramBlock[], d
   //     So the tilemap byte offset = (Byte & 0x7c) << 9 → Byte = (mapBase>>9)&0x7c.
   const scByte = (mapBase >> 9) & 0x7c;   // BG0SC — SCBase window selecting the tilemap
   const nba = 0;                          // BG12NBA — NameBase=0, tile char data at byte $0000
+  // `vram_toggle` (emitted only when a second tilemap exists) flips the display
+  // between the two tilemaps. THIS snes9x fork returns OpenBus GARBAGE when a
+  // PPU register is READ (S9xGetPPU's default case — there is no case for $2107),
+  // so a read-modify-write (`lda $2107 / eor / sta $2107`) writes an UNPREDICTABLE
+  // value and the flip silently fails (the screen just stays on the primary map).
+  // Instead the toggle writes the ABSOLUTE SCBase byte for the target map (which
+  // the real core provably accepts — an `lda #<byte> / sta $2107` lands it) and
+  // tracks which map is up in a zero-page flag ($2a) that `vram_load` zeroes.
+  const altScByte = altMapBase ? (altMapBase >> 9) & 0x7c : 0;
   const h = (n: number, w: number) => '$' + n.toString(16).padStart(w, '0');
   const table = blocks
     .map((b) => `  .byte ${h(b.dest & 0xff, 2)}, ${h((b.dest >> 8) & 0xff, 2)}, ${h(b.len, 2)}`)
     .join('\n');
+  // The `vram_toggle` routine — emitted ONLY when a second tilemap was supplied.
+  // It keeps state in zero-page $2a (0 = primary, 1 = alt) and writes the
+  // ABSOLUTE BG0SC SCBase byte for the target map — it NEVER reads $2107,
+  // because this snes9x fork returns OpenBus garbage on PPU register reads.
+  // TM/C0/M0 are untouched, so the background stays on across the flip.
+  const toggle = altMapBase
+    ? `; vram_toggle: flip the display between the primary and the SECOND
+; tilemap (e.g. "HELLO WORLD" <-> "hello world"). State is zero-page $2a
+; (0 = primary, 1 = alt); vram_load sets it to 0 and $2107=scByte, so the
+; first call flips to the alt map and the next flips back. We write the
+; ABSOLUTE SCBase byte for the target map because this snes9x fork returns
+; OpenBus garbage on PPU register READS — a read-modify-write of $2107 would
+; write a random value and the flip would silently not happen.
+vram_toggle:
+  lda $2a                 ; 0 = primary, 1 = alt
+  eor #$01
+  sta $2a
+  beq vt_pri              ; state now 0 -> show the primary tilemap
+  lda #${h(altScByte, 2)}   ; BG0SC SCBase window for the ALT tilemap
+  sta $2107
+  rts
+vt_pri:
+  lda #${h(scByte, 2)}     ; BG0SC SCBase window for the PRIMARY tilemap
+  sta $2107
+  rts
+`
+    : '';
+  // Zero-page $2a holds the toggle state (0 = primary, 1 = alt). `vram_load`
+  // zeroes it right after programming $2107=scByte, so the first `vram_toggle`
+  // call flips to the alt map. Emitted only when there IS an alt map — otherwise
+  // $2a is unused and the single-screen build stays byte-identical to before.
+  const flagInit = altMapBase
+    ? `  lda #0                   ; toggle state: 0 = primary (matches the $2107 above)\n  sta $2a\n`
+    : '';
 
   return `; --- PPU/VRAM bring-up glue (generated) -------------------------------
 ; Brings up BG0 and loads the compact ${dataName} into VRAM. Pure 8-bit mode.
@@ -262,7 +354,7 @@ vram_load:
   sta $212c
   lda #$80                 ; VMAIN: high + increment ($2118 no-inc, $2119 auto-inc)
   sta $2115
-  ; load the two data pointers (PEA pushes high first, so low pops first)
+${flagInit}  ; load the two data pointers (PEA pushes high first, so low pops first)
   pea vram_data
   pla
   sta $20                  ; data ptr lo
@@ -347,7 +439,14 @@ vram_done:
   lda #$0f
   sta $2100
   rts
-vram_blocks:
+; --- OS service routines (the program JSRs these — no PPU/SPU setup needed) ----
+; pad_read: A <- the raw pad byte ($4016). Buttons are active-LOW: a button is
+;   PRESSED when its bit is CLEAR (0). A=01 B=02 X=04 Y=08. To test button A:
+;   jsr pad_read / and #$01 / bne pressed.
+pad_read:
+  lda $4016
+  rts
+${toggle}vram_blocks:
 ${table}
   .byte $00, $00, $00      ; terminator
 vram_data:

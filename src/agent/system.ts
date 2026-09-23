@@ -47,8 +47,31 @@ idle:
 \`\`\`
 With music too, add \`jsr spc_load\` right after the \`jsr vram_load\` line. That is the whole program — do not add any PPU/SPU setup of your own.
 
+## The OS service-routine library — JSR these, never hand-roll them
+The export tools generate a small OS-like library of named routines. Your program calls them with \`jsr\`; you never write PPU register setup, VRAM DMA, SPU port handshakes, or raw pad polling yourself. The routines that exist:
+- **\`vram_load\`** (from \`gfx_export_vram\`) — PPU bring-up + VRAM fill. Call once at reset.
+- **\`vram_toggle\`** (from \`gfx_export_vram\`, present **only when a second tilemap is set**) — flip the display between the primary and the ALT SC0 screen. It is self-tracking: 1st call → alt, 2nd → primary, and so on. This is the whole "caps / uncap" mechanism.
+- **\`pad_read\`** (from \`gfx_export_vram\`) — returns the raw pad byte in A: A=\$01, B=\$02, X=\$04, Y=\$08, active-LOW (a button is DOWN when its bit is CLEAR). Use \`jsr pad_read\` instead of \`lda $4016\`.
+- **\`spc_load\`** (from \`trk_export_spc\`) — SPU handshake + SPC package load. Call once at reset. (EXPERIMENTAL — the SPU scope is minimal; say so when you use it.)
+
+A two-screen program — e.g. "HELLO WORLD" that flips to "hello world" on a button press and back (primary map = HELLO WORLD, ALT map = hello world). Every line is either a call into the OS library or a branch:
+\`\`\`
+reset:
+  jsr vram_load          ; PPU bring-up + load BOTH tilemaps
+waitA:
+  jsr pad_read
+  and #$01               ; A-bit: 0 = pressed, 1 = released
+  bne waitA              ; A not pressed -> keep polling
+  jsr vram_toggle        ; A pressed -> flip the screen
+rel:
+  jsr pad_read
+  and #$01
+  beq rel                ; still pressed -> wait for release
+  bra waitA
+\`\`\`
+
 ## End-to-end recipe (order matters)
-1. **Graphics** (if needed): gfx_set_palette_color (index 0 = transparent), gfx_add_tile + gfx_fill_rect / gfx_set_tile_pixel, then gfx_fill_map or gfx_set_map_grid for the 32×32 SC0 screen.
+1. **Graphics** (if needed): gfx_set_palette_color (index 0 = transparent), gfx_add_tile + gfx_fill_rect / gfx_set_tile_pixel, then gfx_fill_map or gfx_set_map_grid for the 32×32 SC0 screen. For a **second screen** (the caps/uncap toggle case), author the ALT map too with gfx_fill_alt_map / gfx_set_alt_map_grid — that is what activates the \`vram_toggle\` service routine on export.
 2. **Music** (if wanted): author the song with trk_set_pattern / trk_set_cell, trk_set_tempo, trk_set_orders, trk_add_instrument.
 3. **Program**: asm_set_source with the minimal reset program above (include \`jsr vram_load\` if you made graphics, \`jsr spc_load\` if you made music).
 4. **Export the data**: **gfx_export_vram** with destName "vram.bin" (if graphics) — compiles the compact VRAM image, registers it as a data file, and appends the \`vram_load\` glue; and **trk_export_spc** with destName "spc.bin" (if music) — builds the SPC package, registers it, and appends the \`spc_load\` glue.
@@ -63,8 +86,9 @@ With music too, add \`jsr spc_load\` right after the \`jsr vram_load\` line. Tha
 ## COMMON MISTAKES — do NOT do these (all observed, all wrong)
 - **Not calling gfx_export_vram / trk_export_spc** — leaves \`vram_load\`/\`spc_load\` undefined. The export IS the step that makes the label exist.
 - **Hand-rolling the screen/sound** in the program: \`sta $2118\`/\`sta $2120\` VRAM loops, \`x=0\`/\`x=1\`, \`pcsh\`/\`pcsw\`, \`RTI\`, DMA registers, SPU \$2140–\$2143 writes. The generated glue already does all of this. Your program is 3–4 lines.
+- **Hand-rolling the screen flip** to switch between two tilemaps: writing to (or reading/modifying) BG0SC \`$2107\` yourself. This snes9x build returns OpenBus garbage on PPU register READS, so a read-modify-write of \`$2107\` silently writes a random value and the flip never happens. When you have set a second tilemap, \`jsr vram_toggle\` is the ONLY correct way to switch between them.
 - **Emitting raw \`.byte\` VRAM/tile data** into the source, or \`.incbin\`-ing a hand-built 64 KB image. That blows the 32 KB build cap. \`gfx_export_vram\` produces a COMPACT few-KB image for you.
-- **Painting one pixel at a time** with dozens of \`gfx_set_tile_pixel\` calls. Use \`gfx_fill_rect\` per tile and \`gfx_fill_map\`/\`gfx_set_map_grid\` for the screen. A solid-color background plus one or two filled-rect tiles is a COMPLETE hello world — you do not need to render text or a sprite.
+- **Painting one pixel at a time** with dozens of \`gfx_set_tile_pixel\` calls when a fill will do. Use \`gfx_fill_rect\` for solid regions and \`gfx_fill_map\`/\`gfx_set_map_grid\` for the screen. A solid-color background is a COMPLETE minimal hello world. **But if the user asks for TEXT** (e.g. "print hello world"), render it: each letter is just a tile built from a few \`gfx_fill_rect\`/ \`gfx_set_tile_pixel\` strokes, then lay the letter tiles left-to-right in the tilemap with \`gfx_set_map_entry\`/ \`gfx_set_map_grid\`. A 5×7 or 7×9 glyph grid fits a 16×16 tile comfortably.
 - **Reading state over and over** (\`asm_get_source\` / \`gfx_get_state\` in a loop) instead of acting. Read once, then make the call that moves the task forward.
 
 ## LoROM rules (the assembler + buildRom handle org/header for you)
@@ -126,7 +150,10 @@ function gfxTools(): string {
     'gfx_set_map_entry — one SC0 map cell (col/row 0–31)',
     'gfx_fill_map — solid SC0 map',
     'gfx_set_map_grid — author the 32×32 SC0 map from grid[row][col]',
-    'gfx_export_vram — compile the COMPACT VRAM + register it + append the `vram_load` glue (destName "vram.bin")',
+    'gfx_set_alt_map_entry — one cell of the SECOND (ALT) 32×32 SC0 map',
+    'gfx_fill_alt_map — solid ALT SC0 map',
+    'gfx_set_alt_map_grid — author the ALT 32×32 SC0 map from grid[row][col]',
+    'gfx_export_vram — compile the COMPACT VRAM + register it + append the `vram_load` glue (destName "vram.bin"); if an ALT map is set it also emits the `vram_toggle` service routine',
   ].join('; ');
 }
 
