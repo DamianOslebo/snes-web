@@ -39,9 +39,35 @@ reply. **Stop** aborts the in-flight request.
 
 A step that Ollama rejects for a transient reason (a 5xx, a dropped tunnel
 response, or the model emitting a malformed tool-call that Ollama can't parse)
-is **retried up to 2 times** before the error surfaces — a failed step has no
+is **retried up to 12 times** before the error surfaces — a failed step has no
 side effects yet (nothing is dispatched or appended), so the retry just
-re-sends the identical conversation. Aborts are never retried.
+re-sends the identical conversation. A permanent rejection (a 4xx like a
+404 "model not found") is *not* retried — it fails fast on the first attempt
+with an actionable message. Aborts are never retried.
+
+## Step budget — it keeps working instead of making you type "continue"
+
+A real task is more than a handful of steps, so a single step **cap** is not a
+stop. Each send runs with a **per-batch checkpoint** (`maxTurns`, default 14):
+when the model has been acting for that many steps without replying, the loop
+doesn't end — it re-anchors it with a short "you're not done, keep going" nudge
+and continues. That removes the old "Stopped at the 14-step limit → send
+'continue'" dance: a mid-task checkpoint is transparent to you.
+
+What actually **ends** a run:
+
+- the model sends a real text reply (it's done),
+- the **total step budget** (`totalTurns`, default 150) is spent — the run
+  stops as `max-turns` and the panel offers "continue" to buy more steps,
+- a **spin** — the same step producing the same result with nothing changing
+  (3× in a row, or an A-B-A-B cycle). Legitimate repeats that *do* change
+  state (add a tile, then assemble…) never trip this, because the results
+  differ and so does the step signature,
+- **Stop** (you abort) — always wins, and is never auto-continued.
+
+To restore the old hard stop, set `totalTurns` equal to `maxTurns`.
+"continue" still works at any stop: it re-runs the loop over the existing
+history, so a budget-ended task picks up where it left off.
 
 ## Thinking (per-step latency)
 
@@ -99,8 +125,9 @@ the conversation (which is what gets sent to Ollama). Per send it records:
 - **assistant** — the model's reply;
 - **error** — a surfaced failure (e.g. the exact Ollama 500 text, a CORS
   error) and the phase it happened in;
-- **run-end** — how it stopped (`reply` / `max-turns` / `aborted`), the turn
-  count, total wall time, and **per-step metrics**: `modelMs` (that step's
+- **run-end** — how it stopped (`reply` = done; `max-turns` = the total step
+  budget was spent; `loop` = a spin was detected; `aborted` = you hit Stop),
+  the turn count, total wall time, and **per-step metrics**: `modelMs` (that step's
   `/api/chat` round trip, including any retries), `retries`, `retryErrors`
   (the failed attempt(s) that recovered — e.g. the XML-syntax error),
   `toolCalls`, and `toolMs` (controller dispatch time).

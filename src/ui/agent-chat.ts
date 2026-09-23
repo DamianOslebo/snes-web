@@ -636,7 +636,7 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
         if (res.stopped === 'max-turns' && res.finalContent.trim() === '') {
           items.push({
             kind: 'assistant',
-            text: `⏸ Stopped at the ${res.turns}-step limit mid-task. Send “continue” to pick up where I left off.`,
+            text: `⏸ I kept working and used my full ${res.turns}-step budget without finishing. Send “continue” to give me more steps and pick up where I left off.`,
           });
         }
         if (res.stopped === 'aborted') {

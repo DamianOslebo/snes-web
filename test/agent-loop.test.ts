@@ -157,13 +157,14 @@ describe('runAgent', () => {
     ]);
   });
 
-  it('stops after maxTurns tool-calling steps', async () => {
+  it('stops when the total step budget equals the batch limit (the old hard stop)', async () => {
     const { t, calls } = scripted([call('asm_get_source')]); // same tool call, forever
     const r = await runAgent({
       ...base,
       controllers: miniControllers().controllers,
       transport: t,
       maxTurns: 2,
+      totalTurns: 2,
     });
     expect(r.stopped).toBe('max-turns');
     expect(r.turns).toBe(2);
@@ -171,6 +172,75 @@ describe('runAgent', () => {
     const roles = r.messages.map((m) => m.role);
     expect(roles.filter((x) => x === 'assistant')).toHaveLength(2);
     expect(roles.filter((x) => x === 'tool')).toHaveLength(2);
+  });
+
+  it('auto-continues past the per-batch limit and finishes when the model completes', async () => {
+    // Six tool steps (crossing two 2-step batches) then a final reply. Under
+    // the old hard stop at maxTurns this would have required a manual
+    // "continue" after step 2; now it runs straight through to the reply.
+    const { t, calls } = scripted([
+      call('gfx_add_tile'),
+      call('gfx_set_map_entry', { col: 0, row: 0, tile: 0 }),
+      call('asm_set_source', { source: 'RTI\n' }),
+      call('asm_assemble'),
+      call('asm_build_rom'),
+      call('asm_run'),
+      reply('done'),
+    ]);
+    const r = await runAgent({
+      ...base,
+      controllers: miniControllers().controllers,
+      transport: t,
+      maxTurns: 2,
+      totalTurns: 50,
+    });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(6); // all six tool steps ran, not just the first 2
+    expect(calls).toHaveLength(7); // six tool steps + the final reply
+    // A checkpoint nudge (a user message that is not the original prompt) was
+    // injected between the batches so the model kept going on its own.
+    const nudges = r.messages.filter((m) => m.role === 'user' && m.content !== 'make a block game');
+    expect(nudges.length).toBe(3); // batch boundaries after steps 2, 4, and 6
+    expect(nudges.every((m) => typeof m.content === 'string' && m.content.includes('checkpoint'))).toBe(true);
+  });
+
+  it('stops at the total step budget when the model keeps acting (the safety valve)', async () => {
+    // The model keeps acting (no final reply) and every step is DIFFERENT
+    // (unique args → a distinct spin signature, so spin-detection never trips).
+    // The ONLY thing that can end this run is the total step budget.
+    let n = 0;
+    const t: Transport = {
+      post: async () => call('gfx_add_tile', { tile: n++ }),
+      get: async () => {
+        throw new Error('unexpected get()');
+      },
+    };
+    const r = await runAgent({
+      ...base,
+      controllers: miniControllers().controllers,
+      transport: t,
+      maxTurns: 3,
+      totalTurns: 6,
+    });
+    expect(r.stopped).toBe('max-turns');
+    expect(r.turns).toBe(6); // 2 auto-continued batches of 3, then the total budget
+  });
+
+  it('still stops on a spin even at a checkpoint (never auto-continues a loop)', async () => {
+    // The same call + result forever: with maxTurns:3 the spin fires on the
+    // very step that is also a checkpoint boundary — spin must win, and the
+    // run must NOT be auto-continued into more spinning.
+    const { t, calls } = scripted([call('asm_get_source')]);
+    const r = await runAgent({
+      ...base,
+      controllers: miniControllers().controllers,
+      transport: t,
+      maxTurns: 3,
+      totalTurns: 100,
+    });
+    expect(r.stopped).toBe('loop');
+    expect(r.turns).toBe(3); // 3 identical steps trip the spin check
+    expect(calls).toHaveLength(3);
   });
 
   it('an aborted in-flight request becomes stopped:"aborted" (no throw)', async () => {

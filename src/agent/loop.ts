@@ -6,8 +6,11 @@
  *   model replies → if it requested tool calls, run each in order (dispatched
  *   against `AgentControllers`), append the results as `role:"tool"` messages,
  *   and send the whole conversation back → repeat until the model answers with
- *   a plain text reply, hits `maxTurns`, is aborted, or is detected spinning
- *   (the same step producing the same result again and again).
+ *   a plain text reply, burns the total step budget, is aborted, or is detected
+ *   spinning (the same step producing the same result again and again). The
+ *   per-batch `maxTurns` is a "keep going" CHECKPOINT (auto-continued, with a
+ *   nudge), not a stop — so a long build keeps working without the user
+ *   typing "continue" after every 14 steps.
  *
  * Tool calls come from TWO sources, tried in order (see `./tool-protocol`):
  *   - native `message.tool_calls` (back-compat for models/transports that
@@ -48,6 +51,19 @@ import type { AgentControllers, Message } from './types';
  */
 const MALFORMED_MAX = 4;
 
+/**
+ * Nudge pushed into the wire history at each batch checkpoint (every
+ * `maxTurns` tool steps) so the run KEEPS GOING instead of making the user
+ * type "continue". Deliberately states the task is not over — the bare
+ * "continue" the user used to type let the model wander into a text-only
+ * reply (the `turns: 0` runs in the field logs); an explicit "not done, keep
+ * working" keeps it on task across what used to be a forced stop.
+ */
+const AUTO_CONTINUE_NUDGE =
+  'Step checkpoint reached — the task is NOT finished and you are NOT at a hard limit, so keep going. ' +
+  'Call the tools you still need to complete the task. ' +
+  'Only stop and give a short summary once the task is actually complete.';
+
 /** UI events, in order, as the loop progresses. */
 export type AgentEvent =
   | { type: 'thinking' }
@@ -65,8 +81,21 @@ export interface RunAgentOptions {
   messages: Message[];
   controllers: AgentControllers;
   transport?: Transport;
-  /** Max tool-calling steps before the loop stops (default 14). */
+  /**
+   * Steps per batch. Every `maxTurns` tool-calling steps is a CHECKPOINT, not a
+   * stop: the loop re-anchors the model (a nudge) and keeps going. This is what
+   * lets a long build run to completion without the user typing "continue"
+   * after every 14 steps. Default 14.
+   */
   maxTurns?: number;
+  /**
+   * Hard cap on TOTAL tool-calling steps across all auto-continued batches —
+   * the real "I'm out of budget" stop (a clean reply, a spin, or an abort end
+   * the run sooner). Generous by default so a normal multi-step ROM build
+   * finishes in one run. Set equal to `maxTurns` to restore the old hard stop.
+   * Default 150.
+   */
+  totalTurns?: number;
   /** Ollama `think` toggle for models that support it; `undefined` = model default. */
   think?: boolean;
   /**
@@ -118,8 +147,10 @@ export interface RunAgentResult {
   /** Tool-calling steps actually taken. */
   turns: number;
   /**
-   * Why the loop stopped: a plain-text reply, the step budget, a user Stop,
-   * or a detected spin (same step + same result, no progress).
+   * Why the loop stopped: a plain-text reply, the TOTAL step budget, a user
+   * Stop, or a detected spin (same step + same result, no progress).
+   * `'max-turns'` = the total budget was burned (the per-batch `maxTurns`
+   * checkpoint auto-continues and does not stop on its own).
    */
   stopped: 'reply' | 'max-turns' | 'aborted' | 'loop';
   /** Wall time of the whole run (thinking → final answer), in ms. */
@@ -314,6 +345,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     controllers,
     transport = fetchTransport,
     maxTurns = 14,
+    totalTurns = 150,
     think,
     retries = 12,
     retryDelayMs = 400,
@@ -326,6 +358,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   let messages: Message[] = [{ role: 'system', content: system }, ...opts.messages];
   const startedAt = Date.now();
   let turns = 0;
+  let batchTurns = 0; // tool-calling steps since the last (auto) checkpoint
   let stopped: RunAgentResult['stopped'] = 'max-turns';
   let finalContent = '';
   const perStep: StepMetrics[] = [];
@@ -458,15 +491,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     }
     perStep.push({ index: stepIndex, modelMs, retries: outcome.retries, retryErrors: outcome.retryErrors, toolCalls: calls.length, toolMs });
 
-    if (++turns >= maxTurns) {
-      stopped = 'max-turns';
-      break;
-    }
+    turns += 1;
+    batchTurns += 1;
 
-    // Spin detection: the same calls producing the same results, three times
-    // in a row, or an A-B-A-B cycle. Identical RESULTS are the key — a tool
-    // legitimately called twice (add a tile, assemble…) usually changes
-    // something, so its signature differs and it never trips this.
+    // Spin detection FIRST: the same calls producing the same results, three
+    // times in a row, or an A-B-A-B cycle. Identical RESULTS are the key — a
+    // tool legitimately called twice (add a tile, assemble…) usually changes
+    // something, so its signature differs and it never trips this. Checked
+    // before the checkpoint so a spin right at a batch boundary is stopped,
+    // not auto-continued into more spin.
     sigs.push(stepSignature(calls, results));
     if (sigs.length > 4) sigs.shift();
     const repeats = sigs.length >= 3 && sigs[0] === sigs[1] && sigs[1] === sigs[2];
@@ -480,6 +513,23 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       messages.push({ role: 'user', content: 'That step just repeated with the same result and made no progress. Do NOT repeat it — change your approach: fix the failing part, try a different tool, or re-plan the task.' });
       stopped = 'loop';
       break;
+    }
+
+    // Batch checkpoint — this is NOT a stop. The model is mid-task and still
+    // acting, so re-anchor it and keep going instead of making the user type
+    // "continue" after every 14 steps. Only the TOTAL budget (or a clean
+    // reply, a spin, or an abort) ends the run. The nudge exists because a
+    // bare "continue" let models stall into a text-only reply (the turns:0
+    // runs in the field logs); saying "not done, keep going" keeps them on
+    // task across what used to be a forced stop.
+    if (batchTurns >= maxTurns) {
+      if (turns >= totalTurns) {
+        stopped = 'max-turns';
+        break;
+      }
+      messages.push({ role: 'user', content: AUTO_CONTINUE_NUDGE });
+      batchTurns = 0;
+      continue;
     }
   }
 
