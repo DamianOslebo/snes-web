@@ -64,6 +64,25 @@ const AUTO_CONTINUE_NUDGE =
   'Call the tools you still need to complete the task. ' +
   'Only stop and give a short summary once the task is actually complete.';
 
+/**
+ * Forward-looking "intent" phrasing — the model announcing it is ABOUT TO do
+ * something rather than reporting it is done. A text-only reply (no tool call)
+ * that matches this is a "narration stall": the model said "now I'll build the
+ * tiles" but emitted NO tool call, expecting to keep going. That used to end
+ * the run (`stopped:reply`, turns:0), forcing the user to type "continue" to
+ * make it actually do the work it described. We nudge it ONCE to call the
+ * tools. A genuine completion ("the ROM is built", "done") does not match this,
+ * so it stops immediately with no extra round-trip.
+ */
+const INTENT_NUDGE_RE =
+  /\b(i'?ll|i will|let me|let'?s|about to|going to|i'?m about to|i'?m going to)\b/i;
+
+/** Nudge pushed when the model narrates the next step but calls no tool. */
+const INTENT_NUDGE =
+  'You described the next step but did not call a tool, so nothing actually happened yet. ' +
+  'Call the tools now to do the work you just described — for example build the tiles, set the tilemap, assemble, and build the ROM. ' +
+  'Only stop and give a short summary once the task is actually complete.';
+
 /** UI events, in order, as the loop progresses. */
 export type AgentEvent =
   | { type: 'thinking' }
@@ -365,6 +384,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   let trimRounds = 0; // context-trims tried for the current step (reset on success)
   let emptyStreak = 0; // consecutive empty replies (a nudge is allowed, not a loop)
   let malformedStreak = 0; // consecutive malformed tool-call replies (nudged, not failed)
+  let intentStreak = 0; // consecutive "I'll do X" text replies with no tool call (nudged, then stopped)
   const sigs: string[] = []; // recent step signatures, for spin detection
 
   for (;;) {
@@ -472,11 +492,38 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       }
       emptyStreak = 0;
       perStep.push({ index: stepIndex, modelMs, retries: outcome.retries, retryErrors: outcome.retryErrors, toolCalls: 0, toolMs: 0 });
+
+      // A NON-empty text reply is normally the model's final answer — but the
+      // field logs showed it is often a "narration stall": the model said
+      // "now I'll build the tiles" and called NO tool, so the run ended at
+      // turns:0 and the user had to type "continue" to make it act. Forward
+      // intent (INTENT_NUDGE_RE) gets ONE nudge to actually call the tools;
+      // a second such stall with no tool call in between stops the run. A
+      // genuine completion ("the ROM is built", "done") never matches, so it
+      // stops immediately with no extra round-trip.
+      if (INTENT_NUDGE_RE.test(reply.content)) {
+        if (intentStreak >= 1) {
+          const note = 'The model described the next step but did not call a tool to do it, so I stopped. Send "continue" to make it act from here, or tell me what to change.';
+          finalContent = note;
+          onEvent?.({ type: 'message', content: reply.content });
+          onEvent?.({ type: 'message', content: note });
+          // Leave a nudge in the wire history so a "continue" carries the reason.
+          messages.push({ role: 'user', content: 'You described the next step but did not call a tool. Call the tool(s) now to do the work you described — do not just describe it again.' });
+          stopped = 'reply';
+          break;
+        }
+        intentStreak += 1;
+        onEvent?.({ type: 'message', content: reply.content });
+        messages.push({ role: 'user', content: INTENT_NUDGE });
+        continue;
+      }
+
       onEvent?.({ type: 'message', content: reply.content });
       stopped = 'reply';
       break;
     }
     emptyStreak = 0;
+    intentStreak = 0; // a tool call ran — acting again, so the intent streak resets
 
     let toolMs = 0;
     const results: { ok: boolean; content: string }[] = [];

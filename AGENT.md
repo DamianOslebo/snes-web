@@ -56,7 +56,8 @@ and continues. That removes the old "Stopped at the 14-step limit → send
 
 What actually **ends** a run:
 
-- the model sends a real text reply (it's done),
+- the model sends a real text reply (it's done) — *unless* it is a
+  "narration stall" (it described work but called no tool; see below),
 - the **total step budget** (`totalTurns`, default 150) is spent — the run
   stops as `max-turns` and the panel offers "continue" to buy more steps,
 - a **spin** — the same step producing the same result with nothing changing
@@ -68,6 +69,21 @@ What actually **ends** a run:
 To restore the old hard stop, set `totalTurns` equal to `maxTurns`.
 "continue" still works at any stop: it re-runs the loop over the existing
 history, so a budget-ended task picks up where it left off.
+
+## No stalling after narrating ("Now I'll build the tiles…")
+
+Field logs showed the model replying with the *next step* — "Now I'll build
+the letter tiles. Let me start…" — while calling **no tool**. That used to
+end the run as if it were done (`turns: 0`), and the only way to make it do
+the work it described was to type "continue". Forward-looking intent replies
+("I'll…", "let me…", "about to…") that carry no tool call now get **one
+nudge**: "you described the next step but did not call a tool — call it
+now". If the model then calls a tool, the run proceeds, and the stall streak
+resets (so a later mid-task narration gets its own nudge). A *second
+consecutive* stall — two tool-less "I'll…" replies back to back — stops the
+run with a visible note. Bounded, never loops. A genuine completion
+("the ROM is built", "done") never matches the intent pattern, so it stops
+immediately with no extra round-trip.
 
 ## Thinking (per-step latency)
 

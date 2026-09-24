@@ -741,3 +741,66 @@ describe('empty replies', () => {
     expect(r.messages.some((m) => m.role === 'user' && /empty/i.test(m.content))).toBe(true);
   });
 });
+
+describe('narration stalls (intent text, no tool call)', () => {
+  it('does not end the run on "I\'ll do X" — nudges once, the model then acts', async () => {
+    // The field-log failure: the model says "Now I'll build the letter tiles"
+    // with NO tool call, and the old loop treated that as a final reply
+    // (turns:0), forcing the user to type "continue".
+    const { t } = scripted([
+      reply("Now I'll build the letter tiles. Let me start by creating the blank tile and the letter tiles."),
+      call('gfx_add_tile', { tile: 0 }),
+      call('gfx_set_map_entry', { x: 0, y: 0, tile: 1 }),
+      reply('The ROM is built and running. Done!'),
+    ]);
+    const events: AgentEvent[] = [];
+    const r = await runAgent({
+      ...base,
+      controllers: miniControllers().controllers,
+      transport: t,
+      retryDelayMs: 0,
+      onEvent: (e) => events.push(e),
+    });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(2); // it went on to ACT, instead of stopping at 0
+    expect(r.finalContent).toBe('The ROM is built and running. Done!');
+    // Exactly one "go do it" nudge was left in the wire history.
+    const nudges = r.messages.filter((m) => m.role === 'user' && /nothing actually happened yet/i.test(m.content));
+    expect(nudges).toHaveLength(1);
+    // The model's narration was still shown to the user (not swallowed).
+    expect(events.some((e) => e.type === 'message' && /Now I'll build the letter tiles/.test((e as { content: string }).content))).toBe(true);
+  });
+
+  it('stops after a second consecutive stall, with a visible note', async () => {
+    const { t } = scripted([
+      reply("I'll build the letter tiles now."),
+      reply('Let me create them. I\'ll start with the H glyph.'),
+    ]);
+    const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 });
+    expect(r.stopped).toBe('reply');
+    expect(r.finalContent).toMatch(/did not call a tool/i);
+    // One nudge, then the stop — bounded, no infinite ping-pong.
+    const nudges = r.messages.filter((m) => m.role === 'user' && /nothing actually happened yet/i.test(m.content));
+    expect(nudges).toHaveLength(1);
+    // A "continue" carries the reason, not just the word.
+    expect(r.messages.some((m) => m.role === 'user' && /do not just describe it again/i.test(m.content))).toBe(true);
+  });
+
+  it('resets the stall streak after the model acts (each narration episode gets one nudge)', async () => {
+    const { t } = scripted([
+      reply("I'll build the letter tiles now."),
+      call('gfx_add_tile', { tile: 1 }),
+      reply('Tiles set. Now I\'ll place them on the tilemap.'),
+      call('gfx_set_map_entry', { x: 0, y: 0, tile: 1 }),
+      reply('The ROM is built and running. Done!'),
+    ]);
+    const r = await runAgent({ ...base, controllers: miniControllers().controllers, transport: t, retryDelayMs: 0 });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(2);
+    expect(r.finalContent).toBe('The ROM is built and running. Done!');
+    // BOTH narrations were nudged (not stopped), because a tool call ran in
+    // between — the streak is per-consecutive-episode, not once per run.
+    const nudges = r.messages.filter((m) => m.role === 'user' && /nothing actually happened yet/i.test(m.content));
+    expect(nudges).toHaveLength(2);
+  });
+});
