@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { classifyError, runAgent, type AgentEvent } from '../src/agent/loop';
-import type { Transport } from '../src/agent/ollama';
+import type { StreamChunk, Transport } from '../src/agent/ollama';
 import type {
   AgentControllers,
   AsmController,
@@ -802,5 +802,90 @@ describe('narration stalls (intent text, no tool call)', () => {
     // between — the streak is per-consecutive-episode, not once per run.
     const nudges = r.messages.filter((m) => m.role === 'user' && /nothing actually happened yet/i.test(m.content));
     expect(nudges).toHaveLength(2);
+  });
+});
+
+describe('truncated tool calls (a reply cut off mid-JSON)', () => {
+  it('a fragment like `[{"` (no "tool": keyword yet) is NUDGED, not a terminal reply', async () => {
+    // The field log: runs ended stopped:'reply' with the final assistant text
+    // being `[{"` — a streamed tool call cut off before any keyword arrived.
+    // The unbalanced opening bracket is now the "it tried to call a tool"
+    // marker, so the loop asks for a valid call and KEEPS GOING instead of
+    // stopping on the fragment (which forced the user to type "continue").
+    const { t } = scripted([
+      reply('[{"'),
+      call('gfx_add_tile', { tile: 0 }),
+      reply('The ROM is built. Done.'),
+    ]);
+    const r = await runAgent({
+      ...base,
+      controllers: miniControllers().controllers,
+      transport: t,
+      retryDelayMs: 0,
+    });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(1); // it went on to ACT, instead of stopping on the fragment
+    expect(r.finalContent).toBe('The ROM is built. Done.');
+    // The malformed-call nudge ("did not parse") was left in the wire history.
+    expect(r.messages.some((m) => m.role === 'user' && /did not parse/i.test(m.content))).toBe(true);
+  });
+
+  it('a stream that ends WITHOUT the done chunk is RETRIED, never a final reply', async () => {
+    // The transport-level failure: the tunnel drops the tail of the response,
+    // the body stream ends cleanly (no network error) but WITHOUT Ollama's
+    // `done` chunk, leaving a half tool-call (`[{"tool":"gfx_add`). That is a
+    // retryable step failure — the loop re-sends and the run completes — not
+    // an accepted answer that ends the run.
+    let attempt = 0;
+    const t: Transport = {
+      post: async () => {
+        throw new Error('test: post should not be used (postStream present)');
+      },
+      get: async () => {
+        throw new Error('test: get not used here');
+      },
+      postStream: async (_url, _body, onChunk) => {
+        attempt += 1;
+        if (attempt === 1) {
+          onChunk({ content: '[{"tool":"gfx_add' } as StreamChunk); // tail dropped — no done
+        } else if (attempt === 2) {
+          onChunk({ content: '{"tool":"gfx_add_tile","args":{"tile":0}}' } as StreamChunk);
+          onChunk({ done: true } as StreamChunk);
+        } else {
+          onChunk({ content: 'The ROM is built. Done.' } as StreamChunk);
+          onChunk({ done: true } as StreamChunk);
+        }
+      },
+    };
+    const r = await runAgent({
+      ...base,
+      controllers: miniControllers().controllers,
+      transport: t,
+      retryDelayMs: 0,
+    });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(1);
+    expect(r.finalContent).toBe('The ROM is built. Done.');
+    expect(attempt).toBe(3);
+    // The truncated first attempt was RECOVERED as a retry on the same step.
+    expect(r.perStep[0].retries).toBe(1);
+    expect(r.perStep[0].retryErrors.join(' ')).toMatch(/done|cut short/i);
+  });
+
+  it('still stops cleanly on a second truncated fragment (bounded, not a loop)', async () => {
+    // If the model genuinely keeps emitting broken JSON (a complete stream —
+    // done chunk present — with unbalanced brackets), the malformed path
+    // nudges a bounded number of times and then stops with a visible note,
+    // exactly like any other malformed-call episode.
+    const { t } = scripted([reply('[{"'), reply('[{"')]);
+    const r = await runAgent({
+      ...base,
+      controllers: miniControllers().controllers,
+      transport: t,
+      retryDelayMs: 0,
+    });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(0);
+    expect(r.finalContent).toMatch(/did not parse/i);
   });
 });

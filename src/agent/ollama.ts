@@ -246,6 +246,14 @@ function finalize(content: string, nativeCalls: ToolCall[] | undefined): Message
  * signal) is rethrown as-is so the loop can treat it as an abort; an idle
  * expiry is rethrown as a retryable TimeoutError so the loop backs off and
  * retries patiently.
+ *
+ * COMPLETENESS: Ollama ends every clean stream with a final `{"done": true}`
+ * chunk. If the body stream simply ENDS without it, the tail of the response
+ * was dropped in transit (a tunnel/server close mid-stream) — the accumulated
+ * text is a TRUNCATION, not an answer. That is surfaced as a retryable error
+ * (the loop re-sends the step), never as a successful reply: a truncated tool
+ * call like `[{"tool":"gfx_add` used to be accepted as the final reply and
+ * silently end the run, forcing a "continue" that just re-truncated.
  */
 async function streamCollect(
   transport: Transport,
@@ -256,6 +264,7 @@ async function streamCollect(
 ): Promise<{ content: string; nativeCalls: ToolCall[] | undefined }> {
   const parts: string[] = [];
   let nativeCalls: ToolCall[] | undefined;
+  let sawDone = false; // Ollama's "the stream is finished" chunk
   const ctrl = new AbortController();
   let idleFired = false;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -291,6 +300,7 @@ async function streamCollect(
         if (c.error) {
           throw new Error(typeof c.error === 'string' ? c.error : JSON.stringify(c.error));
         }
+        if (c.done === true) sawDone = true;
         const s = chunkText(c);
         if (s !== '') parts.push(s);
         if (c.message && c.message.tool_calls) nativeCalls = parseToolCalls(c.message.tool_calls);
@@ -298,6 +308,22 @@ async function streamCollect(
       armIdle();
     }, ctrl.signal);
     clearIdle();
+
+    // The stream ENDED but Ollama never sent its `done` chunk: the response
+    // tail (often the model's tool call) was dropped mid-flight. A user abort
+    // is NOT this — it rethrows as an abort, never as a "truncated reply".
+    if (signal?.aborted) {
+      const e = new Error('aborted');
+      e.name = 'AbortError';
+      throw e;
+    }
+    if (!sawDone) {
+      throw new Error(
+        'the response stream ended before Ollama sent its "done" chunk — the reply was cut short ' +
+          'in transit (a dropped tunnel or server close mid-stream), so the text is likely incomplete',
+      );
+    }
+
     return { content: parts.join(''), nativeCalls };
   } catch (err) {
     clearIdle();

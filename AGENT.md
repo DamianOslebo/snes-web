@@ -38,12 +38,27 @@ Each step the model may request tools; the panel shows a tool chip per call
 reply. **Stop** aborts the in-flight request.
 
 A step that Ollama rejects for a transient reason (a 5xx, a dropped tunnel
-response, or the model emitting a malformed tool-call that Ollama can't parse)
-is **retried up to 12 times** before the error surfaces — a failed step has no
-side effects yet (nothing is dispatched or appended), so the retry just
-re-sends the identical conversation. A permanent rejection (a 4xx like a
+response, **the response stream ending mid-answer** — Ollama never sent its
+`done` chunk, so the reply was cut off in transit — or the model emitting a
+malformed tool-call that Ollama can't parse) is **retried up to 12 times**
+before the error surfaces — a failed step has no side effects yet (nothing is
+dispatched or appended), so the retry just re-sends the identical conversation.
+A permanent rejection (a 4xx like a
 404 "model not found") is *not* retried — it fails fast on the first attempt
 with an actionable message. Aborts are never retried.
+
+**A half answer is never an answer.** Two guards make sure a truncated tool
+call can never be mistaken for the model finishing:
+
+- **Stream completeness** — Ollama ends every clean stream with a final
+  `{"done": true}` chunk. A stream that simply *ends* without it had its tail
+  dropped (tunnel/server close), so it is a retryable step failure, never a
+  successful reply.
+- **The reply itself** — a reply whose JSON is cut off mid-flight (an
+  unbalanced opening bracket — `[{"`, `[{"tool`, `{"tile":3,…`) is
+  classified as a malformed tool call and gets the "reply with ONE valid JSON
+  object" nudge, bounded like any other malformed episode. A genuine prose
+  summary never trips either check.
 
 ## Step budget — it keeps working instead of making you type "continue"
 

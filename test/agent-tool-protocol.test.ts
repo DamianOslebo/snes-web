@@ -94,6 +94,43 @@ describe('parseToolReply — the structured tool-call protocol', () => {
     expect(p.kind).toBe('malformed');
   });
 
+  // The field-log truncations: a streamed tool call cut off BEFORE any `"tool":`
+  // keyword arrives. An UNBALANCED opening bracket is the marker — a clean
+  // reply never leaves one dangling, so these must not be read as final answers.
+  it('flags a stream truncated to just `[{"` as malformed (not a clean reply)', () => {
+    const p = parseToolReply('[{"');
+    expect(p.kind).toBe('malformed');
+    expect(p.calls).toEqual([]);
+  });
+
+  it('flags a stream truncated mid-key (`[{"tool`) as malformed', () => {
+    const p = parseToolReply('[{"tool');
+    expect(p.kind).toBe('malformed');
+    expect(p.calls).toEqual([]);
+  });
+
+  it('flags a single-call JSON cut off mid-args as malformed', () => {
+    const p = parseToolReply('{"tile":3,"x0":2');
+    expect(p.kind).toBe('malformed');
+    expect(p.calls).toEqual([]);
+  });
+
+  it('still reads a BALANCED JSON object as a reply when it is not a call', () => {
+    // Guard against the unbalanced-bracket check misfiring: balanced brackets
+    // in a clean reply must not make it malformed.
+    const p = parseToolReply('The map is [32, 32] cells; each tile is 16x16.');
+    expect(p.kind).toBe('reply');
+    expect(p.calls).toEqual([]);
+  });
+
+  it('still reads a complete call embedded in prose as a call', () => {
+    // A well-formed call with balanced brackets parses even with prose around
+    // it — the unbalanced check only ever adds malformed, never hides a call.
+    const p = parseToolReply('next step: {"tool":"asm_assemble","args":{}}');
+    expect(p.kind).toBe('call');
+    expect(p.calls).toEqual([{ name: 'asm_assemble', args: {} }]);
+  });
+
   it('classifies a lone JSON null as a clean reply, not a call', () => {
     expect(parseToolReply('null').kind).toBe('reply');
   });

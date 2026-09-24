@@ -9,6 +9,7 @@ import {
   parseArgs,
 } from '../src/agent/ollama';
 import type { StreamChunk, Transport } from '../src/agent/ollama';
+import { classifyError } from '../src/agent/loop';
 import type { Message, ToolSpec } from '../src/agent/types';
 
 /** A recording fake: answers via `responder`, records every request. */
@@ -290,9 +291,26 @@ describe('chatOnce — streaming (postStream)', () => {
         await wait(30);
         emit({ content: piece });
       }
+      emit({ done: true }); // Ollama's completion chunk — a clean stream always ends with it
     });
     const m = await chatOnce('http://h', 'm', [], [], t, undefined, false, 4_000);
     expect(m).toEqual({ role: 'assistant', content: 'abcd' });
+  });
+
+  it('a stream that ENDS without the done chunk is a truncation error, not a reply', async () => {
+    // The field failure: the tunnel drops the tail of the response, the body
+    // stream ends cleanly, and the partial text — a tool call cut mid-JSON
+    // (`[{"tool":"gfx_add`) — used to be returned as a successful reply and
+    // silently end the run. Now it must fail as a RETRYABLE error so the loop
+    // re-sends the step instead of accepting a half-answer.
+    const { t } = streamFake(async (emit) => {
+      emit({ content: '[{"tool":"gfx_add' }); // then the stream just… ends
+    });
+    const err = await chatOnce('http://h', 'm', [], [], t).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/done.{0,40}chunk|cut short/i);
+    // And the loop's classifier must call that retryable — never permanent.
+    expect(classifyError(err)).toBe('retryable');
   });
 
   it('propagates a mid-stream `error` chunk (e.g. the model/worker died)', async () => {

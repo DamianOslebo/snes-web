@@ -142,6 +142,35 @@ const TOOL_INTENT =
   /"tool"\s*:|"function"\s*:|"arguments"\s*:|"args"\s*:|tool_calls|<\s*\/?\s*function\b|<\s*\/?\s*parameter\b/i;
 
 /**
+ * True when `text` has an opening bracket (`{` or `[`, outside a string
+ * literal) whose matching close never arrives — a JSON payload cut off
+ * mid-flight, i.e. a truncated stream. This is the second "it clearly tried
+ * to call a tool" marker: field logs showed replies of `[{"` and `[{"tool`
+ * that carry NO `"tool":` keyword (the colon never arrived) and so were read
+ * as clean final answers, ending the run. A genuine prose reply never leaves
+ * a bracket dangling, so this cannot misfire on one. Stray CLOSING brackets
+ * in prose do not count (the depth never goes negative).
+ */
+function unbalancedOpen(text: string): boolean {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{' || c === '[') depth += 1;
+    else if ((c === '}' || c === ']') && depth > 0) depth -= 1;
+  }
+  return depth > 0;
+}
+
+/**
  * Classify a model reply. `content` is the assistant's text (already the full,
  * accumulated message). Never throws.
  */
@@ -175,8 +204,11 @@ export function parseToolReply(content: string): ParsedReply {
     if (calls) return { kind: 'call', calls, text: raw };
   }
 
-  // 3) No valid call. A strong tool-attempt marker means "malformed";
-  //    otherwise this is a clean final answer.
-  if (TOOL_INTENT.test(raw)) return { kind: 'malformed', calls: [], text: raw };
+  // 3) No valid call. A strong tool-attempt marker means "malformed"; an
+  //    UNBALANCED opening bracket is the other one (a JSON payload cut off
+  //    mid-flight — the `[{"` / `[{"tool` truncations from the field logs,
+  //    which carry no `"tool":` keyword and used to end the run as a "reply").
+  //    Otherwise this is a clean final answer.
+  if (TOOL_INTENT.test(raw) || unbalancedOpen(raw)) return { kind: 'malformed', calls: [], text: raw };
   return { kind: 'reply', calls: [], text: raw };
 }
