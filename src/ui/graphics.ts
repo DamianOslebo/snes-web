@@ -1301,7 +1301,7 @@ function buildSpritesPane(): HTMLElement {
   // The 128-slot OAM table (scrollable).
   const tblSec = el('div', 'sp-section');
   tblSec.appendChild(el('h3', '', 'OAM slots (128)'));
-  tblSec.appendChild(el('p', 'muted', 'Size is global (the selector above). 8×8 = one char, any index. 16×16 = a 2×2 char block: the tile is its TOP-LEFT char, so it must sit on an even char row AND even char column (0, 2, 16, 18, 32, …). x/y are the top-left screen pixel. Positions are static — OAM loads once, so a moving sprite re-calls oam_load.'));
+  tblSec.appendChild(el('p', 'muted', 'Size is global (the selector above). 8×8 = one char, any index. 16×16 = a 2×2 char block: the tile is its TOP-LEFT char, which must sit on an even char column (0, 2, 4, … — tile % 2 == 0, any row). The SNES lays 8×8 chars out 16 per row, so the block is (tile, tile+1, tile+16, tile+17) — paint all four chars. x/y are the top-left screen pixel. Positions are static — OAM loads once, so a moving sprite re-calls oam_load.'));
   const wrap = el('div', 'oam-wrap');
   const tbl = el('table', 'oam-tbl');
   const thead = el('thead', '');
