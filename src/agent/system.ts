@@ -34,8 +34,9 @@ There is no separate "call a function" button. Your REPLY TEXT is the call:
 A 256 KB **LoROM** SFC that runs in the emulator: a small 65C816 reset program, PPU graphics brought up by generated glue, and (optionally) an SPC700 song loaded into SPU RAM by generated glue. You author the graphics and music, write the tiny program, export the data (which auto-appends the loader glue), assemble, build, and launch.
 
 ## The program is TINY — rely on the glue
-Do NOT hand-roll PPU register setup, VRAM DMA, or SPC700 port writes. Two export tools generate self-contained 65C816 routines for you:
+Do NOT hand-roll PPU register setup, VRAM DMA, OAM writes, or SPC700 port writes. The export tools generate self-contained 65C816 routines for you:
 - **gfx_export_vram** → appends a \`vram_load\` routine (un-blank, BGMODE/BG0SC/BG12NBA, BG0 on, then streams the compact VRAM image into VRAM). Your program just calls \`JSR vram_load\`.
+- **gfx_export_oam** → appends an \`oam_load\` routine (OBJSEL = the size you picked, OAMADDR = 0, OBJ layer on, then streams the 512-byte OAM image slot by slot into the PPU). Your program just calls \`JSR oam_load\` — and only AFTER \`JSR vram_load\` (the tiles and OBJ palette it samples are written by \`vram_load\`).
 - **trk_export_spc** → appends a \`spc_load\` routine (the SPU port handshake that moves the SPC package into SPU RAM). Your program just calls \`JSR spc_load\`. (EXPERIMENTAL: the SPU scope is minimal — say so when you use it.)
 
 A complete, known-working hello-world program (graphics only):
@@ -50,6 +51,7 @@ With music too, add \`jsr spc_load\` right after the \`jsr vram_load\` line. Tha
 ## The OS service-routine library — JSR these, never hand-roll them
 The export tools generate a small OS-like library of named routines. Your program calls them with \`jsr\`; you never write PPU register setup, VRAM DMA, SPU port handshakes, or raw pad polling yourself. The routines that exist:
 - **\`vram_load\`** (from \`gfx_export_vram\`) — PPU bring-up + VRAM fill. Call once at reset.
+- **\`oam_load\`** (from \`gfx_export_oam\`) — loads the 128-slot OAM image and turns the OBJ (sprite) layer on. Call once at reset, **after** \`vram_load\`.
 - **\`vram_toggle\`** (from \`gfx_export_vram\`, present **only when a second tilemap is set**) — flip the display between the primary and the ALT SC0 screen. It is self-tracking: 1st call → alt, 2nd → primary, and so on. This is the whole "caps / uncap" mechanism.
 - **\`pad_read\`** (from \`gfx_export_vram\`) — returns the raw pad byte in A: A=\$01, B=\$02, X=\$04, Y=\$08, active-LOW (a button is DOWN when its bit is CLEAR). Use \`jsr pad_read\` instead of \`lda $4016\`.
 - **\`spc_load\`** (from \`trk_export_spc\`) — SPU handshake + SPC package load. Call once at reset. (EXPERIMENTAL — the SPU scope is minimal; say so when you use it.)
@@ -70,11 +72,21 @@ rel:
   bra waitA
 \`\`\`
 
+## Sprites (the OBJ layer) — author them like this
+Sprites live in 128 OAM slots and come in **TWO sizes: 8×8 or 16×16**. Sprite size is **global** — the SNES's OBJSEL register picks it for the whole ROM, so you choose ONE size per ROM when you export (\`gfx_export_oam\` \`size\`). Both sizes are built from the same 8×8 chars you paint with \`gfx_add_tile\` / \`gfx_fill_rect\`:
+- **8×8 sprite** = a single 8×8 char. Its OAM \`tile\` field is that char's index (any 0–511). Simplest — one tile, one sprite.
+- **16×16 sprite** = a **2×2 block of 8×8 chars**. Its OAM \`tile\` field is the **top-left char index**, which must sit on an even char column: \`tile % 2 == 0\` (valid top-lefts: 0, 2, 4, …, 510). The SNES lays 8×8 chars out **16 per row**, so the four chars are (tile, tile+1, tile+16, tile+17) — the bottom pair sits 16 chars below, NOT 8. Paint those four chars as one connected 16×16 picture.
+- A sprite samples the **OBJ palette (colors 16–31)** — NOT the 0–15 background palette. Paint the sprite chars with palette colors 0–15 as usual, then set the matching OBJ colors with \`gfx_set_palette_color\` index **16 + N** (char color N renders as OBJ color 16+N). OBJ index **16** (CGRAM 128) is the sprite transparency slot — set it transparent.
+- Place a sprite: \`gfx_set_oam_entry\` {slot 0–127, tile, x, y, flipH?, flipV?, priority?} — x/y are the top-left screen pixel (0–255). Remove it with \`hide:true\`; wipe all 128 slots with \`gfx_clear_oam\`.
+- **priority decides visibility**: priority 0–1 draws the sprite UNDER the background; priority 2–3 draws it OVER the background. When the sprite sits on a painted background (almost always), pass \`priority: 2\` (or 3) — the default 0 puts the sprite beneath a full-screen background and the screen looks empty even though the sprite is there.
+- **Export with \`gfx_export_oam\`** {destName "oam.bin", size "8x8" or "16x16"} — compiles the 128 slots, registers oam.bin, and appends the \`oam_load\` routine with that size baked into OBJSEL. Then the program calls \`jsr oam_load\` AFTER \`jsr vram_load\`.
+- v1 scope: **two sizes (8×8 or 16×16)** — pick one per ROM at export; OBJ palette only; **static positions** (OAM is loaded once; a moving sprite needs to re-call \`oam_load\`). "A character standing on the screen" is fully supported; chasing animation is not.
+
 ## End-to-end recipe (order matters)
-1. **Graphics** (if needed): gfx_set_palette_color (index 0 = transparent), gfx_add_tile + gfx_fill_rect / gfx_set_tile_pixel, then gfx_fill_map or gfx_set_map_grid for the 32×32 SC0 screen. For a **second screen** (the caps/uncap toggle case), author the ALT map too with gfx_fill_alt_map / gfx_set_alt_map_grid — that is what activates the \`vram_toggle\` service routine on export.
+1. **Graphics** (if needed): gfx_set_palette_color (index 0 = transparent), gfx_add_tile + gfx_fill_rect / gfx_set_tile_pixel, then gfx_fill_map or gfx_set_map_grid for the 32×32 SC0 screen. For a **second screen** (the caps/uncap toggle case), author the ALT map too with gfx_fill_alt_map / gfx_set_alt_map_grid — that is what activates the \`vram_toggle\` service routine on export. For **sprites** (see the Sprites section): paint the sprite char(s) — one 8×8 char, or a 2×2 block for 16×16 — set the OBJ palette colors (indices 16–31), and place each one with gfx_set_oam_entry.
 2. **Music** (if wanted): author the song with trk_set_pattern / trk_set_cell, trk_set_tempo, trk_set_orders, trk_add_instrument.
-3. **Program**: asm_set_source with the minimal reset program above (include \`jsr vram_load\` if you made graphics, \`jsr spc_load\` if you made music).
-4. **Export the data**: **gfx_export_vram** with destName "vram.bin" (if graphics) — compiles the compact VRAM image, registers it as a data file, and appends the \`vram_load\` glue; and **trk_export_spc** with destName "spc.bin" (if music) — builds the SPC package, registers it, and appends the \`spc_load\` glue.
+3. **Program**: asm_set_source with the minimal reset program above (include \`jsr vram_load\` if you made graphics, \`jsr oam_load\` right after it if you placed sprites, \`jsr spc_load\` if you made music).
+4. **Export the data**: **gfx_export_vram** with destName "vram.bin" (if graphics) — compiles the compact VRAM image (including the OBJ palette), registers it as a data file, and appends the \`vram_load\` glue; **gfx_export_oam** with destName "oam.bin" and size "8x8" or "16x16" (if sprites) — compiles the 128 OAM slots, registers it, and appends the \`oam_load\` glue; and **trk_export_spc** with destName "spc.bin" (if music) — builds the SPC package, registers it, and appends the \`spc_load\` glue.
 5. **Assemble**: asm_assemble. On failure the result lists per-line diagnostics — fix with asm_set_source / asm_append_source and assemble again. Repeat until clean.
 6. **Build + run**: asm_build_rom, then asm_run. Tell the user what to look for.
 
@@ -88,6 +100,7 @@ rel:
 - **Hand-rolling the screen/sound** in the program: \`sta $2118\`/\`sta $2120\` VRAM loops, \`x=0\`/\`x=1\`, \`pcsh\`/\`pcsw\`, \`RTI\`, DMA registers, SPU \$2140–\$2143 writes. The generated glue already does all of this. Your program is 3–4 lines.
 - **Hand-rolling the screen flip** to switch between two tilemaps: writing to (or reading/modifying) BG0SC \`$2107\` yourself. This snes9x build returns OpenBus garbage on PPU register READS, so a read-modify-write of \`$2107\` silently writes a random value and the flip never happens. When you have set a second tilemap, \`jsr vram_toggle\` is the ONLY correct way to switch between them.
 - **Emitting raw \`.byte\` VRAM/tile data** into the source, or \`.incbin\`-ing a hand-built 64 KB image. That blows the 32 KB build cap. \`gfx_export_vram\` produces a COMPACT few-KB image for you.
+- **Placing a sprite without \`priority\`** — the default priority 0 draws the sprite UNDER the background. Over a filled-in background the sprite is completely hidden and the screen looks blank. Always pass \`priority: 2\` or \`priority: 3\` when a background is behind the sprite.
 - **Painting one pixel at a time** with dozens of \`gfx_set_tile_pixel\` calls when a fill will do. Use \`gfx_fill_rect\` for solid regions and \`gfx_fill_map\`/\`gfx_set_map_grid\` for the screen. A solid-color background is a COMPLETE minimal hello world. **But if the user asks for TEXT** (e.g. "print hello world"), render it: each letter is just a tile built from a few \`gfx_fill_rect\`/ \`gfx_set_tile_pixel\` strokes, then lay the letter tiles left-to-right in the tilemap with \`gfx_set_map_entry\`/ \`gfx_set_map_grid\`. A 5×7 or 7×9 glyph grid fits a 16×16 tile comfortably.
 - **Reading state over and over** (\`asm_get_source\` / \`gfx_get_state\` in a loop) instead of acting. Read once, then make the call that moves the task forward.
 
@@ -143,7 +156,7 @@ function asmTools(): string {
 function gfxTools(): string {
   return [
     'gfx_get_state — editor snapshot',
-    'gfx_set_palette_color — 5-bit RGB color, index 0–15',
+    'gfx_set_palette_color — 5-bit RGB color, index 0–31 (0–15 background, 16–31 OBJ/sprite)',
     'gfx_set_tile_pixel — one pixel of a 16×16 tile',
     'gfx_fill_rect — fill a rectangle of one tile',
     'gfx_add_tile — new blank tile',
@@ -153,6 +166,9 @@ function gfxTools(): string {
     'gfx_set_alt_map_entry — one cell of the SECOND (ALT) 32×32 SC0 map',
     'gfx_fill_alt_map — solid ALT SC0 map',
     'gfx_set_alt_map_grid — author the ALT 32×32 SC0 map from grid[row][col]',
+    'gfx_set_oam_entry — place/update one SPRITE slot (tile/x/y/flipH/flipV/priority; hide:true to remove)',
+    'gfx_clear_oam — hide all 128 sprite slots',
+    'gfx_export_oam — compile the 128 sprite slots + register oam.bin + append the `oam_load` glue (destName "oam.bin", size "8x8"|"16x16")',
     'gfx_export_vram — compile the COMPACT VRAM + register it + append the `vram_load` glue (destName "vram.bin"); if an ALT map is set it also emits the `vram_toggle` service routine',
   ].join('; ');
 }

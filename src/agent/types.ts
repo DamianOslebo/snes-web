@@ -16,6 +16,7 @@
  */
 
 import type { VramCompact } from '../gfx/vram';
+import type { OamSize } from '../gfx/oam';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 
@@ -116,11 +117,15 @@ export interface AsmController {
   run(): { ok: boolean; error?: string };
 }
 
-/** Graphics page: tiles, palette, tilemap, and the compiled 64 KB VRAM image. */
+/** Graphics page: tiles, palette, tilemap, sprites (OAM), and the compiled VRAM. */
 export interface GfxController {
   /** A compact snapshot of the editor state (for the agent to inspect). */
-  getState(): { mode: number; tiles: number; palette: number; mapEntries: number; altMapEntries: number };
-  /** Set palette `index` (0-15) to a 5-5-5 color. */
+  getState(): { mode: number; tiles: number; palette: number; mapEntries: number; altMapEntries: number; oamEntries: number };
+  /**
+   * Set palette `index` to a 5-5-5 color.
+   * Index 0-15 = background palette (CGRAM palette 0).
+   * Index 16-31 = OBJ/sprite palette (CGRAM palette 8 — the one sprites sample).
+   */
   setPaletteColor(index: number, r: number, g: number, b: number, transparent: boolean): void;
   /** Paint one pixel of a tile with palette `color`. Creates the tile if needed. */
   setTilePixel(tile: number, row: number, col: number, color: number): void;
@@ -154,6 +159,30 @@ export interface GfxController {
    * 32 columns); palette/flags come from `palette`.
    */
   setAltMapFromGrid(grid: number[][], palette: number): void;
+
+  // --- sprites (OAM) ---------------------------------------------------------
+  //
+  // 128 OBJ slots. Sprite SIZE is global (OBJSEL), chosen once at export — the
+  // two supported sizes are 8×8 and 16×16 (see OamSize / `oamGlue`). A sprite
+  // samples the OBJ palette (colors 16-31 → CGRAM palette 8) and a char by its
+  // 9-bit `tile` index (8×8 = that char; 16×16 = the 2×2 block from its
+  // top-left). `setOamEntry(slot, null)` hides a slot.
+
+  /** One sprite slot. `tile` = 8×8 char index (0-511): the whole 8×8 sprite, or the top-left of the 16×16 block. */
+  setOamEntry(slot: number, entry: { tile: number; x: number; y: number; flipH?: boolean; flipV?: boolean; priority?: number } | null): void;
+  /** Hide every sprite slot. */
+  clearOam(): void;
+  /** Compile the 128 slots to the 512-byte OAM image the program `.incbin`s. */
+  buildOam(): Uint8Array;
+  /**
+   * The self-contained 65C816 `oam_load` routine (OBJSEL + OAMADDR + TM +
+   * 512-byte stream through $2104). Call AFTER `vram_load`. `dataName` is the
+   * `.incbin` file name the glue references (default "oam.bin"); `size`
+   * (`'8x8' | '16x16'`, default `'16x16'`) is the global sprite size baked into
+   * OBJSEL.
+   */
+  oamGlue(dataName?: string, size?: OamSize): string;
+
   /** Compile the editor to a 64 KB VRAM image. */
   buildVram(): Uint8Array;
   /**

@@ -178,7 +178,7 @@ Two buttons next to **↺ New**:
   latencies, and the retry trail.
 - **🧹** — clears the journal only (conversation and pages are kept).
 
-## Tool reference (28)
+## Tool reference (34)
 
 **asm_*** — the assembler page
 | tool | what it does |
@@ -193,10 +193,14 @@ Two buttons next to **↺ New**:
 | tool | what it does |
 | --- | --- |
 | `gfx_get_state` | mode / tile count / map cells set |
-| `gfx_set_palette_color` | 5-bit RGB, index 0–15 (0 = transparent by convention) |
+| `gfx_set_palette_color` | 5-bit RGB, index 0–15 background **or 16–31 OBJ (sprite)** — index 0 = transparent by convention |
 | `gfx_add_tile` / `gfx_set_tile_pixel` / `gfx_fill_rect` | 16×16 tile authoring (batch: `fill_rect`) |
 | `gfx_set_map_entry` / `gfx_fill_map` / `gfx_set_map_grid` | the 32×32 SC0 map (`set_map_grid` takes `grid[row][col]`) |
-| `gfx_export_vram` | compile the **compact** VRAM image (used palette + tiles + tilemap, a few KB) → registers `vram.bin` on the asm page **and appends the `vram_load` bring-up glue** (idempotent — re-running replaces the block, never duplicates it) |
+| `gfx_set_alt_map_entry` / `gfx_fill_alt_map` / `gfx_set_alt_map_grid` | the SECOND (ALT) 32×32 SC0 map — authoring it is what activates the `vram_toggle` service routine on export (caps/uncap flips) |
+| `gfx_set_oam_entry` | place/update one SPRITE slot 0–127 (`slot/tile/x/y`, `flipH/flipV`, `priority` 0–3; `hide:true` removes it) — see Sprites below |
+| `gfx_clear_oam` | hide all 128 sprite slots (start clean) |
+| `gfx_export_vram` | compile the **compact** VRAM image (used palette + tiles + tilemap, a few KB) → registers `vram.bin` on the asm page **and appends the `vram_load` bring-up glue** (plus `vram_toggle` + `pad_read` when an ALT map is set; idempotent — re-running replaces the block, never duplicates it) |
+| `gfx_export_oam` | compile the 128-slot OAM table (512 bytes) → registers `oam.bin` **and appends the `oam_load` glue with the chosen GLOBAL size baked into OBJSEL** (`size` "8x8" or "16x16", default "16x16"; idempotent — re-exporting switches the size, never duplicates `oam_load`) |
 
 **trk_*** — the music page
 | tool | what it does |
@@ -210,13 +214,15 @@ Two buttons next to **↺ New**:
 
 ## The end-to-end recipe (what the prompt teaches the model)
 
-The program is **tiny** — the model never hand-rolls PPU setup, VRAM DMA, or
-SPU port writes. The two export tools generate self-contained 65C816 routines
-(`vram_load`, `spc_load`) and append them; the program just calls them:
+The program is **tiny** — the model never hand-rolls PPU setup, VRAM DMA,
+OAM writes, or SPU port writes. The export tools generate self-contained
+65C816 routines (`vram_load`, `oam_load`, `spc_load`) and append them; the
+program just calls them:
 
 ```
 reset:
   jsr vram_load        ; PPU bring-up + VRAM fill (glue from gfx_export_vram)
+  ; jsr oam_load       ; sprite table + OBJ layer (glue from gfx_export_oam) — only if sprites
   ; jsr spc_load       ; SPC700 loader (glue from trk_export_spc) — only if music
 idle:
   bra idle
@@ -225,19 +231,54 @@ idle:
 Order matters — the exports **append** glue, so they come **after**
 `asm_set_source` (which replaces the whole source, wiping any appended glue):
 
-1. `gfx_*` — palette, tiles, SC0 map (skip if no graphics).
+1. `gfx_*` — palette, tiles, SC0 map; for a **second screen** author the ALT
+   map too (`gfx_set_alt_map_*`); for **sprites** paint the sprite char(s),
+   set the OBJ palette colors (indices 16–31), and place each with
+   `gfx_set_oam_entry` (skip what you don't need).
 2. `trk_*` — author the song (skip if no music).
 3. `asm_set_source` — the minimal reset program above (`jsr vram_load` if
-   graphics, `jsr spc_load` if music; nothing else).
-4. `gfx_export_vram` (destName `vram.bin`) and `trk_export_spc` (destName
-   `spc.bin`) — each compiles its image, registers the data file, **and
-   appends its loader glue** (both are idempotent, so re-running after a later
-   `asm_set_source` restores the glue without duplicating a label).
+   graphics, `jsr oam_load` right after it if sprites, `jsr spc_load` if
+   music; nothing else).
+4. `gfx_export_vram` (destName `vram.bin`), `gfx_export_oam` (destName
+   `oam.bin`, size "8x8" or "16x16" — the ONE size every sprite draws at),
+   and `trk_export_spc` (destName `spc.bin`) — each compiles its image,
+   registers the data file, **and appends its loader glue** (all idempotent,
+   so re-running after a later `asm_set_source` restores the glue without
+   duplicating a label).
 5. `asm_assemble` → fix diagnostics → repeat until clean.
 6. `asm_build_rom` → `asm_run` → the ROM loads + runs in the emulator.
 
 The safest clean-slate sequence after any program edit is:
-`asm_set_source` → (gfx_export_vram) → (trk_export_spc) → `asm_assemble`.
+`asm_set_source` → (gfx_export_vram) → (gfx_export_oam) → (trk_export_spc)
+→ `asm_assemble`.
+
+## Sprites (the OBJ layer) — scope & limits
+
+- **What it is**: 128 OAM slots (standard 4 bytes each: HPos, VPos, Name, attr),
+  drawn from the same 8×8 chars you paint in the tile editor, coloured from the
+  **OBJ palette** (`gfx_set_palette_color` indices **16–31** — index 16 = the
+  sprite transparency slot). `gfx_export_oam` bakes the chosen GLOBAL size into
+  OBJSEL and `oam_load` streams the table through $2104 and turns the OBJ layer
+  on.
+- **Two sizes, chosen ONCE per ROM** — sprite size is **global** (OBJSEL), not a
+  per-slot field:
+  - **8×8** (OBJSEL `$00`): one char IS the sprite; `tile` is that char's index.
+  - **16×16** (OBJSEL `$60`): a 2×2 block of four 8×8 chars. `tile` is the
+    **top-left char, on an even char column** (`tile % 2 == 0`). The SNES lays
+    8×8 chars out **16 per row**, so the block is (tile, tile+1, tile+16,
+    tile+17) — the bottom pair sits 16 below, **not 8**. Paint those four chars
+    as one connected picture.
+- **Priority decides visibility**: priority 0–1 draws the sprite *under* the
+  background; 2–3 *over* it. With a painted background behind (almost always),
+  pass `priority: 2` — the default 0 leaves the screen looking blank.
+- **What it is not**: mixed sizes in one ROM; moving sprites without a re-call to
+  `oam_load` (OAM is loaded once); per-sprite palettes. v1 = a character standing
+  on the screen — fully supported; chasing animation is not.
+- **Verification**: `test/gfx-oam.test.ts` pins the encoder bytes and the
+  per-size glue text (both assemble with the real assembler into a valid
+  256 KB LoROM), and — when the wasm build is present — renders a white sprite
+  on the **real core** to prove the size is honoured: the same char at 8×8 in
+  one ROM and 16×16 in another, same OAM slot.
 
 ## In-ROM SPU audio — scope & limits (EXPERIMENTAL)
 
@@ -259,7 +300,8 @@ The safest clean-slate sequence after any program edit is:
 | area | where |
 | --- | --- |
 | pure agent core (node-tested) | `src/agent/{types,ollama,tools,loop,system,state-store}.ts` |
+| OAM (sprite) core (node-tested) | `src/gfx/oam.ts` — 128-slot table, OBJSEL per size, `oam_load` glue |
 | pure SPC core (node-tested) | `src/spc/{brr,driver,layout}.ts` |
 | the panel (browser-only) | `src/ui/agent-chat.ts` |
 | per-page controllers | `makeAsmController` (ui/assembler.ts), `makeGfxController` (ui/graphics.ts), `makeTrackController` (ui/track.ts) |
-| tests | `test/agent-{ollama,loop,tools,system,state-store}.test.ts`, `test/spc-{brr,driver}.test.ts` |
+| tests | `test/agent-{ollama,loop,tools,system,state-store}.test.ts`, `test/gfx-oam.test.ts` (incl. real-core sprite-size render), `test/spc-{brr,driver}.test.ts` |

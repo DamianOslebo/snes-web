@@ -1,9 +1,9 @@
 /**
  * `tools` — the agent's tool catalog and dispatcher.
  *
- * The 28 `asm_*` / `gfx_*` / `trk_*` tools are the model's only way to touch
- * the three pages: each maps to one or two `AgentControllers` methods. Two of
- * them are cross-page bridges — `gfx_export_vram` and `trk_export_spc` build
+ * The 34 `asm_*` / `gfx_*` / `trk_*` tools are the model's only way to touch
+ * the three pages: each maps to one or two `AgentControllers` methods. Three
+ * of them are cross-page bridges — `gfx_export_vram`, `gfx_export_oam`, and `trk_export_spc` build
  * a binary on one page and register it on the asm page as an `.incbin` data
  * file, so a 64 KB image never has to cross the model's context as text.
  *
@@ -17,6 +17,7 @@
  */
 
 import { NOTE_MAX, NOTE_MIN, parseNoteName } from '../track/model';
+import type { OamSize } from '../gfx/oam';
 import type { AgentControllers, ToolResult, ToolSpec } from './types';
 
 export interface ToolCtx {
@@ -41,9 +42,10 @@ export const MAX_MANUAL_DATA_BYTES = 64 * 1024;
 // (e.g. after painting more tiles) REPLACES the old block instead of duplicating
 // it — a duplicate `vram_load:` label would otherwise fail assembly. Markers are
 // `;`-prefixed, so the assembler treats them as plain comments.
-const GLUE_MARKERS: Record<'gfx' | 'spc', { start: string; end: string }> = {
+const GLUE_MARKERS: Record<'gfx' | 'spc' | 'oam', { start: string; end: string }> = {
   gfx: { start: ';=== GFX_VRAM_GLUE (generated) ===', end: ';=== /GFX_VRAM_GLUE ===' },
   spc: { start: ';=== SPC_GLUE (generated; EXPERIMENTAL) ===', end: ';=== /SPC_GLUE ===' },
+  oam: { start: ';=== GFX_OAM_GLUE (generated) ===', end: ';=== /GFX_OAM_GLUE ===' },
 };
 
 /**
@@ -54,7 +56,7 @@ const GLUE_MARKERS: Record<'gfx' | 'spc', { start: string; end: string }> = {
  * duplicating the block (a duplicate `vram_load`/`spc_load` label would fail
  * assembly).
  */
-function upsertGlue(c: AgentControllers, kind: 'gfx' | 'spc', block: string): void {
+function upsertGlue(c: AgentControllers, kind: 'gfx' | 'spc' | 'oam', block: string): void {
   const { start, end } = GLUE_MARKERS[kind];
   const body = `${start}\n${block}\n${end}`;
   const src = c.asm.getSource();
@@ -99,6 +101,16 @@ export function assembleHint(errors: { line: number; message: string }[]): strin
       'vram_load is a GENERATED routine — you do not write it. Call gfx_export_vram with ' +
       '{"destName":"vram.bin"} to compile the compact VRAM, register vram.bin, and append the ' +
       'vram_load routine; then call asm_assemble again. Do NOT hand-write PPU setup, DMA, or VRAM bytes.'
+    );
+  }
+  if (/undefined label "oam_load"/.test(text)) {
+    return (
+      'oam_load is a GENERATED routine — you do not write it. Call gfx_export_oam with ' +
+      '{"destName":"oam.bin","size":"16x16"} (use "8x8" for 8×8 sprites) to compile the 512-byte OAM ' +
+      'sprite table, register oam.bin, and append the oam_load routine; then call asm_assemble again. ' +
+      'Do NOT hand-write OAM ($2104) or OBJSEL ($2101) bytes. ' +
+      'Remember to also call gfx_export_vram first (sprites are colored by the OBJ palette, colors 16–31, ' +
+      'which vram_load writes to CGRAM).'
     );
   }
   if (/undefined label "spc_load"/.test(text)) {
@@ -365,12 +377,13 @@ const DEFS: ToolDef[] = [
   {
     name: 'gfx_set_palette_color',
     description:
-      'Set one palette color in 5-bit RGB (r/g/b 0–31). Index 0–15; conventionally index 0 is transparent ' +
-      '(pass transparent:true for it).',
+      'Set one palette color in 5-bit RGB (r/g/b 0–31). Index 0–15 = background palette; ' +
+      'index 16–31 = OBJ/sprite palette (the colors sprites sample). Conventionally index 0 is ' +
+      'transparent (pass transparent:true for it).',
     parameters: {
       type: 'object',
       properties: {
-        index: { type: 'integer', minimum: 0, maximum: 15 },
+        index: { type: 'integer', minimum: 0, maximum: 31 },
         r: { type: 'integer', minimum: 0, maximum: 31 },
         g: { type: 'integer', minimum: 0, maximum: 31 },
         b: { type: 'integer', minimum: 0, maximum: 31 },
@@ -657,6 +670,68 @@ const DEFS: ToolDef[] = [
     },
   },
   {
+    name: 'gfx_set_oam_entry',
+    description:
+      'Place or update one SPRITE (OBJ slot 0–127). `tile` (0–511) is an 8×8 char index: for an 8×8 sprite ' +
+      'it IS the whole sprite; for a 16×16 sprite it is the TOP-LEFT char of the 2×2 block — paint that 2×2 ' +
+      'and pick a top-left on an even char column (e.g. 0, 2, 4; the SNES lays chars 16 per row, so the block ' +
+      'is tile, tile+1, tile+16, tile+17 — the bottom pair sits 16 chars below, not 8). Which size you render ' +
+      'at is set GLOBALLY at export via gfx_export_oam `size` ' +
+      '(8×8 or 16×16). The sprite is colored by the OBJ palette (gfx_set_palette_color index 16–31 — NOT the ' +
+      '0–15 background palette). `x`/`y` = screen position (0–255); `flipH`/`flipV` mirror it; `priority` 0–3 ' +
+      'for draw order — 0–1 draws the sprite UNDER the background, 2–3 draws it OVER the background, so use ' +
+      '2 or 3 when the sprite sits on a painted background (default 0 = invisible behind a full-screen BG). ' +
+      'Pass `hide:true` to remove the sprite from that slot.',
+    parameters: {
+      type: 'object',
+      properties: {
+        slot: { type: 'integer', minimum: 0, maximum: 127 },
+        tile: { type: 'integer', minimum: 0, maximum: 511, description: '8×8 char index — the whole 8×8 sprite, or the top-left char of the 16×16 block (even column; the block is tile, tile+1, tile+16, tile+17)' },
+        x: { type: 'integer', minimum: 0, maximum: 255 },
+        y: { type: 'integer', minimum: 0, maximum: 255 },
+        flipH: { type: 'boolean' },
+        flipV: { type: 'boolean' },
+        priority: { type: 'integer', minimum: 0, maximum: 3, description: '0–3. 0–1 = sprite under the background, 2–3 = sprite over it. Default 0 — use 2 or 3 so a sprite over a painted background is visible.' },
+        hide: { type: 'boolean', description: 'true = hide this slot (clears it)' },
+      },
+      required: ['slot'],
+    },
+    run: (a, c) => {
+      const slot = intF(a, 'slot', 0, 127);
+      if (slot.e) return fail(slot.e);
+      if (a.hide === true || a.hide === 'true') {
+        c.gfx.setOamEntry(slot.v as number, null);
+        return ok({ slot: slot.v, hidden: true });
+      }
+      const tile = intF(a, 'tile', 0, 511);
+      const x = intF(a, 'x', 0, 255);
+      const y = intF(a, 'y', 0, 255);
+      const flipH = optBoolF(a, 'flipH');
+      const flipV = optBoolF(a, 'flipV');
+      const priority = optIntF(a, 'priority', 0, 3);
+      const e = tile.e ?? x.e ?? y.e ?? flipH.e ?? flipV.e ?? priority.e;
+      if (e) return fail(e + ' (tile/x/y are required unless hide:true)');
+      c.gfx.setOamEntry(slot.v as number, {
+        tile: tile.v as number,
+        x: x.v as number,
+        y: y.v as number,
+        flipH: flipH.v ?? false,
+        flipV: flipV.v ?? false,
+        priority: priority.v ?? 0,
+      });
+      return ok({ slot: slot.v, tile: tile.v });
+    },
+  },
+  {
+    name: 'gfx_clear_oam',
+    description: 'Hide EVERY sprite slot (128 slots) — start clean before placing sprites.',
+    parameters: { type: 'object', properties: {} },
+    run: (_a, c) => {
+      c.gfx.clearOam();
+      return ok({ cleared: 128 });
+    },
+  },
+  {
     name: 'gfx_export_vram',
     description:
       'Compile the graphics into a COMPACT VRAM image (only the used palette + tiles + tilemap — a few KB, ' +
@@ -693,6 +768,39 @@ const DEFS: ToolDef[] = [
         return ok({ bytes: bytes.length, dataFile: dn.v, glueAppended: true, layout });
       }
       return ok({ bytes: bytes.length, glue: c.gfx.vramGlue(), layout });
+    },
+  },
+  {
+    name: 'gfx_export_oam',
+    description:
+      'Compile the 128 SPRITE (OBJ) slots into the 512-byte OAM table. With `destName` (standard name ' +
+      '"oam.bin"), also register it on the assembler page as an `.incbin` data file AND append the ' +
+      'self-contained 65C816 `oam_load` routine to the asm source. The program then calls `JSR vram_load` ' +
+      'at startup, then `JSR oam_load` once sprites are placed — no manual OAM/OBJSEL/TM writes needed. ' +
+      '`size` sets the GLOBAL sprite size baked into OBJSEL (the ONE size every sprite draws at): ' +
+      '"8x8" or "16x16" (default "16x16"). IMPORTANT: vram_load must come first (it writes the OBJ palette ' +
+      'into CGRAM palette 8); oam_load then points OBJ at the sprite slots. Export after you are done ' +
+      'placing sprites so the table is final.',
+    parameters: {
+      type: 'object',
+      properties: {
+        destName: { type: 'string', description: 'Data-file name, e.g. "oam.bin"' },
+        size: { type: 'string', enum: ['8x8', '16x16'], description: 'Global sprite size for this ROM: "8x8" or "16x16" (default "16x16")' },
+      },
+    },
+    run: (a, c) => {
+      const bytes = c.gfx.buildOam();
+      const dn = optStrF(a, 'destName');
+      if (dn.e) return fail(dn.e);
+      const sizeRaw = typeof a.size === 'string' ? a.size.toLowerCase() : '';
+      const size: OamSize = sizeRaw === '8x8' || sizeRaw === '8×8' ? '8x8' : '16x16';
+      if (dn.v) {
+        c.asm.addDataFile(dn.v, bytes);
+        // Idempotent: replaces any previous oam glue block (no duplicate `oam_load` label).
+        upsertGlue(c, 'oam', c.gfx.oamGlue(dn.v, size));
+        return ok({ bytes: bytes.length, dataFile: dn.v, glueAppended: true, size });
+      }
+      return ok({ bytes: bytes.length, glue: c.gfx.oamGlue(undefined, size), size });
     },
   },
 

@@ -55,7 +55,7 @@ function mockControllers() {
   };
 
   const gfx: GfxController = {
-    getState: () => ({ mode: 0, tiles: 2, palette: 16, mapEntries: 1024, altMapEntries: 0 }),
+    getState: () => ({ mode: 0, tiles: 2, palette: 16, objPalette: 16, mapEntries: 1024, altMapEntries: 0, oamEntries: 1 }),
     setPaletteColor: (i, r, g, b, t) => call('setPaletteColor', [i, r, g, b, t]),
     setTilePixel: (...a) => call('setTilePixel', a),
     fillTileRect: (...a) => call('fillTileRect', a),
@@ -66,6 +66,14 @@ function mockControllers() {
     setAltMapEntry: (...a) => call('setAltMapEntry', a),
     fillAltMap: (...a) => call('fillAltMap', a),
     setAltMapFromGrid: (...a) => call('setAltMapFromGrid', a),
+    setOamEntry: (...a) => call('setOamEntry', a),
+    clearOam: () => call('clearOam', []),
+    buildOam: () => {
+      const b = new Uint8Array(512);
+      b.fill(0xab);
+      return b;
+    },
+    oamGlue: (n, size) => `; oam glue for ${n ?? 'oam.bin'} (${size ?? '16x16'})`,
     buildVram: () => new Uint8Array([0, 1, 2, 3]),
     buildVramCompact: () => ({
       blob: new Uint8Array([0, 1, 2, 3]),
@@ -154,8 +162,8 @@ describe('base64ToBytes', () => {
 // --- catalog shape -----------------------------------------------------------
 
 describe('TOOL_SPECS', () => {
-  it('has the 31 well-formed function specs', () => {
-    expect(TOOL_SPECS).toHaveLength(31);
+  it('has the 34 well-formed function specs', () => {
+    expect(TOOL_SPECS).toHaveLength(34);
     for (const s of TOOL_SPECS) {
       expect(s.type).toBe('function');
       expect(s.function.name).toMatch(/^(asm|gfx|trk)_[a-z_]+$/);
@@ -171,7 +179,8 @@ describe('TOOL_SPECS', () => {
       'asm_add_data_file', 'asm_remove_data_file', 'asm_assemble', 'asm_build_rom', 'asm_run',
       'gfx_get_state', 'gfx_set_palette_color', 'gfx_set_tile_pixel', 'gfx_fill_rect',
       'gfx_add_tile', 'gfx_set_map_entry', 'gfx_fill_map', 'gfx_set_map_grid',
-      'gfx_set_alt_map_entry', 'gfx_fill_alt_map', 'gfx_set_alt_map_grid', 'gfx_export_vram',
+      'gfx_set_alt_map_entry', 'gfx_fill_alt_map', 'gfx_set_alt_map_grid',
+      'gfx_set_oam_entry', 'gfx_clear_oam', 'gfx_export_vram', 'gfx_export_oam',
       'trk_get_song', 'trk_set_cell', 'trk_set_pattern', 'trk_set_tempo', 'trk_set_orders',
       'trk_add_pattern', 'trk_add_instrument', 'trk_preview', 'trk_stop', 'trk_export_spc',
     ]) {
@@ -189,7 +198,11 @@ describe('dispatch contract', () => {
     expect(r.ok).toBe(false);
     const body = JSON.parse(r.content) as { error: string; tools: string[] };
     expect(body.error).toContain('unknown tool');
-    expect(body.tools).toHaveLength(31);
+    expect(body.tools).toHaveLength(34);
+    // The sprite (OAM) toolchain is present in the catalog.
+    for (const t of ['gfx_set_oam_entry', 'gfx_clear_oam', 'gfx_export_oam']) {
+      expect(body.tools).toContain(t);
+    }
   });
 
   it('a throwing controller is caught and reported cleanly', () => {
@@ -433,6 +446,61 @@ describe('gfx tools', () => {
     expect(m.sources.src).toBe(before);
     expect(m.sources.src.match(/GFX_VRAM_GLUE \(generated\)/g)!.length).toBe(1);
     expect(dispatch(m, 'gfx_export_vram', { destName: 5 }).ok).toBe(false);
+  });
+
+  it('gfx_set_oam_entry places a sprite with flip/priority defaults filled in', () => {
+    const m = mockControllers();
+    const r = dispatch(m, 'gfx_set_oam_entry', { slot: 3, tile: 8, x: 100, y: 50 });
+    expect(r.ok).toBe(true);
+    expect(callTo(m, 'setOamEntry')).toEqual([3, { tile: 8, x: 100, y: 50, flipH: false, flipV: false, priority: 0 }]);
+    expect(JSON.parse(r.content)).toEqual({ slot: 3, tile: 8 });
+    // Rejections: out-of-range slot/tile/coords, and tile required unless hide.
+    expect(dispatch(m, 'gfx_set_oam_entry', { slot: 128, tile: 0, x: 0, y: 0 }).ok).toBe(false);
+    expect(dispatch(m, 'gfx_set_oam_entry', { slot: 0, tile: 512, x: 0, y: 0 }).ok).toBe(false);
+    expect(dispatch(m, 'gfx_set_oam_entry', { slot: 0, tile: 0, x: 256, y: 0 }).ok).toBe(false);
+    expect(dispatch(m, 'gfx_set_oam_entry', { slot: 0, x: 0, y: 0 }).ok).toBe(false);
+  });
+
+  it('gfx_set_oam_entry with hide:true clears the slot', () => {
+    const m = mockControllers();
+    const r = dispatch(m, 'gfx_set_oam_entry', { slot: 9, hide: true });
+    expect(r.ok).toBe(true);
+    expect(callTo(m, 'setOamEntry')).toEqual([9, null]);
+    expect(JSON.parse(r.content)).toEqual({ slot: 9, hidden: true });
+  });
+
+  it('gfx_clear_oam hides every one of the 128 slots', () => {
+    const m = mockControllers();
+    const r = dispatch(m, 'gfx_clear_oam');
+    expect(r.ok).toBe(true);
+    expect(m.rec.some((c) => c.fn === 'clearOam')).toBe(true);
+    expect(JSON.parse(r.content)).toEqual({ cleared: 128 });
+  });
+
+  it('gfx_export_oam compiles the 512-byte table; destName registers + appends size-specific glue', () => {
+    const m = mockControllers();
+    // No destName: returns the glue text for inspection, registers nothing.
+    const r = dispatch(m, 'gfx_export_oam');
+    const body = JSON.parse(r.content) as Record<string, unknown>;
+    expect(body).toMatchObject({ bytes: 512, size: '16x16' });
+    expect(typeof body.glue).toBe('string');
+    expect(m.files.size).toBe(0);
+    // The GLOBAL size is threaded into the glue and echoed back in the result.
+    dispatch(m, 'gfx_export_oam', { destName: 'oam.bin', size: '8x8' });
+    expect(m.files.get('oam.bin')!.length).toBe(512);
+    expect(m.sources.src).toContain('oam glue for oam.bin (8x8)');
+    expect(m.sources.src).toContain('GFX_OAM_GLUE');
+    // Re-export is idempotent — the marker block (and its `oam_load` label) is replaced, not duplicated.
+    const before = m.sources.src;
+    dispatch(m, 'gfx_export_oam', { destName: 'oam.bin', size: '8x8' });
+    expect(m.sources.src).toBe(before);
+    expect(m.sources.src.match(/GFX_OAM_GLUE \(generated\)/g)!.length).toBe(1);
+    // Switching size replaces the previous block with the new size's glue.
+    dispatch(m, 'gfx_export_oam', { destName: 'oam.bin', size: '16x16' });
+    expect(m.sources.src).toContain('oam glue for oam.bin (16x16)');
+    expect(m.sources.src).not.toContain('oam glue for oam.bin (8x8)');
+    expect(m.sources.src.match(/GFX_OAM_GLUE \(generated\)/g)!.length).toBe(1);
+    expect(dispatch(m, 'gfx_export_oam', { destName: 5 }).ok).toBe(false);
   });
 });
 

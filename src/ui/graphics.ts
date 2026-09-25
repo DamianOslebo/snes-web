@@ -16,6 +16,7 @@ import { MODES, colorsForMode, depthForMode, sizeForMode } from '../gfx/tile-enc
 import { cgramOffset, rgb5to8, type Rgb15 } from '../gfx/palette';
 import { MAP_ENTRIES, type TilemapEntry } from '../gfx/tilemap';
 import { VRAM_SIZE, buildVram as buildVramImage, buildVramCompact, vramGlue as vramGlueGen, type BuildVramOptions } from '../gfx/vram';
+import { OAM_ENTRIES, encodeOam, oamGlue, type OamEntry, type OamSize } from '../gfx/oam';
 import { decodePalette, decodeTile } from '../gfx/decode';
 import { toHexRows } from '../debug/memory-view';
 import { looksLikeSnesRom } from '../core/rom-check';
@@ -67,6 +68,13 @@ interface EdState {
   mode: number;
   tiles: number[][][];
   palette: Rgb15[];
+  /**
+   * The OBJ (sprite) palette — 16 colors, exported to CGRAM palette 8
+   * (colors 128-143). Kept separate from `palette` (the background palette,
+   * CGRAM palette 0) so sprites can be colored independently. In the agent's
+   * flat `setPaletteColor` index space this is colors 16-31.
+   */
+  objPalette: Rgb15[];
   tileIdx: number;
   colIdx: number;
   paint: number;
@@ -75,6 +83,26 @@ interface EdState {
   mapAlt: Array<TilemapEntry | null>;
   mapBrush: TilemapEntry;
   eraseBrush: boolean;
+  /**
+   * The 128 OAM sprite slots (OBJ). `null` = hidden (off-screen). These are
+   * independent of the tilemap — sprites sample the OBJ palette (colors
+   * 16-31) and the char tiles directly by 9-bit index.
+   */
+  oam: Array<OamEntry | null>;
+  /** Global sprite size — the ONE size every sprite in this ROM draws at (baked into OBJSEL on export). */
+  oamSize: OamSize;
+  /** Which OBJ palette color (flat index 16-31) the sprite-pane RGB sliders are editing. */
+  objColIdx: number;
+  /** Sprite-pane DOM refs (filled by buildSpritesPane before wiring). */
+  spOamBody: HTMLElement;
+  spObjPalEl: HTMLElement;
+  spObjR: HTMLInputElement;
+  spObjG: HTMLInputElement;
+  spObjB: HTMLInputElement;
+  spObjT: HTMLInputElement;
+  spObjColLbl: HTMLElement;
+  spSizeEl: HTMLSelectElement;
+  spCount: HTMLElement;
   tileBase: number;
   paletteBase: number;
   mapBase: number;
@@ -128,6 +156,10 @@ const ed = {
   mode: 0,
   tiles: [],
   palette: defaultPalette(),
+  objPalette: defaultPalette(),
+  oam: new Array<OamEntry | null>(OAM_ENTRIES).fill(null),
+  oamSize: '16x16',
+  objColIdx: 17,
   tileIdx: 0,
   colIdx: 0,
   paint: 1,
@@ -153,6 +185,12 @@ interface GfxStore {
   mode: number;
   tiles: number[][][];
   palette: Rgb15[];
+  /** Optional: the OBJ (sprite) palette, 16 colors. Absent in v1 stores predating sprites. */
+  objPalette?: Rgb15[];
+  /** Optional: the 128 OAM sprite slots (`null` = hidden). Absent in v1 stores predating sprites. */
+  oam?: Array<OamEntry | null>;
+  /** Optional: global sprite size ('8x8' | '16x16'). Absent in v1 stores predating sprites. */
+  oamSize?: OamSize;
   map: Array<TilemapEntry | null>;
   /** Optional: the second (alt) tilemap. Absent in v1 stores predating the toggle feature. */
   mapAlt?: Array<TilemapEntry | null>;
@@ -165,10 +203,22 @@ const isGfxStore = (v: unknown): v is GfxStore => {
   const g = v as GfxStore | null;
   if (!g || g.v !== 1) return false;
   if (typeof g.mode !== 'number' || !Array.isArray(g.tiles)) return false;
-  if (!Array.isArray(g.palette) || g.palette.length !== 16) return false;
-  for (const c of g.palette) {
-    if (typeof c?.r !== 'number' || typeof c.g !== 'number' ||
-        typeof c.b !== 'number' || typeof c.transparent !== 'boolean') return false;
+  const valid16 = (a: unknown): boolean => {
+    if (!Array.isArray(a) || a.length !== 16) return false;
+    for (const c of a) {
+      if (typeof c?.r !== 'number' || typeof c.g !== 'number' ||
+          typeof c.b !== 'number' || typeof c.transparent !== 'boolean') return false;
+    }
+    return true;
+  };
+  if (!valid16(g.palette)) return false;
+  if (g.objPalette !== undefined && !valid16(g.objPalette)) return false;
+  if (g.oam !== undefined) {
+    if (!Array.isArray(g.oam) || g.oam.length !== OAM_ENTRIES) return false;
+    for (const e of g.oam) {
+      if (e === null) continue; // hidden slot
+      if (typeof e?.tile !== 'number' || typeof e.x !== 'number' || typeof e.y !== 'number') return false;
+    }
   }
   if (!Array.isArray(g.map) || g.map.length !== MAP_ENTRIES) return false;
   if (g.mapAlt !== undefined && (!Array.isArray(g.mapAlt) || g.mapAlt.length !== MAP_ENTRIES)) return false;
@@ -206,6 +256,15 @@ function ensureGfxState(): void {
   ed.mode = value.mode;
   ed.tiles = value.tiles.length ? value.tiles : [blankTile()];
   ed.palette = value.palette;
+  // Optional in the store; fall back to the default OBJ palette (v1 predates sprites).
+  ed.objPalette = value.objPalette && value.objPalette.length === 16
+    ? value.objPalette
+    : defaultPalette();
+  // Optional in the store; fall back to all-hidden slots (v1 predates sprites).
+  ed.oam = value.oam && value.oam.length === OAM_ENTRIES
+    ? value.oam
+    : new Array<OamEntry | null>(OAM_ENTRIES).fill(null);
+  ed.oamSize = value.oamSize === '8x8' ? '8x8' : '16x16';
   ed.map = value.map;
   // Optional in the store; fall back to a blank alt map (v1 predates the toggle).
   ed.mapAlt = value.mapAlt && value.mapAlt.length === MAP_ENTRIES
@@ -222,6 +281,9 @@ function gfxPersist(): void {
     mode: ed.mode,
     tiles: ed.tiles,
     palette: ed.palette,
+    objPalette: ed.objPalette,
+    oam: ed.oam,
+    oamSize: ed.oamSize,
     map: ed.map,
     mapAlt: ed.mapAlt,
     tileBase: ed.tileBase,
@@ -345,6 +407,17 @@ pre.hex{font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:#8a8a94;
 .palswatch.t{background:repeating-linear-gradient(45deg,#2a2a30 0 4px,#1c1c22 4px 8px)}
 .palswatch.sel{outline:2px solid #9fd0ff}
 .palgrid{display:grid;grid-template-columns:repeat(8,28px);gap:5px}
+.sp-section{display:flex;flex-direction:column;gap:10px}
+.sp-section h3{margin:0;font-size:13px;font-weight:600;color:#b8b8c0;text-transform:uppercase;letter-spacing:.04em}
+.oam-wrap{max-height:420px;overflow:auto;border:1px solid #2a2a30;border-radius:6px;background:#101014}
+table.oam-tbl{border-collapse:collapse;width:100%;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
+.oam-tbl th,.oam-tbl td{padding:3px 6px;text-align:left;border-bottom:1px solid #22222a;white-space:nowrap}
+.oam-tbl th{position:sticky;top:0;background:#1c1c22;color:#8a8a94;font-weight:600;z-index:1}
+.oam-tbl td input[type=number]{width:64px;padding:2px 5px;font:inherit}
+.oam-tbl td input[type=checkbox]{accent-color:#4a7ab5}
+.oam-tbl tr.sel td{background:#16233a}
+.oam-tbl tr.off td{color:#5a5a64}
+.sp-stat{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#9fd0ff}
 .mapgrid{display:grid;grid-template-columns:repeat(32,12px);gap:1px;background:#2a2a30;padding:1px;border-radius:4px;width:max-content;max-width:100%;overflow:auto}
 .mapcell{width:12px;height:12px;background:#1a1a1f}
 .mapcell:hover{outline:1px solid #9fd0ff}
@@ -386,24 +459,30 @@ export function mountGraphics(container: HTMLElement): void {
   const tabs = el('nav', 'tabs');
   const insTab = el('button', 'tab active', '🔍 VRAM Inspector');
   const edTab = el('button', 'tab', '🖌 Tile Editor');
+  const spTab = el('button', 'tab', '🎯 Sprites (OAM)');
   tabs.appendChild(insTab);
   tabs.appendChild(edTab);
+  tabs.appendChild(spTab);
   root.appendChild(tabs);
 
   const insPane = buildInspectorPane();
   const edPane = buildEditorPane();
+  const spPane = buildSpritesPane();
   edPane.hidden = true;
+  spPane.hidden = true;
   root.appendChild(insPane);
   root.appendChild(edPane);
+  root.appendChild(spPane);
 
+  const panes: HTMLElement[] = [insPane, edPane, spPane];
+  const tabEls = [insTab, edTab, spTab];
   const show = (pane: HTMLElement): void => {
-    insPane.hidden = pane !== insPane;
-    edPane.hidden = pane !== edPane;
-    insTab.classList.toggle('active', pane === insPane);
-    edTab.classList.toggle('active', pane === edPane);
+    for (const p of panes) p.hidden = p !== pane;
+    for (let i = 0; i < panes.length; i++) tabEls[i].classList.toggle('active', panes[i] === pane);
   };
   insTab.addEventListener('click', () => show(insPane));
   edTab.addEventListener('click', () => show(edPane));
+  spTab.addEventListener('click', () => show(spPane));
 
   // Release paint/map drags wherever the pointer comes up.
   window.addEventListener('pointerup', () => {
@@ -910,6 +989,8 @@ function rebuildAll(): void {
   rebuildPal();
   paintMapAll();
   renderPreview();
+  // The sprite pane is built after the editor pane, so it may not exist yet.
+  if (ed.spOamBody) rebuildSprites();
 }
 
 /** Translate a client-space pointer position into a pixel and paint it. */
@@ -1170,6 +1251,254 @@ function download(): void {
   }
 }
 
+// --- Sprites (OBJ) tab — the OAM table + OBJ palette -----------------------
+
+/** The 👾 Sprites (OBJ) pane: the global size, the OBJ palette (16–31), and
+ * the 128-slot OAM table. It edits the same `ed.oam` / `ed.objPalette` state
+ * the agent drives from any page, and is persisted under `snes-web:gfx:v1`. */
+function buildSpritesPane(): HTMLElement {
+  const pane = el('div', 'panel');
+
+  // Header: global size + live count + clear-all.
+  const head = el('div', 'row');
+  const sizeLbl = el('label', '', 'size');
+  const sizeEl = el('select', '');
+  for (const s of ['8x8', '16x16'] as OamSize[]) {
+    const o = document.createElement('option');
+    o.value = s;
+    o.textContent = s === '8x8' ? '8×8 — one char (OBJSEL $00)' : '16×16 — a 2×2 char block (OBJSEL $60)';
+    if (s === ed.oamSize) o.selected = true;
+    sizeEl.appendChild(o);
+  }
+  sizeLbl.appendChild(sizeEl);
+  head.appendChild(sizeLbl);
+  const countEl = el('span', 'sp-stat', '');
+  head.appendChild(countEl);
+  const clearBtn = el('button', 'btn', 'clear all sprites');
+  head.appendChild(clearBtn);
+  pane.appendChild(head);
+
+  // OBJ palette (colors 16–31) — sprites sample THIS, not the background one.
+  const palSec = el('div', 'sp-section');
+  palSec.appendChild(el('h3', '', 'OBJ palette (colors 16–31)'));
+  palSec.appendChild(el('p', 'muted', 'Index 16 (CGRAM 128) is the sprite transparency slot. A char painted with background color N renders as OBJ color 16+N, so set those here.'));
+  const objPalEl = el('div', 'palgrid');
+  palSec.appendChild(objPalEl);
+  const rgbRow = el('div', 'row');
+  const objColLbl = el('span', 'muted', '17');
+  rgbRow.appendChild(objColLbl);
+  const spObjR = rangeEl('OBJ red (0–31)');
+  const spObjG = rangeEl('OBJ green (0–31)');
+  const spObjB = rangeEl('OBJ blue (0–31)');
+  rgbRow.appendChild(label('R', spObjR));
+  rgbRow.appendChild(label('G', spObjG));
+  rgbRow.appendChild(label('B', spObjB));
+  const spObjT = checkbox('transparent');
+  rgbRow.appendChild(spObjT.lbl);
+  palSec.appendChild(rgbRow);
+  pane.appendChild(palSec);
+
+  // The 128-slot OAM table (scrollable).
+  const tblSec = el('div', 'sp-section');
+  tblSec.appendChild(el('h3', '', 'OAM slots (128)'));
+  tblSec.appendChild(el('p', 'muted', 'Size is global (the selector above). 8×8 = one char, any index. 16×16 = a 2×2 char block: the tile is its TOP-LEFT char, so it must sit on an even char row AND even char column (0, 2, 16, 18, 32, …). x/y are the top-left screen pixel. Positions are static — OAM loads once, so a moving sprite re-calls oam_load.'));
+  const wrap = el('div', 'oam-wrap');
+  const tbl = el('table', 'oam-tbl');
+  const thead = el('thead', '');
+  const hr = el('tr', '');
+  for (const th of ['#', 'on', 'tile', 'x', 'y', 'H', 'V', 'pri', '']) {
+    hr.appendChild(el('th', '', th));
+  }
+  thead.appendChild(hr);
+  tbl.appendChild(thead);
+  const tbody = el('tbody', '');
+  tbl.appendChild(tbody);
+  wrap.appendChild(tbl);
+  tblSec.appendChild(wrap);
+  tblSec.appendChild(el('p', 'muted', 'The gfx_export_oam agent tool compiles these 128 slots into oam.bin, registers it, and appends the oam_load routine (destName "oam.bin", size "8x8"|"16x16"). The program then calls jsr oam_load after jsr vram_load.'));
+  pane.appendChild(tblSec);
+
+  Object.assign(ed, {
+    spOamBody: tbody,
+    spObjPalEl: objPalEl,
+    spObjR, spObjG, spObjB, spObjT: spObjT.input,
+    spObjColLbl: objColLbl,
+    spSizeEl: sizeEl,
+    spCount: countEl,
+  });
+
+  sizeEl.addEventListener('change', () => {
+    ed.oamSize = sizeEl.value === '8x8' ? '8x8' : '16x16';
+    scheduleGfxPersist();
+  });
+  clearBtn.addEventListener('click', () => {
+    for (let i = 0; i < OAM_ENTRIES; i++) ed.oam[i] = null;
+    rebuildSprites();
+    scheduleGfxPersist();
+  });
+  const objT = spObjT.input;
+  spObjR.addEventListener('input', () => { setObjColor(ed.objColIdx, { r: +spObjR.value, g: +spObjG.value, b: +spObjB.value, transparent: objT.checked }); });
+  spObjG.addEventListener('input', () => { setObjColor(ed.objColIdx, { r: +spObjR.value, g: +spObjG.value, b: +spObjB.value, transparent: objT.checked }); });
+  spObjB.addEventListener('input', () => { setObjColor(ed.objColIdx, { r: +spObjR.value, g: +spObjG.value, b: +spObjB.value, transparent: objT.checked }); });
+  objT.addEventListener('change', () => { setObjColor(ed.objColIdx, { r: +spObjR.value, g: +spObjG.value, b: +spObjB.value, transparent: objT.checked }); });
+
+  rebuildSprites();
+  return pane;
+}
+
+/** Write one OBJ palette color (flat index 16–31) and repaint the sprite surfaces. */
+function setObjColor(flatIdx: number, color: Rgb15): void {
+  const i = Math.max(0, Math.min(15, Math.round(flatIdx) - 16));
+  ed.objPalette[i] = { r: clamp5(color.r), g: clamp5(color.g), b: clamp5(color.b), transparent: !!color.transparent };
+  rebuildSprites();
+  scheduleGfxPersist();
+}
+
+/** Sync the OBJ-pane RGB sliders to the currently selected OBJ color. */
+function syncObjSliders(): void {
+  const i = ed.objColIdx - 16;
+  const c = ed.objPalette[i];
+  if (!c) return;
+  ed.spObjR.value = String(c.r);
+  ed.spObjG.value = String(c.g);
+  ed.spObjB.value = String(c.b);
+  ed.spObjT.checked = c.transparent;
+  ed.spObjColLbl.textContent = String(ed.objColIdx);
+}
+
+/**
+ * Redraw the whole Sprites (OBJ) pane from state: the OBJ palette swatches,
+ * the 128 OAM slot rows, and the live "N active" count. Called on tab mount and
+ * after any OAM/size/OBJ-palette change.
+ */
+function rebuildSprites(): void {
+  // --- OBJ palette swatches (colors 16–31) ---
+  const grid = ed.spObjPalEl;
+  grid.innerHTML = '';
+  for (let i = 0; i < 16; i++) {
+    const flat = 16 + i;
+    const c = ed.objPalette[i];
+    const b = el('button', `palswatch${c && c.transparent ? ' t' : ''}${flat === ed.objColIdx ? ' sel' : ''}`);
+    if (c && !c.transparent) b.style.background = cssColor(c);
+    b.title = `${flat}: ${c && c.transparent ? 'transparent' : `${c.r},${c.g},${c.b}`}`;
+    b.addEventListener('click', () => {
+      ed.objColIdx = flat;
+      syncObjSliders();
+      rebuildSprites();
+    });
+    grid.appendChild(b);
+  }
+  syncObjSliders();
+
+  // --- 128 OAM slot rows ---
+  const tbody = ed.spOamBody;
+  tbody.innerHTML = '';
+  let active = 0;
+  for (let slot = 0; slot < OAM_ENTRIES; slot++) {
+    const e = ed.oam[slot];
+    const on = e !== null;
+    if (on) active++;
+    const tr = el('tr', on ? '' : 'off');
+    tr.appendChild(el('td', '', String(slot)));
+
+    const onCell = el('td', '');
+    const onChk = el('input', '');
+    onChk.type = 'checkbox';
+    onChk.checked = on;
+    onChk.addEventListener('change', () => {
+      if (onChk.checked) {
+        ed.oam[slot] = { tile: 0, x: 128, y: 128, flipH: false, flipV: false, priority: 0 };
+      } else {
+        ed.oam[slot] = null;
+      }
+      rebuildSprites();
+      scheduleGfxPersist();
+    });
+    onCell.appendChild(onChk);
+    tr.appendChild(onCell);
+
+    // Capture the (possibly-absent) entry's fields once, narrowed by `on`,
+    // so the per-cell closures below only touch plain numbers.
+    const i0 = {
+      tile: on ? e.tile : 0,
+      x: on ? e.x : 0,
+      y: on ? e.y : 0,
+      fh: on ? !!e.flipH : false,
+      fv: on ? !!e.flipV : false,
+      pr: on ? (e.priority ?? 0) : 0,
+    };
+
+    const numIn = (hi: number, key: 'tile' | 'x' | 'y', initial: number) => {
+      const inp = el('input', '');
+      inp.type = 'number';
+      inp.min = '0';
+      inp.max = String(hi);
+      inp.value = String(initial);
+      inp.title = key;
+      inp.addEventListener('change', () => {
+        const cur = ed.oam[slot];
+        if (!cur) return;
+        cur[key] = num(inp, 0, 0, hi);
+        scheduleGfxPersist();
+      });
+      const td = el('td', '');
+      td.appendChild(inp);
+      tr.appendChild(td);
+    };
+    numIn(511, 'tile', i0.tile);
+    numIn(255, 'x', i0.x);
+    numIn(255, 'y', i0.y);
+
+    const chkCell = (key: 'flipH' | 'flipV', initial: boolean) => {
+      const inp = el('input', '');
+      inp.type = 'checkbox';
+      inp.checked = initial;
+      inp.title = key;
+      inp.addEventListener('change', () => {
+        const cur = ed.oam[slot];
+        if (!cur) return;
+        cur[key] = inp.checked;
+        scheduleGfxPersist();
+      });
+      const td = el('td', '');
+      td.appendChild(inp);
+      tr.appendChild(td);
+    };
+    chkCell('flipH', i0.fh);
+    chkCell('flipV', i0.fv);
+
+    const priInp = el('input', '');
+    priInp.type = 'number';
+    priInp.min = '0';
+    priInp.max = '3';
+    priInp.value = String(i0.pr);
+    priInp.title = 'priority (0–3)';
+    priInp.addEventListener('change', () => {
+      const cur = ed.oam[slot];
+      if (!cur) return;
+      cur.priority = num(priInp, 0, 0, 3);
+      scheduleGfxPersist();
+    });
+    const priTd = el('td', '');
+    priTd.appendChild(priInp);
+    tr.appendChild(priTd);
+
+    const actCell = el('td', '');
+    const hideBtn = el('button', 'btn', '×');
+    hideBtn.title = 'hide this slot';
+    hideBtn.addEventListener('click', () => {
+      ed.oam[slot] = null;
+      rebuildSprites();
+      scheduleGfxPersist();
+    });
+    actCell.appendChild(hideBtn);
+    tr.appendChild(actCell);
+
+    tbody.appendChild(tr);
+  }
+  ed.spCount.textContent = `${active}/${OAM_ENTRIES} active · ${ed.oamSize}`;
+}
+
 // --- agent controller (the gfx_* tools dispatch against this) --------------
 
 /** Re-render the mounted editor after the agent edits it (no-op when off-screen). */
@@ -1230,14 +1559,22 @@ export function makeGfxController(): GfxController {
         mode: ed.mode,
         tiles: ed.tiles.length,
         palette: ed.palette.length,
+        objPalette: ed.objPalette.length,
         mapEntries: ed.map.reduce((n, e) => n + (e !== null ? 1 : 0), 0),
         altMapEntries: ed.mapAlt.reduce((n, e) => n + (e !== null ? 1 : 0), 0),
+        oamEntries: ed.oam.filter((e) => e !== undefined).length,
       };
     },
 
+    /**
+     * `index` 0-15 = background palette (CGRAM palette 0);
+     * 16-31 = OBJ/sprite palette (CGRAM palette 8, the one sprites sample).
+     */
     setPaletteColor(index, r, g, b, transparent) {
-      if (index < 0 || index > 15) return;
-      ed.palette[index] = { r: clamp5(r), g: clamp5(g), b: clamp5(b), transparent };
+      if (!Number.isInteger(index) || index < 0 || index > 31) return;
+      const color = { r: clamp5(r), g: clamp5(g), b: clamp5(b), transparent };
+      if (index < 16) ed.palette[index] = color;
+      else ed.objPalette[index - 16] = color;
       if (gfxMounted) refreshPalette(); // (also persists — harmless double)
       else scheduleGfxPersist();
     },
@@ -1363,6 +1700,41 @@ export function makeGfxController(): GfxController {
       scheduleGfxPersist();
     },
 
+    // --- sprites (OAM): 128 slots, 16×16 chars ------------------------------
+    // Data-only — the editor pane's sprite list (when mounted) re-renders on
+    // refreshGfx. Slots are `null`-hidden until authored.
+
+    setOamEntry(slot, entry) {
+      if (!Number.isInteger(slot) || slot < 0 || slot > 127) return;
+      ed.oam[slot] = entry
+        ? {
+            tile: Math.max(0, Math.min(0x1ff, Math.round(entry.tile))),
+            x: ((Math.round(entry.x) % 256) + 256) & 0xff,
+            y: ((Math.round(entry.y) % 256) + 256) & 0xff,
+            flipH: !!entry.flipH,
+            flipV: !!entry.flipV,
+            priority: (Math.round(entry.priority ?? 0)) & 3,
+          }
+        : null;
+      if (gfxMounted) rebuildAll();
+      scheduleGfxPersist();
+    },
+
+    clearOam() {
+      ed.oam = new Array<OamEntry | null>(OAM_ENTRIES).fill(null);
+      if (gfxMounted) rebuildAll();
+      scheduleGfxPersist();
+    },
+
+    buildOam() {
+      ensureGfxState();
+      return encodeOam(ed.oam);
+    },
+
+    oamGlue(dataName, size) {
+      return oamGlue(dataName, size);
+    },
+
     buildVram() {
       ensureGfxState();
       return buildVramImage(gfxVramOpts());
@@ -1393,6 +1765,7 @@ function gfxVramOpts(): BuildVramOptions {
     mode: ed.mode,
     tiles: ed.tiles.length ? ed.tiles : [blankTile()],
     palettes: [ed.palette],
+    objPalette: ed.objPalette,
     tilemap: ed.map.map((e) => e ?? blankEntry()),
     altTilemap: hasAlt ? ed.mapAlt.map((e) => e ?? blankEntry()) : undefined,
     tileBase: ed.tileBase,

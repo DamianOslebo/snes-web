@@ -209,6 +209,50 @@ idle:
   bra idle
 ```
 
+### `src/gfx/oam.ts` (new) — the OAM sprite table + `oam_load` glue
+
+The OBJ (sprite) layer, mirroring the `vram.ts` "compact export + self-contained
+glue" pattern: `encodeOam` produces the 512-byte OAM image (what a program
+`.incbin`s as `oam.bin`) and `oamGlue` emits the pure-8-bit `oam_load` routine.
+The program only has to `JSR vram_load` then `JSR oam_load`.
+
+- **`OAM_ENTRIES = 128`**, **`OAM_BYTES = 512`** — the standard 4 bytes per slot
+  in the SNES write order: `[HPos, VPos, Name[7:0], attr]` with
+  `attr = Name[8] | priority<<4 | flipH<<6 | flipV<<7` (the `REGISTER_2104`
+  normal path in `core/snes9x-2010/core/ppu.c`).
+- **Sprite size is GLOBAL, not per-slot** — OBJSEL ($2101) picks it once for
+  the whole ROM: `OBJSEL_8X8 = $00` (one 8×8 char IS the sprite, any char
+  index) and `OBJSEL_16X16 = $60` (a 2×2 block of four 8×8 chars — `tile` is
+  the **top-left char on an even char column**; the SNES lays 8×8 chars out
+  **16 per row**, so the block is `tile, tile+1, tile+16, tile+17`, the bottom
+  pair 16 below, not 8). The OAM byte layout is identical for both;
+  `oamGlue(name, size)` bakes the chosen OBJSEL in — it is the ONE size every
+  sprite in the ROM draws at.
+- **`encodeOamEntry(e)` / `encodeOam(slots)`** — `OamEntry {tile, x, y,
+  flipH?, flipV?, priority?}`; unset slots are written `OAM_HIDDEN` (VPos = 255,
+  off the extended screen) so they render nothing and consume none of the
+  32-sprites-per-line budget.
+- **`oamGlue(dataName = 'oam.bin', size = '16x16')`** — `oam_load`: OBJSEL ←
+  size, OAMADDR ← 0, TM ← BG0+OBJ **absolutely** (no PPU register reads — this
+  snes9x fork returns OpenBus garbage on reads, so a read-modify-write would
+  write a random value), then streams the 512 bytes through OAMDATA ($2104).
+  Scratch is zero-page `$30/$31`, clear of `vramGlue`'s `$20–$2a` and
+  `spcGlue`'s `$10–$17`, so all three routines coexist in one ROM.
+- **OBJ palette** — a sprite samples CGRAM palette 8 (StartPalette hard-wired
+  to 128, ppu.c:1802), which is where the editor's **OBJ palette (colors
+  16–31)** lands when `buildVramCompact` gets `objPalette`; index 16 = the
+  sprite transparency slot. So: paint the sprite chars as usual, colour them
+  with `gfx_set_palette_color` indices **16 + N**, and a char painted with
+  background colour N renders as OBJ colour 16+N.
+- **Priority decides visibility** — a sprite draws at z = 36 + 4·P against a
+  non-priority BG0 at z = 39: priority 0–1 under the background, 2–3 over it.
+  Over a painted background, use `priority: 2` or the screen looks blank.
+- **Agent tools** ([AGENT.md](AGENT.md)): `gfx_set_oam_entry` /
+  `gfx_clear_oam` edit the slots; `gfx_export_oam` (destName `oam.bin`,
+  `size` "8x8"|"16x16") compiles the table, registers it, and appends
+  `oam_load` — idempotent, and re-exporting with a different `size` replaces
+  the glue with the new OBJSEL.
+
 ### `src/gfx/decode.ts` (new) — the Inspector's reader
 
 The inverse of the encoders, all reading straight out of a 64 KB buffer:
@@ -216,7 +260,7 @@ The inverse of the encoders, all reading straight out of a 64 KB buffer:
 (16×16 composes its four sub-tiles); `decodePalette(vram, paletteIndex)` → 16
 `Rgb15`; `decodeTilemap(vram, mapBase?, count?)`. Range-checked against the buffer.
 
-### Tests (node env) — 47 tests, all green
+### Tests (node env) — 66 tests, all green
 
 - **`test/gfx-tile.test.ts` (14)** — per-mode 0-7 round-trip
   (encode→decode identical); exact byte counts (16/32/64 per sub-tile, ×4 for 16×16);
@@ -242,6 +286,14 @@ The inverse of the encoders, all reading straight out of a 64 KB buffer:
   carries `vram.bin` in verbatim, and with the agent's minimal `reset: jsr
   vram_load` entry produces a **valid 256 KB LoROM SFC** (reset vector →
   `$008000`).
+- **`test/gfx-oam.test.ts` (19)** — the 4-byte slot order and attr packing
+  (including Name[8] for tiles ≥ 256); the 512 B table and the hidden-slot fill;
+  the per-size OBJSEL ($00/$60) and that the 8×8 vs 16×16 glue differs **only**
+  in that OBJSEL byte; the glue never reads a PPU register back; both sizes
+  assemble with the real assembler into a valid 256 KB LoROM SFC; and — when the
+  wasm build is present — the **real core** renders the same white char as an
+  8×8 sprite in one ROM and a 16×16 in another (boundary boxes prove the size,
+  priority 2 puts the sprite over the painted background).
 
 ## `?gfx=1` page — `src/ui/graphics.ts` (`mountGraphics`)
 
@@ -271,6 +323,15 @@ emulator boot, so the **Editor works fully core-free on any origin**.
   index space is therefore limited to indices 0-15 (one palette). Transparency is
   "index 0" or a color with its transparent flag set, in both the preview and the
   painted tile. A multi-palette (256-color) editor is a v2 item.
+- **🎯 Sprites (OAM) tab** (core-free, a third tab next to Inspector/Editor):
+  a **global size selector** (8×8 / 16×16 — the ONE size every sprite in the ROM
+  draws at, baked into OBJSEL at export), an **OBJ palette editor** (colors
+  16–31 — what sprites sample; index 16 = the sprite transparency slot; exported
+  to CGRAM palette 8), and a **128-slot OAM table** (per slot: tile, x, y, flip
+  H/V, priority 0–3; "clear all sprites" hides the rest with VPos 255). The
+  pane's hint states the 16×16 rule: the tile is the **top-left char of the
+  2×2 block**, on an **even char column** (chars are laid out 16 per row → the
+  block is tile, tile+1, tile+16, tile+17).
 
 ## Wiring
 
@@ -290,6 +351,7 @@ npx vitest run test/gfx-palette.test.ts   # 8 tests  (5-5-5 round-trips, rgb5to8
 npx vitest run test/gfx-tilemap.test.ts   # 7 tests  (entry bits, 2048 B, guard)
 npx vitest run test/gfx-vram.test.ts      # 11 tests (buildVram layout + round-trip)
 npx vitest run test/gfx-vram-compact.test.ts  # 7 tests (compact export + vram_load glue + ROM)
+npx vitest run test/gfx-oam.test.ts    # 19 tests (slot bytes, OBJSEL per size, LoROM, real-core render of both sizes)
 npx vitest run                           # full suite
 npm run typecheck
 npm run build

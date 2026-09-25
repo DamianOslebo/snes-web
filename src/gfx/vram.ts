@@ -19,6 +19,15 @@ import { encodeTilemapAt, MAP_BYTES, type TilemapEntry } from './tilemap';
 /** 64 KB PPU VRAM (matches `VRAM_SIZE` in `src/core/types.ts`). */
 export const VRAM_SIZE = 0x10000;
 
+/**
+ * The CGRAM palette index the OBJ (sprite) palette lives at. This is fixed by
+ * the core, not a choice: `S9xInitOBJ` hard-wires `BG.StartPalette = 128`
+ * (ppu.c:1802), so the OAM palette field P colours from CGRAM palette 8+P.
+ * With v1 pinning the OAM palette field to 0 (see `src/gfx/oam.ts`), every
+ * sprite colours from CGRAM palette 8 (colors 128-143, byte $C100).
+ */
+export const OBJ_PALETTE_CGRAM = 8;
+
 export interface BuildVramOptions {
   /** Background mode 0-7 (selects tile depth/size — see `MODES` in tile-encode). */
   mode: number;
@@ -32,6 +41,14 @@ export interface BuildVramOptions {
    * `paletteBase + i`.
    */
   palettes: Rgb15[][];
+  /**
+   * Optional OBJ (sprite) palette — 16 colors, written to CGRAM palette 8
+   * (byte $C100). This is the palette every sprite colours from (v1 pins the
+   * OAM palette field to 0; see `OBJ_PALETTE_CGRAM` and `src/gfx/oam.ts`).
+   * It is a SEPARATE CGRAM region from `palettes` (which lands at `paletteBase`),
+   * so a sprite palette can be authored independently of the background palette.
+   */
+  objPalette?: Rgb15[];
   /** Optional tilemap entries (up to 1024) placed at `mapBase`. */
   tilemap?: TilemapEntry[];
   /**
@@ -58,6 +75,7 @@ export function buildVram(opts: BuildVramOptions): Uint8Array {
     mode,
     tiles,
     palettes,
+    objPalette,
     tilemap,
     tileBase = 0,
     paletteBase = 0,
@@ -79,6 +97,16 @@ export function buildVram(opts: BuildVramOptions): Uint8Array {
     const bytes = encodePalette(palettes[i]);
     if (off + bytes.length > VRAM_SIZE) {
       throw new Error(`buildVram: palette ${paletteBase + i} at $${off.toString(16)} exceeds VRAM`);
+    }
+    vram.set(bytes, off);
+  }
+
+  // 2b) OBJ (sprite) palette — CGRAM palette 8 (byte $C100), a separate region.
+  if (objPalette) {
+    const off = cgramOffset(OBJ_PALETTE_CGRAM);
+    const bytes = encodePalette(objPalette);
+    if (off + bytes.length > VRAM_SIZE) {
+      throw new Error(`buildVram: obj palette at $${off.toString(16)} exceeds VRAM`);
     }
     vram.set(bytes, off);
   }
@@ -149,6 +177,7 @@ export function buildVramCompact(opts: BuildVramOptions): VramCompact {
     mode,
     tiles,
     palettes,
+    objPalette,
     tilemap,
     altTilemap,
     tileBase = 0,
@@ -200,6 +229,15 @@ export function buildVramCompact(opts: BuildVramOptions): VramCompact {
   const palStart = 0xc000 + paletteBase * 32;
   const palLen = palettes.length * 32;
   if (palLen > 0) regions.push({ dest: palStart, bytes: full.slice(palStart, palStart + palLen) });
+
+  // 3b) OBJ (sprite) palette — CGRAM palette 8 (byte $C100). A SEPARATE region
+  //     from the main palette, and word dest $6080 (dest_hi $60) so the glue's
+  //     CGRAM branch (dest_hi ≥ $60) streams it through $2121/$2122 with
+  //     CGADD base 128 — exactly the colours the sprites will sample.
+  if (objPalette) {
+    const objStart = cgramOffset(OBJ_PALETTE_CGRAM);
+    regions.push({ dest: objStart, bytes: encodePalette(objPalette) });
+  }
 
   // Concatenate the region bytes (blob order = block order) and split each
   // region into ≤255-word blocks. `r.dest` is a byte offset; the PPU wants a

@@ -32,7 +32,7 @@ function miniControllers() {
     run: () => ({ ok: true }),
   };
   const gfx: GfxController = {
-    getState: () => ({ mode: 0, tiles: 1, palette: 16, mapEntries: 1024, altMapEntries: 0 }),
+    getState: () => ({ mode: 0, tiles: 1, palette: 16, objPalette: 16, mapEntries: 1024, altMapEntries: 0, oamEntries: 0 }),
     setPaletteColor: () => {},
     setTilePixel: () => {},
     fillTileRect: () => {},
@@ -43,6 +43,10 @@ function miniControllers() {
     setAltMapEntry: () => {},
     fillAltMap: () => {},
     setAltMapFromGrid: () => {},
+    setOamEntry: () => {},
+    clearOam: () => {},
+    buildOam: () => new Uint8Array(512),
+    oamGlue: () => ';oam glue',
     buildVram: () => new Uint8Array(4),
     buildVramCompact: () => ({ blob: new Uint8Array(4), blocks: [{ dest: 0, len: 2 }], mapBase: 0x1000, bgmode: 0 }),
     vramGlue: () => ';vram glue',
