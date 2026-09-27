@@ -50,6 +50,7 @@ function miniControllers() {
     buildVram: () => new Uint8Array(4),
     buildVramCompact: () => ({ blob: new Uint8Array(4), blocks: [{ dest: 0, len: 2 }], mapBase: 0x1000, bgmode: 0 }),
     vramGlue: () => ';vram glue',
+    vramGlueLz: () => ';vram glue lz',
   };
   const track: TrackController = {
     getSong: () => '{"v":1,"name":"S","tempo":8,"orders":[0],"patterns":[],"instruments":[]}',
@@ -63,6 +64,7 @@ function miniControllers() {
     stop: () => ({ ok: true }),
     buildSpc: () => new Uint8Array(2),
     spcGlue: () => ';glue',
+    spcGlueLz: () => ';glue lz',
     spcLayout: () => ({}),
   };
   return { controllers: { asm, gfx, track } as AgentControllers, log };

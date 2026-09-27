@@ -28,6 +28,7 @@
 
 import { encodeBrr, BRR_SAMPLES_PER_BLOCK } from './brr';
 import { buildDriver, DRIVER_BYTE_LENGTH } from './driver';
+import { lzDecodeCall, lzRepoint } from '../asm/lzss';
 
 // --- SPC-RAM placement -------------------------------------------------------
 export const SPC_RAM_SIZE = 0x10000;        // the SPU's own 64 KB
@@ -259,6 +260,40 @@ spc_term:
 spc_data:
   .incbin "${dataName}"
 `;
+}
+
+/**
+ * `spcGlue` with the data pointer re-pointed at the decompressed
+ * `LZ_SCRATCH` buffer instead of the embedded blob: where `spcGlue` loads
+ * `$10/$11` = `spc_data`, the LZ variant instead emits `lzDecodeCall` (set
+ * `$40/$41` = `spc_data`, `$42/$43` = `LZ_SCRATCH`, `jsr lz_decode`) and then
+ * `lzRepoint('$10','$11')` (data ptr -> `LZ_SCRATCH`). Everything else — the
+ * SPU-ready wait, the Appendix D block walk, the $2140–$2143 port streaming,
+ * the start-address + terminate — is byte-identical to `spcGlue`. The
+ * `.incbin` at `spc_data` holds the COMPRESSED blob; `lz_decode` expands it
+ * into WRAM before the walk streams it out to the SPU.
+ *
+ * Implemented as a targeted swap of the raw data-pointer block so `spcGlue`
+ * stays the single source of the walker; the guard throws if that block is
+ * ever refactored (rather than silently emitting a ROM that never decompresses).
+ */
+export function spcGlueLz(dataName = 'spc.bin'): string {
+  const raw = spcGlue(dataName);
+  // The exact data-pointer setup `spcGlue` emits (layout.ts: `pea spc_data …`).
+  const rawPtr =
+    '  pea spc_data          ; push the 16-bit address of the embedded data\n' +
+    '  pla                   ; A = low byte (PEA writes high first, so low pops first)\n' +
+    '  sta $10               ; ptr_lo\n' +
+    '  pla                   ; A = high byte\n' +
+    '  sta $11               ; ptr_hi\n';
+  const lzPtr = lzDecodeCall('spc_data') + lzRepoint('$10', '$11');
+  // Function replacement: no `$`-sequence interpretation in `lzPtr` (full of
+  // `lda #$02`, `sta $41`, …), and only the first (unique) block is swapped.
+  const out = raw.replace(rawPtr, () => lzPtr);
+  if (out === raw) {
+    throw new Error('spcGlueLz: the raw data-pointer block moved — re-derive the LZ swap against spcGlue');
+  }
+  return out;
 }
 
 // --- metadata (for the tools / panel) ----------------------------------------

@@ -18,6 +18,7 @@
 
 import { NOTE_MAX, NOTE_MIN, parseNoteName } from '../track/model';
 import type { OamSize } from '../gfx/oam';
+import { LZ_GLUE_EXTRA, LZ_ROUTINE_BYTES, lzssCompress, lzssGlue } from '../asm/lzss';
 import type { AgentControllers, ToolResult, ToolSpec } from './types';
 
 export interface ToolCtx {
@@ -42,10 +43,14 @@ export const MAX_MANUAL_DATA_BYTES = 64 * 1024;
 // (e.g. after painting more tiles) REPLACES the old block instead of duplicating
 // it — a duplicate `vram_load:` label would otherwise fail assembly. Markers are
 // `;`-prefixed, so the assembler treats them as plain comments.
-const GLUE_MARKERS: Record<'gfx' | 'spc' | 'oam', { start: string; end: string }> = {
+const GLUE_MARKERS: Record<'gfx' | 'spc' | 'oam' | 'lz', { start: string; end: string }> = {
   gfx: { start: ';=== GFX_VRAM_GLUE (generated) ===', end: ';=== /GFX_VRAM_GLUE ===' },
   spc: { start: ';=== SPC_GLUE (generated; EXPERIMENTAL) ===', end: ';=== /SPC_GLUE ===' },
   oam: { start: ';=== GFX_OAM_GLUE (generated) ===', end: ';=== /GFX_OAM_GLUE ===' },
+  // The shared LZSS decompressor. BOTH gfx and spc export it (via `lzssGlue()`),
+  // and it carries its own `lz_decode` label, so it must upsert into ONE shared
+  // block — never once per asset (a duplicate `lz_decode:` label would fail assembly).
+  lz: { start: ';=== LZSS_DECODE_GLUE (generated) ===', end: ';=== /LZSS_DECODE_GLUE ===' },
 };
 
 /**
@@ -55,10 +60,17 @@ const GLUE_MARKERS: Record<'gfx' | 'spc' | 'oam', { start: string; end: string }
  * after changing graphics or music converges to the same source instead of
  * duplicating the block (a duplicate `vram_load`/`spc_load` label would fail
  * assembly).
+ *
+ * Most glue (`vramGlue`, `spcGlue`, `oamGlue`) is a bare routine and gets its
+ * `start`/`end` markers added here. `lzssGlue()` is self-contained and ALREADY
+ * carries its own `start`/`end` markers — re-wrapping it would nest the markers
+ * (and, worse, emit a second `lz_decode`), so a self-delimited block is used
+ * verbatim.
  */
-function upsertGlue(c: AgentControllers, kind: 'gfx' | 'spc' | 'oam', block: string): void {
+function upsertGlue(c: AgentControllers, kind: 'gfx' | 'spc' | 'oam' | 'lz', block: string): void {
   const { start, end } = GLUE_MARKERS[kind];
-  const body = `${start}\n${block}\n${end}`;
+  const selfDelimited = block.startsWith(start) && block.trimEnd().endsWith(end);
+  const body = selfDelimited ? block : `${start}\n${block}\n${end}`;
   const src = c.asm.getSource();
   const s = src.indexOf(start);
   if (s >= 0) {
@@ -70,6 +82,44 @@ function upsertGlue(c: AgentControllers, kind: 'gfx' | 'spc' | 'oam', block: str
   }
   // Not present — append with a single blank-line separator.
   c.asm.appendSource(`\n${body}`);
+}
+
+/**
+ * Register one compiled asset (VRAM or SPC package) on the asm page as an
+ * `.incbin` data file, choosing the smaller of the raw or the LZSS-compressed
+ * blob, and appending the matching 65C816 glue.
+ *
+ * The compressed path costs the (shared) `lz_decode` routine plus a little
+ * glue. `overhead` is charged only on the FIRST LZ asset in the ROM — once the
+ * source already carries the LZ block, the second asset reuses it for free.
+ * We take the compressed path only when it actually wins after that charge:
+ * `compressed.length + overhead < raw.length`. Otherwise the raw path is kept
+ * byte-for-byte, so the ROM is NEVER made larger by enabling compression.
+ */
+function exportAsset(
+  c: AgentControllers,
+  kind: 'gfx' | 'spc',
+  dataName: string,
+  raw: Uint8Array,
+  rawGlue: () => string,
+  lzGlue: () => string,
+): { bytes: number; dataFile: string; glueAppended: true; compressed: boolean; rawBytes: number } {
+  const srcHasLz = c.asm.getSource().includes(GLUE_MARKERS.lz.start);
+  const overhead = (srcHasLz ? 0 : LZ_ROUTINE_BYTES) + LZ_GLUE_EXTRA;
+  const compressed = lzssCompress(raw);
+  if (compressed.length + overhead < raw.length) {
+    c.asm.addDataFile(dataName, compressed);
+    // One shared decompressor for the whole ROM — upserted into a single
+    // marker block, so a later LZ asset reuses it instead of duplicating the
+    // `lz_decode` label.
+    upsertGlue(c, 'lz', lzssGlue());
+    upsertGlue(c, kind, lzGlue());
+    return { bytes: compressed.length, dataFile: dataName, glueAppended: true, compressed: true, rawBytes: raw.length };
+  }
+  // Compression can't beat raw — keep the current path unchanged.
+  c.asm.addDataFile(dataName, raw);
+  upsertGlue(c, kind, rawGlue());
+  return { bytes: raw.length, dataFile: dataName, glueAppended: true, compressed: false, rawBytes: raw.length };
 }
 
 // --- result helpers ---------------------------------------------------------
@@ -749,11 +799,11 @@ const DEFS: ToolDef[] = [
     },
     run: (a, c) => {
       const compact = c.gfx.buildVramCompact();
-      const bytes = compact.blob;
+      const raw = compact.blob;
       const dn = optStrF(a, 'destName');
       if (dn.e) return fail(dn.e);
       const layout = {
-        bytes: bytes.length,
+        bytes: raw.length,
         blocks: compact.blocks.length,
         mapBase: compact.mapBase,
         altMapBase: compact.altMapBase,
@@ -761,13 +811,14 @@ const DEFS: ToolDef[] = [
         bgmode: compact.bgmode,
       };
       if (dn.v) {
-        c.asm.addDataFile(dn.v, bytes);
-        // Idempotent: replaces any previous vram glue block, so re-exporting
-        // after painting more tiles can't produce a duplicate `vram_load` label.
-        upsertGlue(c, 'gfx', c.gfx.vramGlue(dn.v));
-        return ok({ bytes: bytes.length, dataFile: dn.v, glueAppended: true, layout });
+        // Compress the blob when it actually shrinks the ROM (see exportAsset);
+        // the matching glue — raw `vram_load`, or `vram_load` over `lz_decode` —
+        // is appended to match. Idempotent either way (a later re-export after
+        // painting more tiles replaces the block instead of duplicating it).
+        const r = exportAsset(c, 'gfx', dn.v, raw, () => c.gfx.vramGlue(dn.v), () => c.gfx.vramGlueLz(dn.v));
+        return ok({ ...r, layout });
       }
-      return ok({ bytes: bytes.length, glue: c.gfx.vramGlue(), layout });
+      return ok({ bytes: raw.length, glue: c.gfx.vramGlue(), layout });
     },
   },
   {
@@ -998,17 +1049,18 @@ const DEFS: ToolDef[] = [
       },
     },
     run: (a, c) => {
-      const bytes = c.track.buildSpc();
+      const raw = c.track.buildSpc();
       const dn = optStrF(a, 'destName');
       if (dn.e) return fail(dn.e);
       const layout = c.track.spcLayout();
       if (dn.v) {
-        c.asm.addDataFile(dn.v, bytes);
-        // Idempotent: replaces any previous spc glue block (see `upsertGlue`).
-        upsertGlue(c, 'spc', c.track.spcGlue(dn.v));
-        return ok({ bytes: bytes.length, dataFile: dn.v, glueAppended: true, layout });
+        // Compress the SPC package when it actually shrinks the ROM (see
+        // exportAsset); the matching glue — raw `spc_load`, or `spc_load` over
+        // `lz_decode` — is appended to match. Idempotent either way.
+        const r = exportAsset(c, 'spc', dn.v, raw, () => c.track.spcGlue(dn.v), () => c.track.spcGlueLz(dn.v));
+        return ok({ ...r, layout });
       }
-      return ok({ bytes: bytes.length, glue: c.track.spcGlue(), layout });
+      return ok({ bytes: raw.length, glue: c.track.spcGlue(), layout });
     },
   },
 ];

@@ -15,6 +15,7 @@
 import { charBytesForMode, encodeTileAt, tileCharStride } from './tile-encode';
 import { encodePalette, cgramOffset, type Rgb15 } from './palette';
 import { encodeTilemapAt, MAP_BYTES, type TilemapEntry } from './tilemap';
+import { lzDecodeCall, lzRepoint } from '../asm/lzss';
 
 /** 64 KB PPU VRAM (matches `VRAM_SIZE` in `src/core/types.ts`). */
 export const VRAM_SIZE = 0x10000;
@@ -490,4 +491,38 @@ ${table}
 vram_data:
   .incbin "${dataName}"
 `;
+}
+
+/**
+ * `vramGlue` with the data pointer re-pointed at the decompressed
+ * `LZ_SCRATCH` buffer instead of the embedded blob: where `vramGlue` loads
+ * `$20/$21` = `vram_data`, the LZ variant instead emits `lzDecodeCall` (set
+ * `$40/$41` = `vram_data`, `$42/$43` = `LZ_SCRATCH`, `jsr lz_decode`) and then
+ * `lzRepoint('$20','$21')` (data ptr -> `LZ_SCRATCH`). Everything else — the PPU
+ * bring-up, the block walk, the CGRAM/tilemap paths, the OS routines — is
+ * byte-identical to `vramGlue`. The `.incbin` at `vram_data` holds the
+ * COMPRESSED blob; `lz_decode` expands it into WRAM before the walk streams it
+ * out to VRAM/CGRAM.
+ *
+ * Implemented as a targeted swap of the raw data-pointer block so `vramGlue`
+ * stays the single source of the walker; the guard throws if that block is
+ * ever refactored (rather than silently emitting a ROM that never decompresses).
+ */
+export function vramGlueLz(mapBase: number, bgmode: number, blocks: VramBlock[], dataName = 'vram.bin', altMapBase?: number): string {
+  const raw = vramGlue(mapBase, bgmode, blocks, dataName, altMapBase);
+  // The exact data-pointer setup `vramGlue` emits (vram.ts: `pea vram_data …`).
+  const rawPtr =
+    '  pea vram_data\n' +
+    '  pla\n' +
+    '  sta $20                  ; data ptr lo\n' +
+    '  pla\n' +
+    '  sta $21                  ; data ptr hi\n';
+  const lzPtr = lzDecodeCall('vram_data') + lzRepoint('$20', '$21');
+  // Function replacement: no `$`-sequence interpretation in `lzPtr` (it is full
+  // of `lda #$02`, `sta $41`, …), and only the first (unique) block is swapped.
+  const out = raw.replace(rawPtr, () => lzPtr);
+  if (out === raw) {
+    throw new Error('vramGlueLz: the raw data-pointer block moved — re-derive the LZ swap against vramGlue');
+  }
+  return out;
 }

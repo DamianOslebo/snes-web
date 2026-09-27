@@ -15,7 +15,7 @@
 import { MODES, colorsForMode, depthForMode, sizeForMode } from '../gfx/tile-encode';
 import { cgramOffset, rgb5to8, type Rgb15 } from '../gfx/palette';
 import { MAP_ENTRIES, type TilemapEntry } from '../gfx/tilemap';
-import { VRAM_SIZE, buildVram as buildVramImage, buildVramCompact, vramGlue as vramGlueGen, type BuildVramOptions } from '../gfx/vram';
+import { VRAM_SIZE, buildVram as buildVramImage, buildVramCompact, vramGlue as vramGlueGen, vramGlueLz as vramGlueLzGen, type BuildVramOptions } from '../gfx/vram';
 import { OAM_ENTRIES, encodeOam, oamGlue, type OamEntry, type OamSize } from '../gfx/oam';
 import { decodePalette, decodeTile } from '../gfx/decode';
 import { toHexRows } from '../debug/memory-view';
@@ -1750,6 +1750,11 @@ export function makeGfxController(): GfxController {
       // `c.altMapBase` (present only when an alt tilemap was authored) is what
       // makes the generated glue emit the `vram_toggle` service routine.
       return vramGlueGen(c.mapBase, c.bgmode, c.blocks, dataName, c.altMapBase);
+    },
+
+    vramGlueLz(dataName) {
+      const c = buildVramCompact(gfxVramOpts());
+      return vramGlueLzGen(c.mapBase, c.bgmode, c.blocks, dataName, c.altMapBase);
     },
   };
 }

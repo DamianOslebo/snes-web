@@ -30,6 +30,13 @@ function mockControllers() {
     stop: { ok: true } as { ok: boolean; error?: string },
   };
 
+  // Overridable per-test export blobs. Defaults are tiny, so the fallback rule
+  // always takes the RAW path unless a test swaps in a large/compressible blob.
+  const blobs = {
+    vram: new Uint8Array([0, 1, 2, 3]),
+    spc: new Uint8Array([9, 9]),
+  };
+
   const asm: AsmController = {
     getSource: () => sources.src,
     setSource: (s) => {
@@ -76,12 +83,13 @@ function mockControllers() {
     oamGlue: (n, size) => `; oam glue for ${n ?? 'oam.bin'} (${size ?? '16x16'})`,
     buildVram: () => new Uint8Array([0, 1, 2, 3]),
     buildVramCompact: () => ({
-      blob: new Uint8Array([0, 1, 2, 3]),
+      blob: blobs.vram,
       blocks: [{ dest: 0, len: 2 }],
       mapBase: 0x1000,
       bgmode: 0,
     }),
     vramGlue: (n) => `; vram glue for ${n ?? 'vram.bin'}`,
+    vramGlueLz: (n) => `; vram glue lz for ${n ?? 'vram.bin'}`,
   };
 
   const track: TrackController = {
@@ -111,13 +119,14 @@ function mockControllers() {
     },
     preview: () => results.preview,
     stop: () => results.stop,
-    buildSpc: () => new Uint8Array([9, 9]),
+    buildSpc: () => blobs.spc,
     spcGlue: (n) => `; glue for ${n ?? 'spc.bin'}`,
+    spcGlueLz: (n) => `; glue lz for ${n ?? 'spc.bin'}`,
     spcLayout: () => ({ start: 0x40 }),
   };
 
   const controllers: AgentControllers = { asm, gfx, track };
-  return { controllers, rec, files, sources, results };
+  return { controllers, rec, files, sources, results, blobs };
 }
 
 function dispatch(m: ReturnType<typeof mockControllers>, name: string, args: Record<string, unknown> = {}): ToolResult {
@@ -448,6 +457,48 @@ describe('gfx tools', () => {
     expect(dispatch(m, 'gfx_export_vram', { destName: 5 }).ok).toBe(false);
   });
 
+  it('gfx_export_vram compresses when LZ actually shrinks the ROM', () => {
+    const m = mockControllers();
+    m.blobs.vram = new Uint8Array(2000).fill(0); // a run of zeroes compresses hard
+    const r = dispatch(m, 'gfx_export_vram', { destName: 'vram.bin' });
+    const body = JSON.parse(r.content) as { bytes: number; rawBytes: number; compressed: boolean };
+    expect(r.ok).toBe(true);
+    expect(body.compressed).toBe(true);
+    expect(body.rawBytes).toBe(2000);
+    expect(body.bytes).toBeLessThan(2000); // the COMPRESSED blob was embedded, not the raw image
+    expect(m.files.get('vram.bin')!.length).toBe(body.bytes);
+    // The shared decompressor was appended exactly once, and the LZ glue (not raw).
+    expect(m.sources.src.match(/LZSS_DECODE_GLUE \(generated\)/g)!.length).toBe(1);
+    expect(m.sources.src).toContain('vram glue lz for vram.bin');
+  });
+
+  it('gfx_export_vram falls back to raw when LZ cannot beat the decompressor overhead', () => {
+    const m = mockControllers();
+    m.blobs.vram = new Uint8Array([0, 1, 2, 3]); // 4 bytes < ~206 B of glue overhead
+    const r = dispatch(m, 'gfx_export_vram', { destName: 'vram.bin' });
+    const body = JSON.parse(r.content) as { bytes: number; rawBytes: number; compressed: boolean };
+    expect(r.ok).toBe(true);
+    expect(body.compressed).toBe(false);
+    expect(body.bytes).toBe(4);
+    expect(body.rawBytes).toBe(4);
+    // Raw image embedded, raw glue used, and NO shared decompressor appended.
+    expect(m.files.get('vram.bin')!).toEqual(new Uint8Array([0, 1, 2, 3]));
+    expect(m.sources.src).toContain('vram glue for vram.bin');
+    expect(m.sources.src).not.toContain('LZSS_DECODE_GLUE');
+  });
+
+  it('gfx + spc LZ exports share ONE decompressor block (no duplicate lz_decode)', () => {
+    const m = mockControllers();
+    m.blobs.vram = new Uint8Array(2000).fill(0);
+    m.blobs.spc = new Uint8Array(1500).fill(0x11);
+    dispatch(m, 'gfx_export_vram', { destName: 'vram.bin' });
+    dispatch(m, 'trk_export_spc', { destName: 'spc.bin' });
+    expect(m.sources.src.match(/LZSS_DECODE_GLUE \(generated\)/g)!.length).toBe(1);
+    expect(m.sources.src.match(/\/LZSS_DECODE_GLUE/g)!.length).toBe(1);
+    expect(m.sources.src).toContain('vram glue lz for vram.bin');
+    expect(m.sources.src).toContain('glue lz for spc.bin');
+  });
+
   it('gfx_set_oam_entry places a sprite with flip/priority defaults filled in', () => {
     const m = mockControllers();
     const r = dispatch(m, 'gfx_set_oam_entry', { slot: 3, tile: 8, x: 100, y: 50 });
@@ -600,5 +651,32 @@ describe('trk tools', () => {
     expect(body.glue).toContain('glue for spc.bin');
     expect(m.files.size).toBe(0);
     expect(m.rec.filter((x) => x.fn === 'appendSource')).toHaveLength(0);
+  });
+
+  it('trk_export_spc compresses when LZ actually shrinks the ROM', () => {
+    const m = mockControllers();
+    m.blobs.spc = new Uint8Array(1500).fill(0x11);
+    const r = dispatch(m, 'trk_export_spc', { destName: 'spc.bin' });
+    const body = JSON.parse(r.content) as { bytes: number; rawBytes: number; compressed: boolean };
+    expect(r.ok).toBe(true);
+    expect(body.compressed).toBe(true);
+    expect(body.rawBytes).toBe(1500);
+    expect(body.bytes).toBeLessThan(1500);
+    expect(m.files.get('spc.bin')!.length).toBe(body.bytes);
+    expect(m.sources.src).toContain('glue lz for spc.bin');
+    expect(m.sources.src.match(/LZSS_DECODE_GLUE \(generated\)/g)!.length).toBe(1);
+  });
+
+  it('trk_export_spc falls back to raw when LZ cannot beat the decompressor overhead', () => {
+    const m = mockControllers();
+    m.blobs.spc = new Uint8Array([9, 9]); // 2 bytes < ~206 B of glue overhead
+    const r = dispatch(m, 'trk_export_spc', { destName: 'spc.bin' });
+    const body = JSON.parse(r.content) as { bytes: number; compressed: boolean };
+    expect(r.ok).toBe(true);
+    expect(body.compressed).toBe(false);
+    expect(body.bytes).toBe(2);
+    expect(m.files.get('spc.bin')!).toEqual(new Uint8Array([9, 9]));
+    expect(m.sources.src).toContain('glue for spc.bin');
+    expect(m.sources.src).not.toContain('LZSS_DECODE_GLUE');
   });
 });

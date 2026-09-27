@@ -197,6 +197,14 @@ export interface GfxController {
    * `dataName` is the `.incbin` file name the glue references (default "vram.bin").
    */
   vramGlue(dataName?: string): string;
+  /**
+   * `vramGlue` with LZ: the `.incbin` at `dataName` holds the COMPRESSED blob,
+   * and the routine decompresses it into a WRAM scratch buffer before the block
+   * walk. Byte-identical to `vramGlue` except the data-pointer setup is swapped
+   * for `jsr lz_decode` + a repoint at the scratch buffer. Used by the export
+   * tool only when compression actually shrinks the ROM.
+   */
+  vramGlueLz(dataName?: string): string;
 }
 
 /** Music page: the S-DSP song, and the SPC package export. */
@@ -233,6 +241,14 @@ export interface TrackController {
    * "spc.bin").
    */
   spcGlue(dataName?: string): string;
+  /**
+   * `spcGlue` with LZ: the `.incbin` at `dataName` holds the COMPRESSED blob,
+   * and the routine decompresses it into a WRAM scratch buffer before the
+   * Appendix D walk. Byte-identical to `spcGlue` except the data-pointer setup
+   * is swapped for `jsr lz_decode` + a repoint at the scratch buffer. Used by
+   * the export tool only when compression actually shrinks the ROM.
+   */
+  spcGlueLz(dataName?: string): string;
   /** A compact layout summary (sample/driver offsets) for the agent. */
   spcLayout(): Record<string, unknown>;
 }

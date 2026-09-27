@@ -39,6 +39,7 @@ import type { TrackController } from '../agent/types';
 import {
   buildSpc as buildSpcPackage,
   spcGlue as spcGlueSrc,
+  spcGlueLz as spcGlueLzSrc,
   spcLayout as spcLayoutInfo,
 } from '../spc/layout';
 
@@ -940,6 +941,10 @@ export function makeTrackController(): TrackController {
 
     spcGlue(dataName) {
       return spcGlueSrc(dataName);
+    },
+
+    spcGlueLz(dataName) {
+      return spcGlueLzSrc(dataName);
     },
 
     spcLayout() {
