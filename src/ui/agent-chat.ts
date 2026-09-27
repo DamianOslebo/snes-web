@@ -13,6 +13,12 @@
  * `localStorage["snes-web:agent:v1"]`); "test connection" fetches the
  * installed-model list from `/api/tags`.
  *
+ * The panel can be minimized to a corner pill (the header stays, the body
+ * hides, the root shrinks to fit). The choice persists in
+ * `localStorage["snes-web:agent-collapsed:v1"]`, is shared across all three
+ * pages, and on a fresh install it defaults to **collapsed on small screens**
+ * (where the expanded panel would crowd the dev-panel page behind it).
+ *
  * The conversation itself is ONE across all three authoring pages: the
  * message history (the exact context sent to Ollama) is persisted to
  * `localStorage["snes-web:agent-conversation:v1"]` and restored on every
@@ -38,6 +44,7 @@ import {
 } from '../agent/log';
 
 const SETTINGS_KEY = 'snes-web:agent:v1';
+const COLLAPSED_KEY = 'snes-web:agent-collapsed:v1';
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:11434';
 
 /**
@@ -74,6 +81,46 @@ export function normalizeThink(raw: string | undefined, legacy: boolean): ThinkM
   if (raw === 'on' || raw === 'off') return raw; // explicit — always respected
   if (raw === 'auto') return legacy ? 'off' : 'auto'; // legacy default → off
   return 'off'; // fresh install default
+}
+
+/**
+ * Whether the panel starts collapsed. An explicit stored preference always
+ * wins (it is shared across all three authoring pages); on a fresh install
+ * the panel starts COLLAPSED on small screens — where its expanded size
+ * would crowd the dev-panel page behind it — and expanded elsewhere.
+ *
+ * Pure + node-testable: no DOM here.
+ */
+export function initialCollapsed(stored: boolean | null, smallScreen: boolean): boolean {
+  return stored ?? smallScreen;
+}
+
+function loadCollapsed(): boolean | null {
+  try {
+    const raw = localStorage.getItem(COLLAPSED_KEY);
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+  } catch {
+    // private mode / unavailable storage — no stored preference
+  }
+  return null;
+}
+
+function saveCollapsed(collapsed: boolean): void {
+  try {
+    localStorage.setItem(COLLAPSED_KEY, String(collapsed));
+  } catch {
+    // best effort — the panel still toggles for this page load
+  }
+}
+
+/**
+ * The "mobile setting" heuristic: the same 900px breakpoint the authoring
+ * pages use to switch to their single-column mobile layout (gfx/track/asm).
+ */
+function isSmallScreen(): boolean {
+  if (typeof window === 'undefined') return false;
+  return window.matchMedia ? window.matchMedia('(max-width: 900px)').matches : window.innerWidth <= 900;
 }
 
 function loadSettings(): AgentSettings {
@@ -140,9 +187,15 @@ const CSS = `
 .agc-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #2e3440;cursor:default;flex:none}
 .agc-title{font-weight:600;font-size:14px}
 .agc-sub{color:#8a93a5;font-size:11px;margin-left:auto}
-.agc-toggle{cursor:pointer;background:none;border:none;color:#8a93a5;font-size:14px;padding:2px 6px}
+.agc-live{display:none;flex:none;width:8px;height:8px;border-radius:50%;background:#56b369}
+.agc-root.running .agc-live{display:inline-block;animation:agc-blink 1.2s infinite}
+.agc-toggle{cursor:pointer;background:none;border:none;color:#8a93a5;font-size:15px;padding:6px 10px;flex:none}
 .agc-body{display:flex;flex-direction:column;flex:1;min-height:0}
 .agc-root.collapsed .agc-body{display:none}
+/* Minimized = the pill: the root shrinks to just its header instead of
+   keeping its 600px height (which would still crowd a phone screen). */
+.agc-root.collapsed{width:auto;height:auto}
+.agc-root.collapsed .agc-head{border-bottom:none;padding:8px 10px}
 .agc-settings{display:grid;gap:6px;padding:10px 12px;border-bottom:1px solid #2e3440;flex:none}
 .agc-row{display:flex;gap:6px;align-items:center}
 .agc-settings input[type=text]{flex:1;min-width:0;background:#0f1115;border:1px solid #2e3440;border-radius:6px;color:#dde3ec;padding:5px 8px;font-size:12px}
@@ -277,17 +330,30 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
   const head = el('div', 'agc-head');
   const title = el('span', 'agc-title');
   title.textContent = '🤖 Agent';
+  const live = el('span', 'agc-live');
+  live.title = 'The agent is working';
   const sub = el('span', 'agc-sub');
   const PAGE_NAMES = { asm: 'assembler', gfx: 'graphics', track: 'tracker' } as const;
   sub.textContent = `on ${PAGE_NAMES[page]}`;
   const toggle = el('button', 'agc-toggle');
-  toggle.textContent = '▾';
-  toggle.title = 'Collapse / expand';
-  head.append(title, sub, toggle);
+  head.append(title, live, sub, toggle);
   root.appendChild(head);
-  toggle.addEventListener('click', () => {
-    const collapsed = root.classList.toggle('collapsed');
+
+  function setCollapsed(collapsed: boolean): void {
+    root.classList.toggle('collapsed', collapsed);
     toggle.textContent = collapsed ? '▸' : '▾';
+    toggle.title = collapsed ? 'Expand the agent panel' : 'Minimize the agent panel';
+    saveCollapsed(collapsed);
+  }
+  // Stored preference wins; fresh installs start collapsed on small screens
+  // so the dev-panel page behind is visible without crowding.
+  setCollapsed(initialCollapsed(loadCollapsed(), isSmallScreen()));
+  toggle.addEventListener('click', () => setCollapsed(!root.classList.contains('collapsed')));
+  // On mobile a tap anywhere on the minimized pill expands it — the arrow
+  // button alone is a small target at the far end of the pill.
+  head.addEventListener('click', (e) => {
+    if (!root.classList.contains('collapsed') || e.target === toggle) return;
+    setCollapsed(false);
   });
 
   const body = el('div', 'agc-body');
@@ -503,6 +569,9 @@ export function mountAgentChat(container: HTMLElement, page: PageKind, controlle
   }
 
   function renderAll(): void {
+    // Keeps the header's green "working" dot in sync — visible in the
+    // minimized pill, so a collapsed panel still shows the turn is in flight.
+    root.classList.toggle('running', running);
     msgs.innerHTML = '';
     for (const it of items) {
       if (it.kind === 'user') {
