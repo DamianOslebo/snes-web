@@ -301,7 +301,10 @@ export function buildVramCompact(opts: BuildVramOptions): VramCompact {
  * The glue ALSO always emits two OS service routines the program `JSR`s — the
  * "OS library" for input + screen switching, so the program never hand-rolls
  * PPU register writes:
- *   - `pad_read`    : A <- the raw pad byte ($4016); buttons active-LOW.
+ *   - `pad_read`    : controller-1 state as two bytes, bit SET = pressed:
+ *                     A <- $4218 (bit7=A bit6=X bit5=L bit4=R),
+ *                     X <- $4219 (bit7=B bit6=Y bit5=SELECT bit4=START
+ *                     bit3=UP bit2=DOWN bit1=LEFT bit0=RIGHT).
  *   - `vram_toggle` : (only when `altMapBase` is supplied) flip the display
  *                     between the two tilemaps by writing the ABSOLUTE BG0SC
  *                     SCBase byte for the target map (state tracked in $2a).
@@ -479,11 +482,16 @@ vram_done:
   sta $2100
   rts
 ; --- OS service routines (the program JSRs these — no PPU/SPU setup needed) ----
-; pad_read: A <- the raw pad byte ($4016). Buttons are active-LOW: a button is
-;   PRESSED when its bit is CLEAR (0). A=01 B=02 X=04 Y=08. To test button A:
-;   jsr pad_read / and #$01 / bne pressed.
+; pad_read: controller-1 state, bit SET = PRESSED (active-HIGH).
+;   A <- $4218 (JOY1L): bit7=A  bit6=X  bit5=L  bit4=R
+;   X <- $4219 (JOY1H): bit7=B  bit6=Y  bit5=SELECT  bit4=START
+;                       bit3=UP  bit2=DOWN  bit1=LEFT  bit0=RIGHT
+; Test button A:  jsr pad_read / and #$80 / bne pressed
+; Test button B:  jsr pad_read / txa / and #$80 / bne pressed
 pad_read:
-  lda $4016
+  lda $4219
+  tax
+  lda $4218
   rts
 ${toggle}vram_blocks:
 ${table}

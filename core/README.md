@@ -126,3 +126,14 @@ faithful to run mode — no core patch required.
    values behave as they do on hardware. For the debugger's register panel,
    trust the CPU registers from `core_reg_*` (snes9x's `Cpu.h` globals) as the
    source of truth.
+
+3. **Controller state reaches ROMs via the shim, not just `joypad[]`.**
+   `core_set_controller` writes both snes9x's `joypad[]` and the CPU-visible
+   SNES registers `$4218/$4219` (port 0; `+2` per port) directly in
+   `FillRAM`. The fork's own path — `S9xDoAutoJoypad()` copying `joypad[]`
+   into `FillRAM` — is gated on `NMITIMEN & 1` (NMI enabled, cpuexec.c), and
+   `S9xResetPPU` zeroes `NMITIMEN` at reset; a ROM that never enables NMI
+   would otherwise read `$4218/$4219` as 0 forever. The `$4016` serial port
+   (`S9xReadJOYSERn`) still returns only a single bit (the B button) — SNES-
+   style ROMs should read `$4218`/`$4219` (bit SET = pressed, `$4218`: A X L R
+   in bits 7–4, `$4219`: B Y SELECT START UP DOWN LEFT RIGHT in bits 7–0).

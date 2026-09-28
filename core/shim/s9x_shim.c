@@ -363,6 +363,22 @@ void core_set_controller(int player, int buttons) {
     if (buttons & (1 << 10)) state |= SNES_TL_MASK;
     if (buttons & (1 << 11)) state |= SNES_TR_MASK;
     joypad[port] = state;
+
+    /*
+     * Also mirror the state into the CPU-visible SNES registers ($4218/$4219
+     * for port 0). In this snes9x fork, joypad[] only reaches FillRAM via
+     * S9xDoAutoJoypad, and that runs only when NMITIMEN bit 0 is set (NMI
+     * enabled) — S9xResetPPU zeroes NMITIMEN at reset, and a ROM that never
+     * enables NMI (or can't, since the NMI vector would crash it) would
+     * otherwise read $4218/$4219 as 0 forever. Writing directly makes
+     * SNES-style pad reads work in both cases; if NMI IS enabled, the
+     * auto-joypad path later writes the same value back from joypad[], so
+     * the two stay in sync.
+     */
+    if (Memory.FillRAM) {
+        Memory.FillRAM[0x4218 + 2 * port] = (uint8_t)(state & 0xff);
+        Memory.FillRAM[0x4219 + 2 * port] = (uint8_t)(state >> 8);
+    }
 }
 
 /* ------------------------------------------------------------------ */

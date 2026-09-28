@@ -53,7 +53,7 @@ The export tools generate a small OS-like library of named routines. Your progra
 - **\`vram_load\`** (from \`gfx_export_vram\`) — PPU bring-up + VRAM fill. Call once at reset.
 - **\`oam_load\`** (from \`gfx_export_oam\`) — loads the 128-slot OAM image and turns the OBJ (sprite) layer on. Call once at reset, **after** \`vram_load\`.
 - **\`vram_toggle\`** (from \`gfx_export_vram\`, present **only when a second tilemap is set**) — flip the display between the primary and the ALT SC0 screen. It is self-tracking: 1st call → alt, 2nd → primary, and so on. This is the whole "caps / uncap" mechanism.
-- **\`pad_read\`** (from \`gfx_export_vram\`) — returns the raw pad byte in A: A=\$01, B=\$02, X=\$04, Y=\$08, active-LOW (a button is DOWN when its bit is CLEAR). Use \`jsr pad_read\` instead of \`lda $4016\`.
+- **\`pad_read\`** (from \`gfx_export_vram\`) — controller-1 state in **two bytes, bit SET = pressed** (active-HIGH): A = the \$4218 byte (A=\$80, X=\$40, L=\$20, R=\$10), X = the \$4219 byte (B=\$80, Y=\$40, SELECT=\$20, START=\$10, UP=\$08, DOWN=\$04, LEFT=\$02, RIGHT=\$01). Button A: \`jsr pad_read\` / \`and #$80\` / \`bne pressed\`. Button B: \`jsr pad_read\` / \`txa\` / \`and #$80\`. Never read \`$4016\` directly — in this core it is the NES-style serial port and returns only one bit.
 - **\`spc_load\`** (from \`trk_export_spc\`) — SPU handshake + SPC package load. Call once at reset. (EXPERIMENTAL — the SPU scope is minimal; say so when you use it.)
 
 A two-screen program — e.g. "HELLO WORLD" that flips to "hello world" on a button press and back (primary map = HELLO WORLD, ALT map = hello world). Every line is either a call into the OS library or a branch:
@@ -62,13 +62,13 @@ reset:
   jsr vram_load          ; PPU bring-up + load BOTH tilemaps
 waitA:
   jsr pad_read
-  and #$01               ; A-bit: 0 = pressed, 1 = released
-  bne waitA              ; A not pressed -> keep polling
+  and #$80               ; A-bit of $4218: SET = pressed
+  beq waitA              ; A not pressed -> keep polling
   jsr vram_toggle        ; A pressed -> flip the screen
 rel:
   jsr pad_read
-  and #$01
-  beq rel                ; still pressed -> wait for release
+  and #$80
+  bne rel                ; still held -> wait for release
   bra waitA
 \`\`\`
 
@@ -99,6 +99,7 @@ Sprites live in 128 OAM slots and come in **TWO sizes: 8×8 or 16×16**. Sprite 
 - **Not calling gfx_export_vram / trk_export_spc** — leaves \`vram_load\`/\`spc_load\` undefined. The export IS the step that makes the label exist.
 - **Hand-rolling the screen/sound** in the program: \`sta $2118\`/\`sta $2120\` VRAM loops, \`x=0\`/\`x=1\`, \`pcsh\`/\`pcsw\`, \`RTI\`, DMA registers, SPU \$2140–\$2143 writes. The generated glue already does all of this. Your program is 3–4 lines.
 - **Hand-rolling the screen flip** to switch between two tilemaps: writing to (or reading/modifying) BG0SC \`$2107\` yourself. This snes9x build returns OpenBus garbage on PPU register READS, so a read-modify-write of \`$2107\` silently writes a random value and the flip never happens. When you have set a second tilemap, \`jsr vram_toggle\` is the ONLY correct way to switch between them.
+- **Polling \`$4016\` for button state** — in this core that is the NES-style serial port and it returns a single bit (the B button) plus OpenBus garbage, so A/X/L/R tests built on it never fire. Use \`jsr pad_read\` (A = \$80, B = \$80 in the X register, bit SET = pressed) or the \$4218/\$4219 registers.
 - **Emitting raw \`.byte\` VRAM/tile data** into the source, or \`.incbin\`-ing a hand-built 64 KB image. That blows the 32 KB build cap. \`gfx_export_vram\` produces a COMPACT few-KB image for you.
 - **Placing a sprite without \`priority\`** — the default priority 0 draws the sprite UNDER the background. Over a filled-in background the sprite is completely hidden and the screen looks blank. Always pass \`priority: 2\` or \`priority: 3\` when a background is behind the sprite.
 - **Painting one pixel at a time** with dozens of \`gfx_set_tile_pixel\` calls when a fill will do. Use \`gfx_fill_rect\` for solid regions and \`gfx_fill_map\`/\`gfx_set_map_grid\` for the screen. A solid-color background is a COMPLETE minimal hello world. **But if the user asks for TEXT** (e.g. "print hello world"), render it: each letter is just a tile built from a few \`gfx_fill_rect\`/ \`gfx_set_tile_pixel\` strokes, then lay the letter tiles left-to-right in the tilemap with \`gfx_set_map_entry\`/ \`gfx_set_map_grid\`. A 5×7 or 7×9 glyph grid fits a 16×16 tile comfortably.
@@ -113,7 +114,7 @@ Sprites live in 128 OAM slots and come in **TWO sizes: 8×8 or 16×16**. Sprite 
 - Labels \`name:\`; \`ld #$10\`, \`lda $4200\`, \`sta $2105\`; \`jsr label\` / \`jsr $F000\`; \`bra done\`; \`jmp $008000\` (long) / \`jmp ($xx\`) (indirect); \`lda ($20),Y\` (zero-page pointer read, Y=0); \`pea label\` / \`pla\` (push/pop a 16-bit value); \`rep\`/\`sep\` (16-bit mode — optional, the glue is pure 8-bit).
 - Directives: \`.byte\`/\`.word\` (aliases db/dw), \`.ascii\`, \`.asciz\`, \`.text\`, \`.incbin "name"\`. Comments with \`;\`.
 - **Not supported (do not use):** \`pcsh\`/\`pcsw\`, \`x=0/1\` bank toggle, \`<\`/\`>\` byte-offset operators, immediate labels (\`#hi(label)\`), or \`label+1\` arithmetic.
-- **Pad polling (buttons):** A/B/X/Y live at \`$4016\` (A = $01, B = $02, X = $04, Y = $08). To act on button A: \`lda $4016\`, then \`and #$01\` + \`bne pressed\`. (\`bit $4016\` tests "any button".) There are NO labels like \`pad1\`/\`pad2\` — the address itself is what you code against.
+- **Pad polling (buttons):** use the \`pad_read\` routine — never \`lda $4016\` (in this core it is the NES-style serial port and returns a single bit). If you poll the registers directly: \$4218 = bit7 A, bit6 X, bit5 L, bit4 R and \$4219 = bit7 B, bit6 Y, bit5 SELECT, bit4 START, bit3 UP, bit2 DOWN, bit1 LEFT, bit0 RIGHT. Bit SET = pressed (active-HIGH).
 - Data files: \`.incbin "name"\` inlines that file's bytes at the site; they count toward code size.
 - Assembler errors come back as \`{line, message}\` with 1-based line numbers. Fix and re-assemble.
 
