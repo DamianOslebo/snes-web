@@ -386,7 +386,17 @@ describe('gfx tools', () => {
     expect(callTo(m, 'setPaletteColor')).toEqual([1, 31, 0, 31, false]);
     expect(dispatch(m, 'gfx_set_palette_color', { index: 0, r: 0, g: 0, b: 0, transparent: true }).ok).toBe(true);
     expect(callTo(m, 'setPaletteColor')).toEqual([0, 0, 0, 0, true]);
-    expect(dispatch(m, 'gfx_set_palette_color', { index: 16, r: 0, g: 0, b: 0 }).ok).toBe(false);
+  });
+
+  it('gfx_set_palette_color accepts OBJ/sprite palette indices 16–31 (the sprite colors)', () => {
+    const m = mockControllers();
+    // The agent's sprite flow paints the OBJ palette this way — 16 was being
+    // rejected by the old 0–15 validation even though the schema says 0–31.
+    for (const index of [16, 20, 31]) {
+      expect(dispatch(m, 'gfx_set_palette_color', { index, r: 31, g: 0, b: 0 }).ok).toBe(true);
+      expect(callTo(m, 'setPaletteColor')).toEqual([index, 31, 0, 0, false]);
+    }
+    expect(dispatch(m, 'gfx_set_palette_color', { index: 32, r: 0, g: 0, b: 0 }).ok).toBe(false);
   });
 
   it('gfx_set_tile_pixel validates the 16×16 tile bounds', () => {

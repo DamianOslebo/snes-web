@@ -25,9 +25,17 @@
  *   $7FD9         ROMRegion (RomHeader[0x29]) = $00
  *   $7FDA         CompanyId (RomHeader[0x2A]) = $00
  *   $7FDC–$7FDF   16-bit complement + ROM checksums (RomHeader[0x2C..0x2F])
+ *   $7FEA/$7FFA/$7FFE  NMI vector → nmi_move — THIS snes9x fork's
+ *                 S9xOpcode_NMI (cpuops_.h) reads the NMI vector from CPU
+ *                 $FFEA in native (non-emulation) mode and from CPU $FFFA in
+ *                 6502-emulation mode (S9xGetWord(0xFFEA) / (0xFFFA)); a real
+ *                 SNES reads the standard $FFFE. Under LoROM those CPU vectors
+ *                 map to three distinct file slots, so we bake the handler at
+ *                 ALL THREE — whatever path this fork's CPU is in (or hardware)
+ *                 lands on nmi_move instead of jumping to $0000 (garbage) when
+ *                 the once-per-vblank NMI fires
  *   $7FFC         reset vector → $008000 (bytes 00 80) — what `looksLikeSnesRom`
  *                 checks for and where the CPU starts on a cold boot
- *   $7FFE         NMI vector   → $008000 (bytes 00 80)
  *   $0000         entry point — the assembled code is copied here (file $0000
  *                 == CPU $008000 under LoROM)
  *
@@ -79,7 +87,23 @@ const HDR_COMPANY_ID = 0x7fda; // RomHeader[0x2A]
 const HDR_COMP_CHKSUM = 0x7fdc; // RomHeader[0x2C..0x2D], low byte first
 const HDR_ROM_CHKSUM = 0x7fde; // RomHeader[0x2E..0x2F], low byte first
 const RESET_VECTOR_ADDR = 0x7ffc; // reset vector → $8000
-const NMI_VECTOR_ADDR = 0x7ffe; // NMI vector → $8000
+// The NMI vector lives in (up to) THREE places. This snes9x fork's
+// S9xOpcode_NMI (core/snes9x-2010/core/cpuops_.h) reads it from CPU $FFEA in
+// native (non-emulation) mode — `S9xGetWord(0xFFEA)` — and from CPU $FFFA in
+// 6502-emulation mode — `S9xGetWord(0xFFFA)`. A real SNES reads the standard
+// $FFFE. Under LoROM those CPU vectors map to three distinct cart-header file
+// slots, so we bake the handler at ALL THREE: whichever path the CPU is in (or
+// real hardware) lands on nmi_move. (The IRQ vector is CPU $FFEE = file $7FEE
+// and reset is CPU $FFFC = file $7FFC — none of these NMI slots collide with
+// them.)
+const NMI_NATIVE_FILE = 0x7fea; // CPU $FFEA — native (non-emulation) NMI vector
+const NMI_EMUL_FILE = 0x7ffa; // CPU $FFFA — 6502-emulation NMI vector
+const NMI_STD_FILE = 0x7ffe; // CPU $FFFE — standard SNES NMI vector (hardware)
+// The sprite glue (src/gfx/oam.ts) names its per-vblank NMI handler `nmi_move`.
+// When that label is in the assembled code, `buildRomFromResult` bakes its
+// address as the NMI vector. Kept as a plain string so rom.ts needn't import
+// the gfx module.
+export const NMI_HANDLER_LABEL = 'nmi_move';
 
 // Header field values mirroring the known-working reference ROM
 // (test/cpu_test/cputest-basic.sfc). ROMSize $08 is inside the $07–$1E range
@@ -104,16 +128,26 @@ export const ASM_ROM_KEY = 'snes-asm-rom';
 export interface BuildRomOptions {
   /** 12-byte ASCII game title (padded/truncated to fit the header slot). */
   title?: string;
+  /**
+   * 16-bit CPU address of the NMI handler to bake as the NMI vector (at all
+   * three NMI-vector slots this fork / hardware might read — CPU $FFEA, $FFFA,
+   * $FFFE). Omit for a ROM with no NMI handler — the vector then defaults to
+   * the entry point, a safe landing spot if the NMI is ever armed.
+   * `buildRomFromResult` fills this in from the `nmi_move` label when the
+   * sprite glue is present.
+   */
+  nmi?: number;
 }
 
 /**
  * Wrap `code` in a 256 KB LoROM SFC image: a cart header at its real $7FB0
  * location (with a valid ROMSize byte at $7FD7 so snes9x's InitROM gate passes),
- * the code at file $0000 (== CPU $008000 under LoROM), reset/NMI vectors →
- * $008000, a 12-byte title at $7FC0, and standard 16-bit checksums at
- * $7FDC–$7FDF. The result satisfies both
- * `looksLikeSnesRom` (the app's pre-load gate) and snes9x's own corrupt-ROM
- * check (memmap.c:1949).
+ * the code at file $0000 (== CPU $008000 under LoROM), the reset vector →
+ * $008000, the NMI vector → `opts.nmi` (or the entry point when the ROM has no
+ * NMI handler) baked at BOTH this fork's CPU $FFEA and the standard $FFFE, a
+ * 12-byte title at $7FC0, and standard 16-bit checksums at $7FDC–$7FDF. The
+ * result satisfies both `looksLikeSnesRom` (the app's pre-load gate) and
+ * snes9x's own corrupt-ROM check (memmap.c:1949).
  */
 export function buildRom(code: Uint8Array, opts: BuildRomOptions = {}): Uint8Array {
   if (code.length === 0) throw new Error('buildRom: empty program');
@@ -141,11 +175,20 @@ export function buildRom(code: Uint8Array, opts: BuildRomOptions = {}): Uint8Arr
   rom[HDR_COMPANY_ID] = COMPANY_ID_FIELD;
   // Checksum bytes ($7FDC–$7FDF) are computed at the end, below.
 
-  // --- vectors ($7FFC reset → $8000, $7FFE NMI → $8000) ------------------
+  // --- vectors ($7FFC reset → $8000; NMI → handler at $7FEA/$7FFA/$7FFE) --
   rom[RESET_VECTOR_ADDR] = ENTRY_ADDR & 0xff; // low byte  → 00
   rom[RESET_VECTOR_ADDR + 1] = (ENTRY_ADDR >> 8) & 0xff; // high byte → 80
-  rom[NMI_VECTOR_ADDR] = ENTRY_ADDR & 0xff;
-  rom[NMI_VECTOR_ADDR + 1] = (ENTRY_ADDR >> 8) & 0xff;
+  // Bake the NMI vector so an armed NMI lands on the handler. This snes9x fork
+  // reads it from CPU $FFEA (file $7FEA) in native mode or CPU $FFFA (file
+  // $7FFA) in emulation mode, and a real SNES reads $FFFE (file $7FFE) — so
+  // bake the same handler at all three slots and it is correct on every path.
+  // Default to the entry point when the ROM carries no NMI handler (opts.nmi)
+  // so the vector is never a bare 0x0000.
+  const nmiVec = (opts.nmi ?? ENTRY_ADDR) & 0xffff;
+  for (const slot of [NMI_NATIVE_FILE, NMI_EMUL_FILE, NMI_STD_FILE]) {
+    rom[slot] = nmiVec & 0xff;
+    rom[slot + 1] = (nmiVec >> 8) & 0xff;
+  }
 
   // --- entry code (file $0000 == CPU $008000 under LoROM) -----------------
   rom.set(code, CODE_OFFSET);
@@ -154,6 +197,23 @@ export function buildRom(code: Uint8Array, opts: BuildRomOptions = {}): Uint8Arr
   writeChecksums(rom);
 
   return rom;
+}
+
+/**
+ * Build a ROM from an `assemble()` result, auto-baking the NMI vector. If the
+ * assembled code contains the `nmi_move` handler (the sprite glue's NMI
+ * handler — see `NMI_HANDLER_LABEL`), its address is baked as the NMI vector
+ * at all three slots this fork / hardware might read (CPU $FFEA, $FFFA, $FFFE).
+ * An explicit `opts.nmi` always wins over the label; if neither is present the
+ * vector defaults to the entry point.
+ */
+export function buildRomFromResult(
+  r: { bytes: Uint8Array; labels?: Array<{ name: string; address: number }> },
+  opts: BuildRomOptions = {},
+): Uint8Array {
+  const labelNmi = r.labels?.find((l) => l.name === NMI_HANDLER_LABEL)?.address;
+  const nmi = opts.nmi ?? labelNmi;
+  return buildRom(r.bytes, nmi ? { ...opts, nmi } : opts);
 }
 
 /**

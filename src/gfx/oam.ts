@@ -5,7 +5,9 @@
  * `.incbin`s as `oam.bin`), and `oamGlue` emits a pure-8-bit `oam_load`
  * routine that programs OBJSEL, points OAMADDR at slot 0, enables OBJ in TM,
  * and streams the table through OAMDATA ($2104). The program only has to
- * `JSR oam_load`.
+ * `JSR oam_load`. For a moving slot-0 sprite the program additionally calls
+ * `JSR spr_init` ONCE — which parks the sprite at screen centre and arms the
+ * once-per-vblank NMI that runs `spr_move` — and then just idles.
  *
  * **Sprite size is GLOBAL, not per-slot.** The SNES decides each sprite's
  * pixel size from OBJSEL's OBJSizeSelect bits (OBJSEL = $2101, bits 5-7);
@@ -134,6 +136,36 @@ export function encodeOam(slots: Array<OamEntry | null | undefined>): Uint8Array
  * the embedded 512-byte OAM table through OAMDATA ($2104). The program only has
  * to `JSR oam_load`.
  *
+ * It ALSO emits the **d-pad sprite service** for moving sprites:
+ *   - `spr_init` — parks the movable sprite (OAM slot 0) at the screen
+ *     centre (X=$80=128, Y=$70=112) in zero-page $2b/$2c and arms NMITIMEN
+ *     bit 7 ($4200). The NMI fires ONCE per frame, at vblank (cpuexec.c: the
+ *     vblank-start event checks `$4200 & $80` and sets the NMI flag; the
+ *     flag is cleared at frame wrap, so it fires exactly once per frame),
+ *     and `nmi_move` runs `spr_move`. Call it ONCE, then let the program
+ *     idle (`bra idle`) — never call `spr_move` from a tight loop, because
+ *     the CPU runs the same loop thousands of times per frame.
+ *     The NMI VECTOR is not written here: it lives in the ROM (read-only),
+ *     and the build (`buildRom` in `src/asm/rom.ts`) bakes it pointing at
+ *     `nmi_move` — at CPU $FFEA/$FFEB on this snes9x fork ($FFFE/$FFFF on a
+ *     real SNES). Writing it to $FFFE at runtime, as the old glue did, hit
+ *     the wrong slot for this fork, so the armed NMI jumped to $0000.
+ *   - `nmi_move` — the per-vblank NMI handler: `jsr spr_move / rti`. The
+ *     ROM build finds this label and bakes its address as the NMI vector.
+ *   - `spr_move` — one d-pad tick: reads the $4219 d-pad byte (bit SET =
+ *     pressed, same state `pad_read` returns in X), moves slot 0 by 2px in
+ *     every held direction (8-bit wrap at the edges), and writes the new
+ *     [HPos,VPos] word into slot 0 through OAMDATA ($2104).
+ * The PPU's per-scanline render loop reads `PPU.OBJ[S].HPos/VPos` fresh EVERY
+ * frame (ppu.c:410/424, 468/493, 661), and the OAM write commits a
+ * position-only word — `HPos |= lowbyte; VPos = highbyte` (ppu.c:3052-3055) —
+ * so the sprite moves on the very next frame while the Name/attr bytes
+ * (tile, priority, flips) that `oam_load` wrote stay untouched. OAMADDR is
+ * reset to slot 0 first, because after `oam_load` streamed all 128 slots it
+ * has wrapped and its final value must not be assumed. The only register READ
+ * in all of this is $4219 — a CPU I/O register the shim fills every frame,
+ * never a PPU register (this fork returns OpenBus garbage on PPU reads).
+ *
  * `size` (`'8x8' | '16x16'`, default `'16x16'`) sets OBJSEL's OBJSizeSelect,
  * so it is the ONE size every sprite in this ROM draws at (see the module doc).
  *
@@ -143,9 +175,10 @@ export function encodeOam(slots: Array<OamEntry | null | undefined>): Uint8Array
  * snes9x fork returns OpenBus garbage on PPU reads, so a read-modify-write of
  * TM would write a random value.
  *
- * Scratch is zero-page $30/$31 (the data pointer) — deliberately clear of
- * spcGlue's $10-$17 and vramGlue's $20-$2a, so the three routines coexist in
- * one ROM.
+ * Scratch is zero-page $30/$31 (the oam_load data pointer) and
+ * $2b (sprite X) / $2c (sprite Y) / $2d (d-pad snapshot) for the sprite
+ * service — deliberately clear of spcGlue's $10-$17, vramGlue's $20-$2a, and
+ * the LZ decoder's $40-$4c, so all the routines coexist in one ROM.
  */
 export function oamGlue(dataName = 'oam.bin', size: OamSize = '16x16'): string {
   const h = (n: number, w: number) => '$' + n.toString(16).padStart(w, '0');
@@ -196,6 +229,75 @@ oam_c:
 oam_d:
   dex
   bne oam_slot
+  rts
+; --- d-pad sprite service (generated) ----------------------------------------
+; The MOVABLE sprite is OAM slot 0. The program calls (after oam_load):
+;   JSR spr_init   once — it parks the sprite at the screen centre AND arms
+;                  the movement tick: the NMI handler nmi_move runs once per
+;                  frame, at vblank, doing one spr_move for you.
+; The NMI vector itself is BAKED into the ROM by the build (rom.ts) pointing
+; at nmi_move — at CPU $FFEA/$FFEB on this snes9x fork ($FFFE/$FFFF on a real
+; SNES) — so spr_init only parks the sprite and arms NMITIMEN; it does NOT
+; write the vector (the ROM region is read-only, and $FFFE is the WRONG slot
+; on this fork anyway).
+; After that the program just idles:   idle: bra idle
+; (Never call spr_move from a tight loop — the CPU runs thousands of times
+;  per frame, so the tick must be paced by the once-per-vblank NMI.)
+; $2b = sprite X, $2c = sprite Y, $2d = this tick's d-pad byte.
+spr_init:
+  lda #$80                   ; X = 128 (screen centre column)
+  sta $2b
+  lda #$70                   ; Y = 112 (screen centre row)
+  sta $2c
+  lda #$80                   ; NMITIMEN bit7: fire the NMI once per vblank
+  sta $4200                  ; (the vector -> nmi_move is baked by the build)
+  rts
+nmi_move:
+  jsr spr_move               ; one d-pad tick per frame (UP/DOWN/LEFT/RIGHT,
+  rti                        ; 2px per held direction, diagonals included)
+spr_move:
+  lda #0
+  sta $2102                  ; OAMADDR -> slot 0 (oam_load left it after 128
+  sta $2103                  ; slots — reset it, do not assume where it is)
+  lda $4219                  ; d-pad byte, bit SET = pressed:
+  and #$0f                   ; bit3=UP bit2=DOWN bit1=LEFT bit0=RIGHT
+  sta $2d
+  lda $2d
+  and #$08
+  beq sv_noup
+  lda $2c                    ; UP: Y -= 2 (8-bit wrap)
+  sec
+  sbc #$02
+  sta $2c
+sv_noup:
+  lda $2d
+  and #$04
+  beq sv_nodn
+  lda $2c                    ; DOWN: Y += 2
+  clc
+  adc #$02
+  sta $2c
+sv_nodn:
+  lda $2d
+  and #$02
+  beq sv_nolt
+  lda $2b                    ; LEFT: X -= 2
+  sec
+  sbc #$02
+  sta $2b
+sv_nolt:
+  lda $2d
+  and #$01
+  beq sv_nort
+  lda $2b                    ; RIGHT: X += 2
+  clc
+  adc #$02
+  sta $2b
+sv_nort:
+  lda $2b                    ; HPos (byte0)
+  sta $2104
+  lda $2c                    ; VPos (byte1) — word commits: slot 0 moved;
+  sta $2104                  ; Name/attr (tile/priority/flips) stay as loaded
   rts
 oam_data:
   .incbin "${dataName}"

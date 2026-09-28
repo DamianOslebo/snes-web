@@ -442,7 +442,7 @@ const DEFS: ToolDef[] = [
       required: ['index', 'r', 'g', 'b'],
     },
     run: (a, c) => {
-      const i = intF(a, 'index', 0, 15);
+      const i = intF(a, 'index', 0, 31);
       const r = intF(a, 'r', 0, 31);
       const g = intF(a, 'g', 0, 31);
       const b = intF(a, 'b', 0, 31);
@@ -731,7 +731,12 @@ const DEFS: ToolDef[] = [
       '0–15 background palette). `x`/`y` = screen position (0–255); `flipH`/`flipV` mirror it; `priority` 0–3 ' +
       'for draw order — 0–1 draws the sprite UNDER the background, 2–3 draws it OVER the background, so use ' +
       '2 or 3 when the sprite sits on a painted background (default 0 = invisible behind a full-screen BG). ' +
-      'Pass `hide:true` to remove the sprite from that slot.',
+      'Pass `hide:true` to remove the sprite from that slot. SLOT 0 IS THE MOVABLE SPRITE: the `oam_load` ' +
+      'glue (from gfx_export_oam) also emits the d-pad sprite service — place a d-pad-driven sprite in slot 0 ' +
+      'and call `JSR spr_init` ONCE in the reset program: it parks the sprite at screen centre and arms the ' +
+      'once-per-vblank NMI that runs the 2px-per-frame d-pad tick for you, so after it the program just idles ' +
+      '(`idle: bra idle`). Never call `JSR spr_move` yourself — from a tight loop it would run thousands of ' +
+      'times per frame.',
     parameters: {
       type: 'object',
       properties: {
@@ -826,7 +831,12 @@ const DEFS: ToolDef[] = [
     description:
       'Compile the 128 SPRITE (OBJ) slots into the 512-byte OAM table. With `destName` (standard name ' +
       '"oam.bin"), also register it on the assembler page as an `.incbin` data file AND append the ' +
-      'self-contained 65C816 `oam_load` routine to the asm source. The program then calls `JSR vram_load` ' +
+      'self-contained 65C816 `oam_load` routine to the asm source, PLUS the d-pad sprite service — for a ' +
+      'moving sprite: place it in slot 0 and call `JSR spr_init` ONCE in the reset program. It parks the ' +
+      'sprite at screen centre and arms the once-per-vblank NMI that runs the 2px-per-frame d-pad tick ' +
+      '(`spr_move`) for you, so after it the program just idles (`idle: bra idle`). Never call `JSR spr_move` ' +
+      'yourself — from a tight loop it would run thousands of times per frame. ' +
+      'The program then calls `JSR vram_load` ' +
       'at startup, then `JSR oam_load` once sprites are placed — no manual OAM/OBJSEL/TM writes needed. ' +
       '`size` sets the GLOBAL sprite size baked into OBJSEL (the ONE size every sprite draws at): ' +
       '"8x8" or "16x16" (default "16x16"). IMPORTANT: vram_load must come first (it writes the OBJ palette ' +

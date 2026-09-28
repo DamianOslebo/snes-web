@@ -1,5 +1,5 @@
 import { assemble } from '../asm/assembler';
-import { buildRom, bytesToBase64, base64ToBytes, ASM_ROM_KEY, ROM_ENTRY, ROM_SIZE } from '../asm/rom';
+import { buildRomFromResult, bytesToBase64, base64ToBytes, ASM_ROM_KEY, ROM_ENTRY, ROM_SIZE } from '../asm/rom';
 import type { AsmController } from '../agent/types';
 import { loadState, saveState } from '../agent/state-store';
 
@@ -249,7 +249,7 @@ export function mountAssembler(container: HTMLElement): void {
     if (!last || !last.ok) return;
     let rom: Uint8Array;
     try {
-      rom = buildRom(last.bytes);
+      rom = buildRomFromResult(last);
     } catch (err) {
       setStat(`build failed: ${(err as Error).message}`, 'err');
       return;
@@ -271,7 +271,7 @@ export function mountAssembler(container: HTMLElement): void {
     if (!last || !last.ok) return;
     let rom: Uint8Array;
     try {
-      rom = buildRom(last.bytes);
+      rom = buildRomFromResult(last);
     } catch (err) {
       setStat(`build failed: ${(err as Error).message}`, 'err');
       return;
@@ -442,7 +442,7 @@ export function makeAsmController(): AsmController {
       const r = assemble(asmSource, ROM_ENTRY, asmIncludes);
       if (!r.ok) return { ok: false, error: errorsText(r.errors) };
       try {
-        return { ok: true, bytes: buildRom(r.bytes).length };
+        return { ok: true, bytes: buildRomFromResult(r).length };
       } catch (err) {
         return { ok: false, error: (err as Error).message };
       }
@@ -453,7 +453,7 @@ export function makeAsmController(): AsmController {
       if (!r.ok) return { ok: false, error: errorsText(r.errors) };
       let rom: Uint8Array;
       try {
-        rom = buildRom(r.bytes);
+        rom = buildRomFromResult(r);
       } catch (err) {
         return { ok: false, error: (err as Error).message };
       }

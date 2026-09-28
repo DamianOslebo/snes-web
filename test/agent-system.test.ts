@@ -19,6 +19,21 @@ describe('buildSystemPrompt', () => {
     }
   });
 
+  it('offers the d-pad sprite service and stops claiming movement is out of scope', () => {
+    for (const page of ['asm', 'gfx'] as const) {
+      const p = buildSystemPrompt(page, '');
+      expect(p).toContain('spr_init');
+      expect(p).toContain('spr_move');
+      expect(p).toContain('SLOT 0'); // the movable sprite is OAM slot 0
+      // A "circle" from background tiles is the exact failure from the d-pad
+      // log — the prompt must call it out as a mistake.
+      expect(p).toContain('Faking a sprite with background tiles');
+      // The old scope line ("static positions … moving sprites not in v1") is gone.
+      expect(p).not.toMatch(/static positions/i);
+      expect(p).not.toMatch(/moving sprites (?:are )?not (?:in|supported)/i);
+    }
+  });
+
   it('names the page the panel is mounted on', () => {
     expect(buildSystemPrompt('asm', '')).toContain('assembler');
     expect(buildSystemPrompt('gfx', '')).toContain('graphics');

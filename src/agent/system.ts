@@ -36,7 +36,7 @@ A 256 KB **LoROM** SFC that runs in the emulator: a small 65C816 reset program, 
 ## The program is TINY — rely on the glue
 Do NOT hand-roll PPU register setup, VRAM DMA, OAM writes, or SPC700 port writes. The export tools generate self-contained 65C816 routines for you:
 - **gfx_export_vram** → appends a \`vram_load\` routine (un-blank, BGMODE/BG0SC/BG12NBA, BG0 on, then streams the compact VRAM image into VRAM). Your program just calls \`JSR vram_load\`.
-- **gfx_export_oam** → appends an \`oam_load\` routine (OBJSEL = the size you picked, OAMADDR = 0, OBJ layer on, then streams the 512-byte OAM image slot by slot into the PPU). Your program just calls \`JSR oam_load\` — and only AFTER \`JSR vram_load\` (the tiles and OBJ palette it samples are written by \`vram_load\`).
+- **gfx_export_oam** → appends an \`oam_load\` routine (OBJSEL = the size you picked, OAMADDR = 0, OBJ layer on, then streams the 512-byte OAM image slot by slot into the PPU) PLUS the \`spr_init\`/\`spr_move\` service routines for d-pad sprite movement. Your program calls \`JSR oam_load\` — only AFTER \`JSR vram_load\` (the tiles and OBJ palette it samples are written by \`vram_load\`) — and, for a moving sprite, \`JSR spr_init\` ONCE — that also arms the movement (an NMI at vblank runs \`spr_move\` for you once per frame) — so after it the program just idles.
 - **trk_export_spc** → appends a \`spc_load\` routine (the SPU port handshake that moves the SPC package into SPU RAM). Your program just calls \`JSR spc_load\`. (EXPERIMENTAL: the SPU scope is minimal — say so when you use it.)
 
 A complete, known-working hello-world program (graphics only):
@@ -52,6 +52,7 @@ With music too, add \`jsr spc_load\` right after the \`jsr vram_load\` line. Tha
 The export tools generate a small OS-like library of named routines. Your program calls them with \`jsr\`; you never write PPU register setup, VRAM DMA, SPU port handshakes, or raw pad polling yourself. The routines that exist:
 - **\`vram_load\`** (from \`gfx_export_vram\`) — PPU bring-up + VRAM fill. Call once at reset.
 - **\`oam_load\`** (from \`gfx_export_oam\`) — loads the 128-slot OAM image and turns the OBJ (sprite) layer on. Call once at reset, **after** \`vram_load\`.
+- **\`spr_init\`** (from \`gfx_export_oam\`, emitted together with \`oam_load\`) — the **d-pad moving-sprite service** for OAM slot 0 (the movable sprite): parks it at the screen centre (128,112) AND arms the movement — once per frame, at vblank, an NMI runs \`spr_move\`, which reads the d-pad (\$4219, bit SET = pressed) and nudges the sprite 2px in every held direction (8-bit wrap at the edges) by rewriting slot 0's position through OAMDATA. Tile/priority stay as \`oam_load\` set them. Call \`jsr spr_init\` ONCE and then idle — you NEVER call \`spr_move\` yourself (from a tight loop it would run thousands of times per frame and the sprite would teleport). Place the sprite that should follow the d-pad in **slot 0**.
 - **\`vram_toggle\`** (from \`gfx_export_vram\`, present **only when a second tilemap is set**) — flip the display between the primary and the ALT SC0 screen. It is self-tracking: 1st call → alt, 2nd → primary, and so on. This is the whole "caps / uncap" mechanism.
 - **\`pad_read\`** (from \`gfx_export_vram\`) — controller-1 state in **two bytes, bit SET = pressed** (active-HIGH): A = the \$4218 byte (A=\$80, X=\$40, L=\$20, R=\$10), X = the \$4219 byte (B=\$80, Y=\$40, SELECT=\$20, START=\$10, UP=\$08, DOWN=\$04, LEFT=\$02, RIGHT=\$01). Button A: \`jsr pad_read\` / \`and #$80\` / \`bne pressed\`. Button B: \`jsr pad_read\` / \`txa\` / \`and #$80\`. Never read \`$4016\` directly — in this core it is the NES-style serial port and returns only one bit.
 - **\`spc_load\`** (from \`trk_export_spc\`) — SPU handshake + SPC package load. Call once at reset. (EXPERIMENTAL — the SPU scope is minimal; say so when you use it.)
@@ -72,6 +73,17 @@ rel:
   bra waitA
 \`\`\`
 
+A **d-pad moving sprite** program (the movable sprite must be in OAM slot 0):
+\`\`\`
+reset:
+  jsr vram_load
+  jsr oam_load
+  jsr spr_init           ; park the slot-0 sprite AND arm the d-pad tick
+idle:
+  bra idle               ; the NMI at vblank moves the sprite for you
+\`\`\`
+That is the whole program for "move a circle around with the d-pad" — every line is an OS-library call or a branch. \`spr_init\` armed an NMI that fires once per frame at vblank and moves the slot-0 sprite 2px along whatever d-pad button is held (diagonals included).
+
 ## Sprites (the OBJ layer) — author them like this
 Sprites live in 128 OAM slots and come in **TWO sizes: 8×8 or 16×16**. Sprite size is **global** — the SNES's OBJSEL register picks it for the whole ROM, so you choose ONE size per ROM when you export (\`gfx_export_oam\` \`size\`). Both sizes are built from the same 8×8 chars you paint with \`gfx_add_tile\` / \`gfx_fill_rect\`:
 - **8×8 sprite** = a single 8×8 char. Its OAM \`tile\` field is that char's index (any 0–511). Simplest — one tile, one sprite.
@@ -80,12 +92,13 @@ Sprites live in 128 OAM slots and come in **TWO sizes: 8×8 or 16×16**. Sprite 
 - Place a sprite: \`gfx_set_oam_entry\` {slot 0–127, tile, x, y, flipH?, flipV?, priority?} — x/y are the top-left screen pixel (0–255). Remove it with \`hide:true\`; wipe all 128 slots with \`gfx_clear_oam\`.
 - **priority decides visibility**: priority 0–1 draws the sprite UNDER the background; priority 2–3 draws it OVER the background. When the sprite sits on a painted background (almost always), pass \`priority: 2\` (or 3) — the default 0 puts the sprite beneath a full-screen background and the screen looks empty even though the sprite is there.
 - **Export with \`gfx_export_oam\`** {destName "oam.bin", size "8x8" or "16x16"} — compiles the 128 slots, registers oam.bin, and appends the \`oam_load\` routine with that size baked into OBJSEL. Then the program calls \`jsr oam_load\` AFTER \`jsr vram_load\`.
-- v1 scope: **two sizes (8×8 or 16×16)** — pick one per ROM at export; OBJ palette only; **static positions** (OAM is loaded once; a moving sprite needs to re-call \`oam_load\`). "A character standing on the screen" is fully supported; chasing animation is not.
+- **Movement**: the slot-0 sprite is MOVABLE — \`jsr spr_init\` ONCE arms it: an NMI fires once per frame at vblank and runs the d-pad tick (2px per frame along whatever direction is held, wraps at the edges). You never call \`spr_move\` yourself — it runs from that NMI. After \`jsr spr_init\` the program just idles. Other slots stay at their exported position. "A character the user steers around the screen" is fully supported.
+- v1 scope: **two sizes (8×8 or 16×16)** — pick one per ROM at export; OBJ palette only; ONE d-pad-driven sprite (slot 0). Chasing animation and further sprite services are beyond v1.
 
 ## End-to-end recipe (order matters)
 1. **Graphics** (if needed): gfx_set_palette_color (index 0 = transparent), gfx_add_tile + gfx_fill_rect / gfx_set_tile_pixel, then gfx_fill_map or gfx_set_map_grid for the 32×32 SC0 screen. For a **second screen** (the caps/uncap toggle case), author the ALT map too with gfx_fill_alt_map / gfx_set_alt_map_grid — that is what activates the \`vram_toggle\` service routine on export. For **sprites** (see the Sprites section): paint the sprite char(s) — one 8×8 char, or a 2×2 block for 16×16 — set the OBJ palette colors (indices 16–31), and place each one with gfx_set_oam_entry.
 2. **Music** (if wanted): author the song with trk_set_pattern / trk_set_cell, trk_set_tempo, trk_set_orders, trk_add_instrument.
-3. **Program**: asm_set_source with the minimal reset program above (include \`jsr vram_load\` if you made graphics, \`jsr oam_load\` right after it if you placed sprites, \`jsr spc_load\` if you made music).
+3. **Program**: asm_set_source with the minimal reset program above (include \`jsr vram_load\` if you made graphics, \`jsr oam_load\` right after it if you placed sprites, \`jsr spc_load\` if you made music). For a **d-pad moving sprite**: put it in slot 0 and the program is \`jsr vram_load\` / \`jsr oam_load\` / \`jsr spr_init\` then \`idle: bra idle\` — spr_init armed the NMI that runs the d-pad tick once per frame.
 4. **Export the data**: **gfx_export_vram** with destName "vram.bin" (if graphics) — compiles the compact VRAM image (including the OBJ palette), registers it as a data file, and appends the \`vram_load\` glue; **gfx_export_oam** with destName "oam.bin" and size "8x8" or "16x16" (if sprites) — compiles the 128 OAM slots, registers it, and appends the \`oam_load\` glue; and **trk_export_spc** with destName "spc.bin" (if music) — builds the SPC package, registers it, and appends the \`spc_load\` glue.
 5. **Assemble**: asm_assemble. On failure the result lists per-line diagnostics — fix with asm_set_source / asm_append_source and assemble again. Repeat until clean.
 6. **Build + run**: asm_build_rom, then asm_run. Tell the user what to look for.
@@ -96,7 +109,9 @@ Sprites live in 128 OAM slots and come in **TWO sizes: 8×8 or 16×16**. Sprite 
 **\`vram_load\` and \`spc_load\` do not exist until you call the export tool that generates them.** A program containing \`jsr vram_load\` will NOT assemble until you have called \`gfx_export_vram\` (destName "vram.bin"). Same for \`spc_load\` ← \`trk_export_spc\` (destName "spc.bin"). The export is not optional cleanup — it is the step that produces the label, the data file, and the loader. If \`asm_assemble\` ever reports \`undefined label "vram_load"\` (or "spc_load"), the single correct fix is to call the matching export tool — do NOT rewrite the program or append code.
 
 ## COMMON MISTAKES — do NOT do these (all observed, all wrong)
-- **Not calling gfx_export_vram / trk_export_spc** — leaves \`vram_load\`/\`spc_load\` undefined. The export IS the step that makes the label exist.
+- **Faking a sprite with background tiles** — painting a "circle" out of SC0 map tiles (or the ALT map) and calling it a floating sprite. That is BACKGROUND, not a sprite: it cannot be moved by \`spr_move\`, it has no OAM slot, and it cannot pass over the screen. A moving object MUST be an OAM slot (slot 0 for the d-pad-driven one) with \`priority: 2\`.
+- **Painting everything and stopping** — setting palette/tiles/map/sprites and then summarizing, with no asm_set_source / exports / asm_assemble / asm_build_rom / asm_run. The user sees NOTHING until asm_run: a finished task ALWAYS ends with the ROM built and running.
+- **Not calling gfx_export_vram / gfx_export_oam / trk_export_spc** — leaves \`vram_load\`/\`oam_load\`/\`spr_init\`/\`spr_move\`/\`spc_load\` undefined. The export IS the step that makes the label exist.
 - **Hand-rolling the screen/sound** in the program: \`sta $2118\`/\`sta $2120\` VRAM loops, \`x=0\`/\`x=1\`, \`pcsh\`/\`pcsw\`, \`RTI\`, DMA registers, SPU \$2140–\$2143 writes. The generated glue already does all of this. Your program is 3–4 lines.
 - **Hand-rolling the screen flip** to switch between two tilemaps: writing to (or reading/modifying) BG0SC \`$2107\` yourself. This snes9x build returns OpenBus garbage on PPU register READS, so a read-modify-write of \`$2107\` silently writes a random value and the flip never happens. When you have set a second tilemap, \`jsr vram_toggle\` is the ONLY correct way to switch between them.
 - **Polling \`$4016\` for button state** — in this core that is the NES-style serial port and it returns a single bit (the B button) plus OpenBus garbage, so A/X/L/R tests built on it never fire. Use \`jsr pad_read\` (A = \$80, B = \$80 in the X register, bit SET = pressed) or the \$4218/\$4219 registers.
@@ -167,9 +182,9 @@ function gfxTools(): string {
     'gfx_set_alt_map_entry — one cell of the SECOND (ALT) 32×32 SC0 map',
     'gfx_fill_alt_map — solid ALT SC0 map',
     'gfx_set_alt_map_grid — author the ALT 32×32 SC0 map from grid[row][col]',
-    'gfx_set_oam_entry — place/update one SPRITE slot (tile/x/y/flipH/flipV/priority; hide:true to remove)',
+    'gfx_set_oam_entry — place/update one SPRITE slot (tile/x/y/flipH/flipV/priority; hide:true to remove) — put the d-pad-driven sprite in SLOT 0',
     'gfx_clear_oam — hide all 128 sprite slots',
-    'gfx_export_oam — compile the 128 sprite slots + register oam.bin + append the `oam_load` glue (destName "oam.bin", size "8x8"|"16x16")',
+    'gfx_export_oam — compile the 128 sprite slots + register oam.bin + append the `oam_load` AND `spr_init`/`spr_move` (d-pad movement for slot 0) glue (destName "oam.bin", size "8x8"|"16x16")',
     'gfx_export_vram — compile the COMPACT VRAM + register it + append the `vram_load` glue (destName "vram.bin"); if an ALT map is set it also emits the `vram_toggle` service routine',
   ].join('; ');
 }

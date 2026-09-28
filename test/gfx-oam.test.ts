@@ -207,6 +207,62 @@ describe('oamGlue — the generated oam_load routine', () => {
   });
 });
 
+// --- the d-pad sprite service (spr_init / spr_move) --------------------------
+
+describe('oamGlue — the d-pad sprite service (spr_init / spr_move)', () => {
+  const g = oamGlue('oam.bin', '16x16');
+
+  it('spr_init parks the movable sprite (slot 0) at the screen centre in zero-page', () => {
+    expect(g).toMatch(/spr_init:/);
+    expect(g).toMatch(/lda #\$80[\s\S]*?sta \$2b/); // X = 128
+    expect(g).toMatch(/lda #\$70[\s\S]*?sta \$2c/); // Y = 112
+    expect(g).toMatch(/spr_init:[\s\S]*?rts/);
+  });
+
+  it('spr_init ALSO arms the once-per-vblank NMI that runs spr_move (paced tick)', () => {
+    // Pacing is the whole point: the CPU runs a tight loop thousands of times
+    // per frame, so the tick must be driven by the once-per-vblank NMI.
+    // The NMI VECTOR is NOT written by the glue: the ROM region is write-
+    // protected at runtime (an `sta $fffe` here would be a no-op, and on this
+    // fork $fffe is the wrong slot anyway). Instead the build (buildRom in
+    // src/asm/rom.ts) bakes the vector to point at this `nmi_move` label — so
+    // the glue only has to emit the handler and arm NMITIMEN.
+    expect(g).not.toMatch(/sta \$fffe/i); // no runtime vector write (write-protected ROM)
+    expect(g).not.toMatch(/sta \$ffff/i);
+    expect(g).toMatch(/lda #\$80[\s\S]*?sta \$4200/); // NMITIMEN bit7: NMI at vblank
+    expect(g).toMatch(/nmi_move:[\s\S]*?jsr spr_move[\s\S]*?rti/); // handler = one tick + rti (the build's vector target)
+    expect(g).not.toMatch(/bra\s+mv\b/i); // no "call spr_move in a tight loop" recipe remains
+  });
+
+  it('spr_move: resets OAMADDR, reads the $4219 d-pad byte, nudges 2px per held direction', () => {
+    expect(g).toMatch(/spr_move:/);
+    // OAMADDR → slot 0 FIRST — after oam_load streamed 128 slots its position is
+    // undefined, so the routine must not assume where it points.
+    expect(g).toMatch(/spr_move:[\s\S]*?lda #0[\s\S]*?sta \$2102[\s\S]*?sta \$2103/);
+    // The d-pad byte comes from $4219 (CPU I/O — the shim fills it every frame),
+    // masked to the four d-pad bits (UP=$08 DOWN=$04 LEFT=$02 RIGHT=$01).
+    expect(g).toMatch(/lda \$4219[\s\S]*?and #\$0f[\s\S]*?sta \$2d/);
+    // All four directions move the zero-page X/Y by 2.
+    expect(g).toMatch(/and #\$08[\s\S]*?sbc #\$02[\s\S]*?sta \$2c/); // UP:    Y -= 2
+    expect(g).toMatch(/and #\$04[\s\S]*?adc #\$02[\s\S]*?sta \$2c/); // DOWN:  Y += 2
+    expect(g).toMatch(/and #\$02[\s\S]*?sbc #\$02[\s\S]*?sta \$2b/); // LEFT:  X -= 2
+    expect(g).toMatch(/and #\$01[\s\S]*?adc #\$02[\s\S]*?sta \$2b/); // RIGHT: X += 2
+    // The position word goes out through OAMDATA ($2104), HPos byte first and
+    // VPos second — byte 1 is the commit that lands the whole word in slot 0.
+    expect(g).toMatch(/lda \$2b[\s\S]*?sta \$2104[\s\S]*?lda \$2c[\s\S]*?sta \$2104/);
+  });
+
+  it('spr_move reads ONLY $4219 — never a PPU register (this fork garbage-reads those)', () => {
+    expect(g).toMatch(/lda \$4219/); // the one legal register read
+    expect(g).not.toMatch(/lda \$21[0-9a-f][0-9a-f]/); // no PPU register reads
+  });
+
+  it('the sprite service is size-agnostic — identical in 8×8 and 16×16 glue', () => {
+    const slice = (t: string) => t.split('oam_data:')[0].split('spr_init:')[1];
+    expect(slice(oamGlue('oam.bin', '8x8'))).toBe(slice(oamGlue('oam.bin', '16x16')));
+  });
+});
+
 // --- real assembler → a valid 256 KB LoROM SFC (core-free) ------------------
 
 describe('oam_load assembles into a runnable 256 KB LoROM SFC (core-free)', () => {
