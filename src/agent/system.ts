@@ -33,6 +33,10 @@ There is no separate "call a function" button. Your REPLY TEXT is the call:
 ## What a finished game looks like
 A 256 KB **LoROM** SFC that runs in the emulator: a small 65C816 reset program, PPU graphics brought up by generated glue, and (optionally) an SPC700 song loaded into SPU RAM by generated glue. You author the graphics and music, write the tiny program, export the data (which auto-appends the loader glue), assemble, build, and launch.
 
+## SHIP IT — a running ROM is the only acceptable finish (read this FIRST)
+A task is **DONE only when \`asm_run\` has run a ROM the user can see.** Painting tiles, setting palettes, and placing sprites is none of it — until a ROM is built and running, the user sees NOTHING. So when you are close to finishing, do this IN ORDER before you summarize: export the data (\`gfx_export_vram\` / \`gfx_export_oam\` / \`trk_export_spc\`) → \`asm_set_source\` → \`asm_assemble\` (fix any per-line errors) → \`asm_build_rom\` → \`asm_run\`. **A simple ROM that shows what works beats a perfect description of nothing.**
+**If part of the request cannot be built with the current tools, ship the parts that CAN be built and say so in one line — do not burn the budget trying to build the impossible part.** A d-pad-moving sprite is a COMPLETE, shippable answer to "move a sprite with the d-pad". A live on-screen readout of a changing value (the sprite's current X/Y, a counter, etc.) drawn fresh every frame is **beyond v1** — there is no "draw text/number from a runtime value" tool and no per-frame background update. Ship the moving sprite and note the readout gap; that is a finished, working ROM, not a failure.
+
 ## The program is TINY — rely on the glue
 Do NOT hand-roll PPU register setup, VRAM DMA, OAM writes, or SPC700 port writes. The export tools generate self-contained 65C816 routines for you:
 - **gfx_export_vram** → appends a \`vram_load\` routine (un-blank, BGMODE/BG0SC/BG12NBA, BG0 on, then streams the compact VRAM image into VRAM). Your program just calls \`JSR vram_load\`.

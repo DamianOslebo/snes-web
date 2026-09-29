@@ -91,11 +91,17 @@ const call = (name: string, args: unknown = {}) => ({
   message: { role: 'assistant', content: '', tool_calls: [{ function: { name, arguments: args } }] },
 });
 
+// `enforceShip: false` keeps the mechanism tests (retry, malformed recovery,
+// context trim, per-step accounting, …) focused on their own behavior — they
+// author a little and then stop, and are NOT about the ship pipeline. The ship
+// guardrail has its own dedicated `describe` block below, run with the default
+// (enforceShip true).
 const base = {
   endpoint: 'http://ollama.test',
   model: 'test-model',
   system: 'You are the SNES authoring agent.',
   messages: [{ role: 'user' as const, content: 'make a block game' }],
+  enforceShip: false,
 };
 
 describe('runAgent', () => {
@@ -893,5 +899,111 @@ describe('truncated tool calls (a reply cut off mid-JSON)', () => {
     expect(r.stopped).toBe('reply');
     expect(r.turns).toBe(0);
     expect(r.finalContent).toMatch(/did not parse/i);
+  });
+});
+
+/**
+ * The ship guardrail — the field-log fix. Default config (enforceShip on) means
+ * a run that did authoring work but stops short of the export→assemble→build→
+ * run pipeline is nudged, bounded, to actually SHIP, and if it still doesn't
+ * the outcome is annotated. A run that ships (asm_run) finishes clean with no
+ * note. A pure Q&A (no authoring) is never nagged. These run with the default
+ * (enforceShip true) — the mechanism block above opts out.
+ */
+describe('ship guardrail (enforceShip default on)', () => {
+  // The terminal ship nudge text (loop.ts), matched loosely.
+  const SHIP_RE = /no ROM is built and RUNNING yet/i;
+
+  it('authored but did not ship: nudged a bounded number of times, then annotated', async () => {
+    // The exact field-log shape: it paints, then declares "ready" with zero
+    // export/assemble/build/run. enforceShip (default) catches that.
+    const { t } = scripted([
+      call('gfx_add_tile', { pattern: 'x' }),
+      reply('The game is ready.'), // repeats forever (scripted last response)
+    ]);
+    const r = await runAgent({
+      ...base,
+      enforceShip: true,
+      controllers: miniControllers().controllers,
+      transport: t,
+      retryDelayMs: 0,
+    });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(1); // one authoring step; the nudges are not "turns"
+    // Bounded: exactly SHIP_NUDGE_MAX ship nudges were left in the wire history
+    // (then the next clean reply was accepted — no infinite nudge loop).
+    const nudges = r.messages.filter((m) => m.role === 'user' && SHIP_RE.test(m.content)).length;
+    expect(nudges).toBe(2);
+    // The no-ROM outcome is made EXPLICIT in the final content.
+    expect(r.finalContent).toMatch(/^The game is ready\./);
+    expect(r.finalContent).toMatch(/Note: no ROM was produced/);
+  });
+
+  it('authored AND shipped (asm_run): finishes clean, no nudge, no note', async () => {
+    const { t } = scripted([
+      call('asm_assemble'), // stage 2
+      call('asm_build_rom'), // stage 3
+      call('asm_run'), // stage 4 — a working ROM
+      reply('The ROM is built and running.'),
+    ]);
+    const r = await runAgent({
+      ...base,
+      enforceShip: true,
+      controllers: miniControllers().controllers,
+      transport: t,
+      retryDelayMs: 0,
+    });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(3);
+    // Reached stage 4, so the guardrail never fires and no note is appended —
+    // the final content is the model's own summary, verbatim.
+    expect(r.finalContent).toBe('The ROM is built and running.');
+    expect(r.messages.every((m) => !SHIP_RE.test(m.content))).toBe(true);
+  });
+
+  it('pure Q&A (no authoring): NOT nagged into building a ROM', async () => {
+    // enforceShip is on (the default), but the model did NO authoring work, so
+    // the guardrail must not fire — a "what can you do?" answer is a legitimate
+    // conversation end. This is the `authored` gate.
+    const { t } = scripted([reply('You can paint tiles, set a tilemap, and build a running ROM.')]);
+    const r = await runAgent({
+      ...base,
+      enforceShip: true,
+      controllers: miniControllers().controllers,
+      transport: t,
+      retryDelayMs: 0,
+    });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(0);
+    // Verbatim answer — no ship nudge, no "no ROM" note.
+    expect(r.finalContent).toBe('You can paint tiles, set a tilemap, and build a running ROM.');
+    expect(r.messages.map((m) => m.role)).toEqual(['system', 'user', 'assistant']);
+    expect(r.messages.every((m) => !SHIP_RE.test(m.content))).toBe(true);
+  });
+
+  it('the nudge converts a "painted but didn\'t ship" run into a ship', async () => {
+    // Paint, then stall on "done" → guardrail nudges → the model (a real model
+    // would re-plan) now drives the pipeline to asm_run → clean finish, no note.
+    // Proves the guardrail redirects to shipping rather than just nagging.
+    const { t } = scripted([
+      call('gfx_add_tile', { pattern: 'x' }), // authored, stage 0
+      reply('I have finished the tiles.'), // → ship nudge (shipStage 0 < 4)
+      call('asm_assemble'), // stage 2
+      call('asm_run'), // stage 4 — it shipped after the nudge
+      reply('Done — the ROM is running now.'), // stage 4 → clean, no note
+    ]);
+    const r = await runAgent({
+      ...base,
+      enforceShip: true,
+      controllers: miniControllers().controllers,
+      transport: t,
+      retryDelayMs: 0,
+    });
+    expect(r.stopped).toBe('reply');
+    expect(r.turns).toBe(3); // gfx_add_tile, asm_assemble, asm_run
+    // One ship nudge fired (then the model shipped, which re-armed it).
+    expect(r.messages.filter((m) => m.role === 'user' && SHIP_RE.test(m.content)).length).toBe(1);
+    // It DID ship, so no "no ROM" note.
+    expect(r.finalContent).toBe('Done — the ROM is running now.');
   });
 });

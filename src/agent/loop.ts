@@ -12,6 +12,18 @@
  *   nudge), not a stop — so a long build keeps working without the user
  *   typing "continue" after every 14 steps.
  *
+ * Ship guardrail: the #1 field failure is a run that authors and authors
+ * (hundreds of paint calls) and stops or spinning WITHOUT ever producing a ROM
+ * — no export/assemble/build/run. So the loop tracks the furthest ship-pipeline
+ * stage reached (a stage counts only once its tool call SUCCEEDED: export →
+ * assemble → build_rom → run), steers the checkpoint nudge toward shipping
+ * while no ROM is running, and — when the model tries to end the run with a
+ * plain text reply while no ROM is built and running — gives it a bounded
+ * chance (SHIP_NUDGE_MAX) to ship, or to say plainly what is unbuildable and
+ * ship the rest, before accepting the stop. A run that ends below "ROM built"
+ * gets an explicit "no ROM was produced" note, so the outcome is never
+ * silently invisible. All bounded, so it can never loop.
+ *
  * Tool calls come from TWO sources, tried in order (see `./tool-protocol`):
  *   - native `message.tool_calls` (back-compat for models/transports that
  *     still emit them);
@@ -63,6 +75,59 @@ const AUTO_CONTINUE_NUDGE =
   'Step checkpoint reached — the task is NOT finished and you are NOT at a hard limit, so keep going. ' +
   'Call the tools you still need to complete the task. ' +
   'Only stop and give a short summary once the task is actually complete.';
+
+/**
+ * The deliverable pipeline — how far a run has gotten at PRODUCING a ROM. The
+ * #1 field-log failure is the agent authoring and authoring (hundreds of paint
+ * calls) and then stopping or spinning WITHOUT ever calling the
+ * export→assemble→build→run tools that turn authored graphics into something
+ * the user can actually see. So the loop tracks the furthest SHIP stage reached
+ * (a stage counts only once its tool call SUCCEEDED) and steers the run toward
+ * shipping instead of letting it wander:
+ *   0 = nothing shipped (no export/assemble/build/run)
+ *   1 = a data file exported (gfx_export_vram / gfx_export_oam / trk_export_spc)
+ *   2 = assembled (asm_assemble)
+ *   3 = ROM built (asm_build_rom) — a ROM file exists
+ *   4 = ROM running (asm_run) — the user can see it  ← a "working ROM"
+ * Ending a run below stage 3 means no ROM was produced; below stage 4 means no
+ * WORKING (running) ROM. Both get a bounded nudge to ship before we accept it.
+ */
+const SHIP_STAGE: Record<string, number> = {
+  gfx_export_vram: 1,
+  gfx_export_oam: 1,
+  trk_export_spc: 1,
+  asm_assemble: 2,
+  asm_build_rom: 3,
+  asm_run: 4,
+};
+
+/** Consecutive clean-reply stops nudged to ship before we finally accept one. */
+const SHIP_NUDGE_MAX = 2;
+
+/**
+ * Checkpoint nudge for a run that has done NO ship-pipeline work yet (stage 0)
+ * — exactly the field-log pattern: long stretches of paint calls with zero
+ * export/assemble/build/run. Steer hard toward shipping instead of the generic
+ * "keep going," and give the model permission to ship a PARTIAL working ROM and
+ * report the unbuildable gap, rather than dying trying to build it all.
+ */
+const SHIP_NUDGE =
+  'Step checkpoint — but you have NOT yet produced a ROM: no export, no assemble, no build, no run. ' +
+  'Authoring alone reaches the user as nothing. SHIP NOW: call the export tool(s) for what you have authored (gfx_export_vram / gfx_export_oam / trk_export_spc as needed), then asm_assemble, then asm_build_rom, then asm_run. ' +
+  'A simple ROM that shows what works beats a perfect description of nothing. ' +
+  'If part of the request genuinely cannot be built with the current tools, ship a working ROM with the parts that CAN be built and state clearly in your final summary exactly what you left out and why. ' +
+  'Do not keep painting tiles or setting palette colors — that is not progress toward a ROM.';
+
+/**
+ * Checkpoint nudge for a run mid-pipeline (stage 1–3): data is on its way but
+ * no ROM is running yet. Push it all the way to asm_run instead of stopping at
+ * the middle of the pipeline.
+ */
+const SHIP_PUSH =
+  'Step checkpoint — you have made some progress toward a ROM but have not built and run one yet. ' +
+  'Drive it all the way: asm_assemble (fixing any per-line errors), then asm_build_rom, then asm_run. ' +
+  'A ROM that is built and running is the goal — do not stop at the middle of the pipeline. ' +
+  'If a part of the request cannot be built with the current tools, ship a working ROM with the parts that CAN be built and say in your summary exactly what you left out and why.';
 
 /**
  * Forward-looking "intent" phrasing — the model announcing it is ABOUT TO do
@@ -140,6 +205,17 @@ export interface RunAgentOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void;
+  /**
+   * Enforce the "ship a ROM" guardrail (default `true`). When on, a run that
+   * did authoring work but ends below the export→assemble→build→run pipeline
+   * gets a bounded nudge to actually ship (plus an end-of-run note if it still
+   * doesn't). Set `false` for pure Q&A assistant use, or in tests that exercise
+   * the loop's mechanics (retry, malformed recovery, context trim, …) in
+   * isolation — those tests aren't about shipping. The main authoring path
+   * leaves it on, which is the field-log fix: the agent used to paint for
+   * hundreds of steps and end with a summary, shipping nothing.
+   */
+  enforceShip?: boolean;
 }
 
 /**
@@ -372,6 +448,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     timeoutMs = 30_000,
     signal,
     onEvent,
+    enforceShip = true,
   } = opts;
   const ctx: ToolCtx = { controllers };
   let messages: Message[] = [{ role: 'system', content: system }, ...opts.messages];
@@ -385,6 +462,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   let emptyStreak = 0; // consecutive empty replies (a nudge is allowed, not a loop)
   let malformedStreak = 0; // consecutive malformed tool-call replies (nudged, not failed)
   let intentStreak = 0; // consecutive "I'll do X" text replies with no tool call (nudged, then stopped)
+  let shipStage = 0; // furthest ship-pipeline stage reached (see SHIP_STAGE)
+  let shipNudge = 0; // consecutive clean-reply stops nudged to ship (bounded by SHIP_NUDGE_MAX)
+  let authored = false; // has the model dispatched any tool call (done authoring work)?
   const sigs: string[] = []; // recent step signatures, for spin detection
 
   for (;;) {
@@ -518,11 +598,41 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         continue;
       }
 
+      // A NON-empty text reply that is not an intent-stall is the model trying
+      // to FINISH. But finishing without a WORKING ROM is exactly the field-log
+      // failure: hundreds of paint calls, then a summary, with zero
+      // export/assemble/build/run. If the run has not produced a ROM the user
+      // can see (stage < 4), give it a BOUNDED chance to ship — or to say
+      // plainly what is unbuildable and ship the rest — before accepting the
+      // stop. shipNudge is bounded (SHIP_NUDGE_MAX) and reset whenever a tool
+      // call runs, so this can never loop.
+      //
+      // Only when the guardrail is ON (enforceShip) AND the model actually did
+      // authoring work (authored). A pure Q&A ("what can you do?" → an answer)
+      // has nothing to ship and must not be nagged into building a ROM; a run
+      // that only NARRATED a plan (no tool call) is caught earlier by the
+      // INTENT_NUDGE above, not here.
+      if (enforceShip && authored && shipStage < 4 && shipNudge < SHIP_NUDGE_MAX) {
+        shipNudge += 1;
+        onEvent?.({ type: 'message', content: reply.content });
+        messages.push({
+          role: 'user',
+          content:
+            'You are about to finish, but no ROM is built and RUNNING yet — the user sees nothing until one is running. ' +
+            'Before you stop, make sure a ROM is actually built and run: if needed, call the export tool(s) for what you authored, then asm_assemble (fixing any per-line errors), then asm_build_rom, then asm_run. ' +
+            'If part of the request genuinely cannot be built with the current tools, ship a working ROM with the parts that CAN be built and state clearly, in your final summary, exactly what you left out and why. ' +
+            'Only stop now if this was a pure question with no ROM to produce — in that case say so in one line.',
+        });
+        continue;
+      }
+
       onEvent?.({ type: 'message', content: reply.content });
       stopped = 'reply';
       break;
     }
     emptyStreak = 0;
+    authored = true; // a tool call ran — the model did real authoring work
+    shipNudge = 0; // a tool call ran — the model is acting, so re-arm the ship nudge
     intentStreak = 0; // a tool call ran — acting again, so the intent streak resets
 
     let toolMs = 0;
@@ -535,6 +645,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       results.push(result);
       onEvent?.({ type: 'tool-result', name: call.name, ok: result.ok, content: result.content });
       messages.push({ role: 'tool', content: result.content, tool_name: call.name });
+      // Track how far the run has gotten at PRODUCING a ROM — a stage counts
+      // only once its tool call succeeded (an errored assemble is no ROM).
+      if (result.ok) {
+        const s = SHIP_STAGE[call.name];
+        if (s && s > shipStage) shipStage = s;
+      }
     }
     perStep.push({ index: stepIndex, modelMs, retries: outcome.retries, retryErrors: outcome.retryErrors, toolCalls: calls.length, toolMs });
 
@@ -574,10 +690,31 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         stopped = 'max-turns';
         break;
       }
-      messages.push({ role: 'user', content: AUTO_CONTINUE_NUDGE });
+      // Steer by how far the run is down the ship pipeline: not shipped at all
+      // (stage 0) gets the hard SHIP_NUDGE; mid-pipeline (1–3) gets SHIP_PUSH;
+      // already running a ROM (stage 4) just gets the plain "keep going".
+      // With the guardrail off (enforceShip false) a checkpoint is a plain
+      // "keep going" — the mechanism it exists for is disabled.
+      const checkpoint = !enforceShip
+        ? AUTO_CONTINUE_NUDGE
+        : shipStage === 0 ? SHIP_NUDGE : shipStage < 4 ? SHIP_PUSH : AUTO_CONTINUE_NUDGE;
+      messages.push({ role: 'user', content: checkpoint });
       batchTurns = 0;
       continue;
     }
+  }
+
+  // Make a no-ROM outcome EXPLICIT when the run ended below "ROM built" (stage
+  // 3), so the user sees exactly what happened instead of reading a summary
+  // and not realizing nothing was actually shipped. Only when the guardrail is
+  // on AND the model actually did authoring work — a pure Q&A that ends below
+  // stage 3 has nothing to ship and gets no "no ROM" note.
+  if (enforceShip && authored && shipStage < 3) {
+    const tail =
+      shipStage === 0
+        ? ' Note: no ROM was produced — the run ended with no export, assemble, build, or run. Re-send the request (or just say "ship it") and I will drive it through the export → assemble → build → run pipeline, or tell me which part is unbuildable and I will ship the rest.'
+        : ' Note: a ROM was not built yet (some data was authored but it was never assembled/built). Re-send the request (or say "build and run it") and I will finish the pipeline: asm_assemble → asm_build_rom → asm_run.';
+    if (!finalContent.includes('Note:')) finalContent = (finalContent ? finalContent + ' ' : '') + tail;
   }
 
   return { messages, finalContent, turns, stopped, totalMs: Date.now() - startedAt, perStep };
