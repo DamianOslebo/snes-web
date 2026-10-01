@@ -4,6 +4,7 @@ import type { StreamChunk, Transport } from '../src/agent/ollama';
 import type {
   AgentControllers,
   AsmController,
+  EmuProbeController,
   GfxController,
   Message,
   TrackController,
@@ -29,6 +30,7 @@ function miniControllers() {
     },
     assemble: () => ({ ok: true, byteCount: 12, errors: [] }),
     buildRom: () => ({ ok: true, bytes: 262144 }),
+    buildRomBytes: () => ({ ok: true, bytes: new Uint8Array(256) }),
     run: () => ({ ok: true }),
   };
   const gfx: GfxController = {
@@ -67,7 +69,23 @@ function miniControllers() {
     spcGlueLz: () => ';glue lz',
     spcLayout: () => ({}),
   };
-  return { controllers: { asm, gfx, track } as AgentControllers, log };
+  // The agent's "eyes": a canned green (screen-up) probe result. The loop never
+  // inspects the summary — it only needs the controller to exist and resolve.
+  const emu: EmuProbeController = {
+    probe: async () => ({
+      ok: true,
+      core: 'test-core',
+      isMock: false,
+      frames: 3,
+      screen: {
+        width: 256, height: 224, background: [0, 0, 0, 0], backgroundCount: 55300,
+        contentRatio: 0.0125, contentBbox: { x0: 100, y0: 100, x1: 155, y1: 123 },
+        topColors: [{ color: [0, 0, 0, 0], count: 55300 }, { color: [255, 0, 0, 0], count: 700 }],
+        isSolid: false, isSolidBlack: false, grid: [], gridCols: 32, gridRows: 28,
+      },
+    }),
+  };
+  return { controllers: { asm, gfx, track, emu } as AgentControllers, log };
 }
 
 /** A transport that replays `responses` in order (last one repeats forever). */

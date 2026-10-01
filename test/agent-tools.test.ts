@@ -9,10 +9,13 @@ import {
 import type {
   AgentControllers,
   AsmController,
+  EmuProbeController,
+  EmuProbeResult,
   GfxController,
   ToolResult,
   TrackController,
 } from '../src/agent/types';
+import type { FrameSummary } from '../src/agent/frame';
 
 /** Recording mocks: canned values + a call log to assert controller usage. */
 function mockControllers() {
@@ -24,10 +27,24 @@ function mockControllers() {
   const results = {
     assemble: { ok: true, byteCount: 12, errors: [] as { line: number; message: string }[] },
     buildRom: { ok: true, bytes: 262144 } as { ok: boolean; bytes?: number; error?: string },
+    buildRomBytes: { ok: true, bytes: new Uint8Array(256) } as { ok: boolean; bytes?: Uint8Array; error?: string },
     run: { ok: true } as { ok: boolean; error?: string },
     setCell: true,
     preview: { ok: true } as { ok: boolean; error?: string },
     stop: { ok: true } as { ok: boolean; error?: string },
+    // Overridable per-test probe outcome (see the emu_probe tests below).
+    probe: {
+      ok: true,
+      core: 'test-core',
+      isMock: false,
+      frames: 3,
+      screen: {
+        width: 256, height: 224, background: [0, 0, 0, 0], backgroundCount: 55300,
+        contentRatio: 0.0125, contentBbox: { x0: 100, y0: 100, x1: 155, y1: 123 },
+        topColors: [{ color: [0, 0, 0, 0], count: 55300 }, { color: [255, 0, 0, 0], count: 700 }],
+        isSolid: false, isSolidBlack: false, grid: [], gridCols: 32, gridRows: 28,
+      },
+    } as EmuProbeResult,
   };
 
   // Overridable per-test export blobs. Defaults are tiny, so the fallback rule
@@ -58,6 +75,7 @@ function mockControllers() {
     },
     assemble: () => results.assemble,
     buildRom: () => results.buildRom,
+    buildRomBytes: () => results.buildRomBytes,
     run: () => results.run,
   };
 
@@ -125,11 +143,24 @@ function mockControllers() {
     spcLayout: () => ({ start: 0x40 }),
   };
 
-  const controllers: AgentControllers = { asm, gfx, track };
+  const emu: EmuProbeController = {
+    probe: (opts) => {
+      call('probe', [opts]);
+      return Promise.resolve(results.probe);
+    },
+  };
+
+  const controllers: AgentControllers = { asm, gfx, track, emu };
   return { controllers, rec, files, sources, results, blobs };
 }
 
 function dispatch(m: ReturnType<typeof mockControllers>, name: string, args: Record<string, unknown> = {}): ToolResult {
+  // `dispatchTool` returns `ToolResult | Promise<ToolResult>` (async tools);
+  // the sync tools used through this helper always resolve immediately.
+  return dispatchTool(name, args, { controllers: m.controllers }) as ToolResult;
+}
+
+async function dispatchAsync(m: ReturnType<typeof mockControllers>, name: string, args: Record<string, unknown> = {}): Promise<ToolResult> {
   return dispatchTool(name, args, { controllers: m.controllers });
 }
 
@@ -171,11 +202,11 @@ describe('base64ToBytes', () => {
 // --- catalog shape -----------------------------------------------------------
 
 describe('TOOL_SPECS', () => {
-  it('has the 34 well-formed function specs', () => {
-    expect(TOOL_SPECS).toHaveLength(34);
+  it('has the 35 well-formed function specs', () => {
+    expect(TOOL_SPECS).toHaveLength(35);
     for (const s of TOOL_SPECS) {
       expect(s.type).toBe('function');
-      expect(s.function.name).toMatch(/^(asm|gfx|trk)_[a-z_]+$/);
+      expect(s.function.name).toMatch(/^(asm|gfx|trk|emu)_[a-z_]+$/);
       expect(s.function.description.length).toBeGreaterThan(10);
       expect(s.function.parameters).toMatchObject({ type: 'object' });
     }
@@ -192,6 +223,7 @@ describe('TOOL_SPECS', () => {
       'gfx_set_oam_entry', 'gfx_clear_oam', 'gfx_export_vram', 'gfx_export_oam',
       'trk_get_song', 'trk_set_cell', 'trk_set_pattern', 'trk_set_tempo', 'trk_set_orders',
       'trk_add_pattern', 'trk_add_instrument', 'trk_preview', 'trk_stop', 'trk_export_spc',
+      'emu_probe',
     ]) {
       expect(names).toContain(expected);
     }
@@ -207,7 +239,7 @@ describe('dispatch contract', () => {
     expect(r.ok).toBe(false);
     const body = JSON.parse(r.content) as { error: string; tools: string[] };
     expect(body.error).toContain('unknown tool');
-    expect(body.tools).toHaveLength(34);
+    expect(body.tools).toHaveLength(35);
     // The sprite (OAM) toolchain is present in the catalog.
     for (const t of ['gfx_set_oam_entry', 'gfx_clear_oam', 'gfx_export_oam']) {
       expect(body.tools).toContain(t);
@@ -688,5 +720,84 @@ describe('trk tools', () => {
     expect(m.files.get('spc.bin')!).toEqual(new Uint8Array([9, 9]));
     expect(m.sources.src).toContain('glue for spc.bin');
     expect(m.sources.src).not.toContain('LZSS_DECODE_GLUE');
+  });
+});
+
+describe('emu_probe (the agent\'s eyes)', () => {
+  // A measured all-black frame — the "regressed to a black screen" case.
+  const solidBlack: FrameSummary = {
+    width: 256, height: 224, background: [0, 0, 0, 0], backgroundCount: 57344,
+    contentRatio: 0, contentBbox: null,
+    topColors: [{ color: [0, 0, 0, 0], count: 57344 }],
+    isSolid: true, isSolidBlack: true, grid: [], gridCols: 32, gridRows: 28,
+  };
+
+  it('reports a green (screen-up) result with an actionable note', async () => {
+    const m = mockControllers();
+    const r = await dispatchAsync(m, 'emu_probe');
+    expect(r.ok).toBe(true);
+    const body = JSON.parse(r.content) as {
+      core: string; isMock: boolean; frames: number;
+      screen: { contentBbox: { x0: number } | null }; note: string;
+    };
+    expect(body.core).toBe('test-core');
+    expect(body.isMock).toBe(false);
+    expect(body.frames).toBe(3);
+    expect(body.screen.contentBbox).not.toBeNull();
+    expect(body.note).toMatch(/Screen is up/);
+    // No `frames` arg → the controller was called with the default (undefined).
+    expect(callTo(m, 'probe')).toEqual([undefined]);
+  });
+
+  it('passes a numeric `frames` through to the core', async () => {
+    const m = mockControllers();
+    const r = await dispatchAsync(m, 'emu_probe', { frames: 7 });
+    expect(r.ok).toBe(true);
+    expect(callTo(m, 'probe')).toEqual([{ frames: 7 }]);
+  });
+
+  it('diagnoses a SOLID BLACK screen and steers AWAY from background-palette edits', async () => {
+    const m = mockControllers();
+    m.results.probe = { ok: true, core: 'test-core', isMock: false, frames: 3, screen: solidBlack };
+    const r = await dispatchAsync(m, 'emu_probe');
+    expect(r.ok).toBe(true);
+    const body = JSON.parse(r.content) as { note: string };
+    expect(body.note).toMatch(/SOLID BLACK/);
+    // The exact trap an agent already fell into, called out by name:
+    // a SPRITE samples the OBJ palette (16–31), not the background (0–15).
+    expect(body.note).toMatch(/do NOT keep changing background palette colors/);
+    expect(body.note).toMatch(/OBJ palette \(indices 16–31\)/);
+    expect(body.note).toMatch(/gfx_export_oam/);
+    expect(body.note).toMatch(/gfx_set_oam_entry/);
+  });
+
+  it('warns loudly when the frame came from the MOCK core', async () => {
+    const m = mockControllers();
+    m.results.probe = { ok: true, core: 'mock (test pattern)', isMock: true, frames: 3, screen: solidBlack };
+    const r = await dispatchAsync(m, 'emu_probe');
+    const body = JSON.parse(r.content) as { isMock: boolean; note: string };
+    expect(body.isMock).toBe(true);
+    expect(body.note).toMatch(/MOCK core/);
+    expect(body.note).toMatch(/NOT your ROM/);
+  });
+
+  it('turns a failed probe (no clean assemble) into a clean, actionable result', async () => {
+    const m = mockControllers();
+    m.results.probe = { ok: false, error: 'assemble failed' };
+    const r = await dispatchAsync(m, 'emu_probe');
+    expect(r.ok).toBe(false);
+    const body = JSON.parse(r.content) as { error: string; hint: string };
+    expect(body.error).toContain('assemble failed');
+    expect(body.hint).toMatch(/asm_assemble/);
+  });
+
+  it('a REJECTING probe never throws — it resolves to a clean failure', async () => {
+    const m = mockControllers();
+    m.controllers.emu.probe = () => Promise.reject(new Error('wasm died'));
+    // The dispatchTool NEVER-THROWS contract: a rejection becomes an ok:false
+    // tool result the model can read, not an unhandled rejection to the loop.
+    const r = await dispatchAsync(m, 'emu_probe');
+    expect(r.ok).toBe(false);
+    expect(JSON.parse(r.content).error).toContain('wasm died');
   });
 });

@@ -1,11 +1,14 @@
 /**
  * `tools` — the agent's tool catalog and dispatcher.
  *
- * The 34 `asm_*` / `gfx_*` / `trk_*` tools are the model's only way to touch
+ * The 35 `asm_*` / `gfx_*` / `trk_*` tools are the model's only way to touch
  * the three pages: each maps to one or two `AgentControllers` methods. Three
  * of them are cross-page bridges — `gfx_export_vram`, `gfx_export_oam`, and `trk_export_spc` build
  * a binary on one page and register it on the asm page as an `.incbin` data
  * file, so a 64 KB image never has to cross the model's context as text.
+ * `emu_probe` is the agent's EYES: it boots a real core, runs the built ROM
+ * headlessly, and reports a compact summary of the rendered screen so the
+ * agent can see its own output (and catch a black screen) instead of guessing.
  *
  * Contract: `dispatchTool` NEVER throws. Unknown tools and malformed
  * arguments become clean, compact JSON error strings — the model reads them
@@ -20,13 +23,17 @@ import { NOTE_MAX, NOTE_MIN, parseNoteName } from '../track/model';
 import type { OamSize } from '../gfx/oam';
 import { LZ_GLUE_EXTRA, LZ_ROUTINE_BYTES, lzssCompress, lzssGlue } from '../asm/lzss';
 import type { AgentControllers, ToolResult, ToolSpec } from './types';
+import type { FrameSummary } from './frame';
 
 export interface ToolCtx {
   controllers: AgentControllers;
 }
 
 type Args = Record<string, unknown>;
-type Handler = (args: Args, c: AgentControllers) => ToolResult;
+/** A tool handler. Most are sync; `emu_probe` is async (it boots a core), so a
+ * handler may return a ToolResult now or a Promise of one — `dispatchTool`
+ * awaits either and normalizes a rejection to a clean failure. */
+type Handler = (args: Args, c: AgentControllers) => ToolResult | Promise<ToolResult>;
 
 interface ToolDef {
   name: string;
@@ -1073,6 +1080,41 @@ const DEFS: ToolDef[] = [
       return ok({ bytes: raw.length, glue: c.track.spcGlue(), layout });
     },
   },
+
+  // ===== emu (eyes — SEE the built ROM without leaving the page) ===========
+
+  {
+    name: 'emu_probe',
+    description:
+      'SEE your own work: build the current ROM, run it in a headless core for a few frames, and ' +
+      'summarize the rendered screen (background color, how much differs from it, where the content ' +
+      'is, the top colors, and a coarse picture). Use it to VERIFY a build before you finish, and to ' +
+      'DIAGNOSE a black / blank / missing-sprite screen instead of guessing at palette colors. It is ' +
+      'observation only — it never launches the visible emulator or navigates away.',
+    parameters: {
+      type: 'object',
+      properties: {
+        frames: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 24,
+          description: 'How many emulator frames to advance before sampling (default 3).',
+        },
+      },
+    },
+    run: async (a, c) => {
+      const rawFrames = a.frames;
+      const frames = typeof rawFrames === 'number' ? rawFrames : undefined;
+      const r = await c.emu.probe(frames !== undefined ? { frames } : undefined);
+      if (!r.ok) {
+        return fail(r.error ?? 'probe failed', {
+          hint: 'A clean assemble is required. Call asm_assemble (fix its per-line errors), then emu_probe again.',
+        });
+      }
+      const screen = r.screen as FrameSummary;
+      return ok({ core: r.core, isMock: r.isMock ?? false, frames: r.frames, screen, note: verdict(screen, !!r.isMock) });
+    },
+  },
 ];
 
 /** The JSON-Schema tool specs sent to Ollama (derived from the catalog). */
@@ -1092,16 +1134,75 @@ export function toolNames(): string[] {
 /**
  * Dispatch one tool call. NEVER throws: unknown tools and malformed arguments
  * become a clean `ok:false` result whose `content` the model can read and act
- * on. A throwing controller is caught and reported the same way.
+ * on. A throwing (or REJECTING) controller is caught and reported the same way.
+ * Returns a ToolResult for sync handlers and a Promise<ToolResult> for async
+ * ones (e.g. `emu_probe`); the caller `await`s either.
  */
-export function dispatchTool(name: string, args: Args, ctx: ToolCtx): ToolResult {
+export function dispatchTool(name: string, args: Args, ctx: ToolCtx): ToolResult | Promise<ToolResult> {
   const h = HANDLERS[name];
   if (!h) return fail(`unknown tool "${name}"`, { tools: toolNames() });
+  let out: ToolResult | Promise<ToolResult>;
   try {
-    return h(args ?? {}, ctx.controllers);
+    out = h(args ?? {}, ctx.controllers);
   } catch (err) {
     return fail(`tool "${name}" crashed: ${(err as Error).message}`);
   }
+  // Async handler: keep the NEVER-THROWS contract by converting a rejection into
+  // a clean failure instead of surfacing an unhandled promise rejection to the loop.
+  if (out && typeof (out as Promise<ToolResult>).then === 'function') {
+    return (out as Promise<ToolResult>).catch((err) =>
+      fail(`tool "${name}" crashed: ${(err as Error).message}`),
+    );
+  }
+  return out;
+}
+
+// --- emu_probe: turn a measured frame into an actionable verdict -------------
+
+/** A 5-bit SNES RGB color (0–31 each) as `#rrggbb` (lowercase, ≤ 0x1f each). */
+function fmtColor(c: [number, number, number, number]): string {
+  const h = (v: number) => Math.max(0, Math.min(31, v)).toString(16).padStart(2, '0');
+  return `#${h(c[0])}${h(c[1])}${h(c[2])}`;
+}
+
+/**
+ * Tell the model what a rendered screen MEANS and what to fix. This is where
+ * the "a black screen usually means X, not Y" knowledge lives — including the
+ * exact trap an agent already fell into: editing BACKGROUND palette colors
+ * (0–15) to make a SPRITE appear, when a sprite samples the OBJ palette (16–31)
+ * and a sprite-only ROM is SUPPOSED to have a black background.
+ */
+function verdict(s: FrameSummary, isMock: boolean): string {
+  if (isMock) {
+    return "MOCK core — this is the emulator's test pattern, NOT your ROM. The screenshot is " +
+      'unreliable; a real core was unavailable on this page. Do not draw conclusions from this image.';
+  }
+  if (s.isSolidBlack) {
+    return 'SOLID BLACK — nothing is being drawn. ' +
+      'If you wanted a PAINTED BACKGROUND, the tilemap was never filled (gfx_fill_map / gfx_set_map_grid) ' +
+      'or gfx_export_vram was never run. ' +
+      'If you wanted a SPRITE: a black background is CORRECT for a sprite-only ROM, so the sprite itself is ' +
+      'not showing — do NOT keep changing background palette colors (indices 0–15); a sprite samples the ' +
+      'OBJ palette (indices 16–31). Check IN ORDER: (1) was gfx_export_oam run with the sprite placed in ' +
+      'slot 0 and gfx_set_oam_entry setting its tile/x/y? (2) is the sprite tile painted with a visible, ' +
+      'non-transparent color, with OBJ index 16 set transparent? (3) set the matching OBJ color with ' +
+      'gfx_set_palette_color index 16+N, RE-RUN gfx_export_vram, re-assemble, then probe again.';
+  }
+  if (s.isSolid) {
+    return `SOLID single color (${fmtColor(s.background)}) — one flat color, no other content. ` +
+      'That is a valid minimal background, but if you expected a sprite or a pattern it is NOT drawing: ' +
+      'for a sprite check gfx_set_oam_entry + gfx_export_oam; for a pattern fill the tilemap with a ' +
+      'non-background tile.';
+  }
+  const box = s.contentBbox
+    ? `content spans x=${s.contentBbox.x0}–${s.contentBbox.x1}, y=${s.contentBbox.y0}–${s.contentBbox.y1} ` +
+      `(${s.contentBbox.x1 - s.contentBbox.x0 + 1}×${s.contentBbox.y1 - s.contentBbox.y0 + 1}px)`
+    : 'content present';
+  const small = s.contentRatio < 0.01 ? 'a small region of ' : '';
+  return `Screen is up (not blank): background ≈ ${fmtColor(s.background)}, ${small}` +
+    `${Math.round(s.contentRatio * 100)}% of pixels differ — ${box}. Something IS drawing. If a sprite ` +
+    'looks wrong (wrong spot/size/color), adjust its OAM entry (gfx_set_oam_entry) or its OBJ palette ' +
+    '(indices 16–31), then probe again.';
 }
 
 // --- helpers -----------------------------------------------------------------

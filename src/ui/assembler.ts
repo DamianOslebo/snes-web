@@ -447,6 +447,16 @@ export function makeAsmController(): AsmController {
         return { ok: false, error: (err as Error).message };
       }
     },
+    buildRomBytes(): { ok: boolean; bytes?: Uint8Array; error?: string } {
+      initAsmState();
+      const r = assemble(asmSource, ROM_ENTRY, asmIncludes);
+      if (!r.ok) return { ok: false, error: errorsText(r.errors) };
+      try {
+        return { ok: true, bytes: buildRomFromResult(r) };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message };
+      }
+    },
     run(): { ok: boolean; error?: string } {
       initAsmState();
       const r = assemble(asmSource, ROM_ENTRY, asmIncludes);

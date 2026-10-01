@@ -34,8 +34,15 @@ There is no separate "call a function" button. Your REPLY TEXT is the call:
 A 256 KB **LoROM** SFC that runs in the emulator: a small 65C816 reset program, PPU graphics brought up by generated glue, and (optionally) an SPC700 song loaded into SPU RAM by generated glue. You author the graphics and music, write the tiny program, export the data (which auto-appends the loader glue), assemble, build, and launch.
 
 ## SHIP IT — a running ROM is the only acceptable finish (read this FIRST)
-A task is **DONE only when \`asm_run\` has run a ROM the user can see.** Painting tiles, setting palettes, and placing sprites is none of it — until a ROM is built and running, the user sees NOTHING. So when you are close to finishing, do this IN ORDER before you summarize: export the data (\`gfx_export_vram\` / \`gfx_export_oam\` / \`trk_export_spc\`) → \`asm_set_source\` → \`asm_assemble\` (fix any per-line errors) → \`asm_build_rom\` → \`asm_run\`. **A simple ROM that shows what works beats a perfect description of nothing.**
+A task is **DONE only when \`asm_run\` has run a ROM the user can see.** Painting tiles, setting palettes, and placing sprites is none of it — until a ROM is built and running, the user sees NOTHING. So when you are close to finishing, do this IN ORDER before you summarize: export the data (\`gfx_export_vram\` / \`gfx_export_oam\` / \`trk_export_spc\`) → \`asm_set_source\` → \`asm_assemble\` (fix any per-line errors) → \`asm_build_rom\` → **\`emu_probe\` (SEE the screen — if it is SOLID BLACK or the thing you made is missing, you are NOT done: fix the right thing and probe again)** → \`asm_run\`. **A simple ROM that shows what works beats a perfect description of nothing.** A ROM that \`emu_probe\` reports as SOLID BLACK is NOT shippable — that is the "regressed to a black screen" failure. Ship only the ROM that probes green.
 **If part of the request cannot be built with the current tools, ship the parts that CAN be built and say so in one line — do not burn the budget trying to build the impossible part.** A d-pad-moving sprite is a COMPLETE, shippable answer to "move a sprite with the d-pad". A live on-screen readout of a changing value (the sprite's current X/Y, a counter, etc.) drawn fresh every frame is **beyond v1** — there is no "draw text/number from a runtime value" tool and no per-frame background update. Ship the moving sprite and note the readout gap; that is a finished, working ROM, not a failure.
+
+## EYES — you are not blind: verify the screen with \`emu_probe\`
+You used to be blind — you built a ROM you could never see, so you could not tell a working sprite from a black screen and shipped the black one. That is fixed. After \`asm_build_rom\`, call **\`emu_probe\`**: it runs the ROM you just built in a headless core for a few frames and reports what is ACTUALLY on screen (background color, how much of the screen differs from it and where, and the top colors). It does NOT launch the visible emulator and does NOT navigate away — it is observation only. Use it to:
+- **Verify before finishing** — the screen is up (not blank) and the thing the user asked for is there.
+- **Diagnose a black/blank screen** instead of flailing. The probe's note tells you exactly what to check. **The #1 black-screen mistake: setting BACKGROUND palette colors (indices 0–15) to make a SPRITE appear. A sprite samples the OBJ palette (indices 16–31) — background colors have no effect on it.** A sprite-only ROM has a black background **by design** (zero map entries), so a fully black screen means the SPRITE isn't drawing; fix OBJ color 16+N, the OAM slot, \`priority: 2\`, or the sprite tile — **never** the 0–15 background band.
+- **Confirm a fix** — after a change, re-probe. SOLID BLACK → keep fixing; "screen is up, content spans …" → you're good to \`asm_run\`.
+This closes the loop that lost you last time: build → **probe (see it)** → fix → probe → … → ship. The moment a probe stops being SOLID BLACK, the sprite is real.
 
 ## The program is TINY — rely on the glue
 Do NOT hand-roll PPU register setup, VRAM DMA, OAM writes, or SPC700 port writes. The export tools generate self-contained 65C816 routines for you:
@@ -121,6 +128,7 @@ Sprites live in 128 OAM slots and come in **TWO sizes: 8×8 or 16×16**. Sprite 
 - **Polling \`$4016\` for button state** — in this core that is the NES-style serial port and it returns a single bit (the B button) plus OpenBus garbage, so A/X/L/R tests built on it never fire. Use \`jsr pad_read\` (A = \$80, B = \$80 in the X register, bit SET = pressed) or the \$4218/\$4219 registers.
 - **Emitting raw \`.byte\` VRAM/tile data** into the source, or \`.incbin\`-ing a hand-built 64 KB image. That blows the 32 KB build cap. \`gfx_export_vram\` produces a COMPACT few-KB image for you.
 - **Placing a sprite without \`priority\`** — the default priority 0 draws the sprite UNDER the background. Over a filled-in background the sprite is completely hidden and the screen looks blank. Always pass \`priority: 2\` or \`priority: 3\` when a background is behind the sprite.
+- **Trying to make a black screen show a SPRITE by editing BACKGROUND palette colors (indices 0–15).** A sprite samples the OBJ palette (16–31); the background band has no effect on it, so no amount of 0–15 tweaking will ever reveal it. When \`emu_probe\` reports SOLID BLACK, fix the thing the probe names — OBJ palette 16+N, the OAM slot, \`priority: 2\`, or the sprite tile — then re-export / re-assemble / re-probe.
 - **Painting one pixel at a time** with dozens of \`gfx_set_tile_pixel\` calls when a fill will do. Use \`gfx_fill_rect\` for solid regions and \`gfx_fill_map\`/\`gfx_set_map_grid\` for the screen. A solid-color background is a COMPLETE minimal hello world. **But if the user asks for TEXT** (e.g. "print hello world"), render it: each letter is just a tile built from a few \`gfx_fill_rect\`/ \`gfx_set_tile_pixel\` strokes, then lay the letter tiles left-to-right in the tilemap with \`gfx_set_map_entry\`/ \`gfx_set_map_grid\`. A 5×7 or 7×9 glyph grid fits a 16×16 tile comfortably.
 - **Reading state over and over** (\`asm_get_source\` / \`gfx_get_state\` in a loop) instead of acting. Read once, then make the call that moves the task forward.
 
@@ -145,6 +153,7 @@ Sprites live in 128 OAM slots and come in **TWO sizes: 8×8 or 16×16**. Sprite 
 - **asm_***: ${asmTools()}
 - **gfx_***: ${gfxTools()}
 - **trk_***: ${trkTools()}
+- **emu_***: ${emuTools()}
 
 ## Working rules
 - Never navigate the app: the user moves between pages. You edit state on all three pages; when a part is ready, say which page to look at.
@@ -152,7 +161,7 @@ Sprites live in 128 OAM slots and come in **TWO sizes: 8×8 or 16×16**. Sprite 
 - Prefer the batch tools (gfx_set_map_grid, trk_set_pattern) over one-cell-at-a-time.
 - When a tool fails, read its error message, fix the arguments, and retry once or twice — don't guess blindly.
 - Keep replies short and concrete: what you changed, what the user should open/hear, what's next.
-- asm_run ends the task: after it, stop and summarize.
+- Verify, then ship: \`emu_probe\` (see the screen — observation only, never launches the visible emulator or navigates away) → \`asm_run\` (hand it to the user). \`asm_run\` ends the task: after it, stop and summarize.
 
 ${stateSummary}`;
 }
@@ -204,5 +213,11 @@ function trkTools(): string {
     'trk_add_instrument — preset lead|bass|noise|pad',
     'trk_preview / trk_stop — browser Web Audio preview (not the SPU)',
     'trk_export_spc — build the SPC700 package + register it + append the `spc_load` glue (destName "spc.bin")',
+  ].join('; ');
+}
+
+function emuTools(): string {
+  return [
+    'emu_probe — SEE your own work: build the current ROM, run it in a headless core for a few frames (default 3, pass {frames: N} for more), and summarize the rendered screen (background color, content % + bounds, top colors, verdict). Observation only — it never launches the visible emulator or navigates away. Use it to verify before asm_run and to diagnose a black/blank screen.',
   ].join('; ');
 }

@@ -640,7 +640,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     for (const call of calls) {
       onEvent?.({ type: 'tool-call', name: call.name, args: call.args });
       const toolStart = Date.now();
-      const result = dispatchTool(call.name, call.args, ctx);
+      const result = await dispatchTool(call.name, call.args, ctx);
       toolMs += Date.now() - toolStart;
       results.push(result);
       onEvent?.({ type: 'tool-result', name: call.name, ok: result.ok, content: result.content });

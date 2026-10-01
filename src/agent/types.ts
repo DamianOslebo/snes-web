@@ -17,6 +17,7 @@
 
 import type { VramCompact } from '../gfx/vram';
 import type { OamSize } from '../gfx/oam';
+import type { FrameSummary } from './frame';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 
@@ -113,6 +114,11 @@ export interface AsmController {
   assemble(): { ok: boolean; byteCount: number; errors: { line: number; message: string }[] };
   /** Build the 256 KB SFC from the last successful assemble. */
   buildRom(): { ok: boolean; bytes?: number; error?: string };
+  /**
+   * Build the 256 KB SFC from the last clean assemble and return the actual
+   * bytes (so a headless core can boot them). `buildRom` only reports the size.
+   */
+  buildRomBytes(): { ok: boolean; bytes?: Uint8Array; error?: string };
   /** Hand the built ROM to the emulator (▶ Run). Browser-only. */
   run(): { ok: boolean; error?: string };
 }
@@ -254,14 +260,48 @@ export interface TrackController {
 }
 
 /**
+ * Headless "eyes" for the agent. The authoring pages are core-free and `run()`
+ * navigates away, so without this the agent can never see what it built — it is
+ * blind and cannot tell a black screen apart from a working one. `probe` boots a
+ * real core, loads the ROM the agent just built, runs a few frames, and returns
+ * a COMPACT summary of the rendered screen, so the agent can verify and
+ * self-diagnose (build → probe → fix → re-probe) on its own.
+ */
+export interface EmuProbeController {
+  /**
+   * Render the currently-authored ROM headlessly and summarize the screen.
+   * `frames` = emulator frames to advance before sampling (default 3, capped at
+   * 24). Returns `ok:false` (never throws) on any core/ROM/assemble failure.
+   */
+  probe(opts?: { frames?: number }): Promise<EmuProbeResult>;
+}
+
+/** The measured outcome of a probe — structured data, no prose (tools.ts narrates it). */
+export interface EmuProbeResult {
+  ok: boolean;
+  /** Core id, plus a MOCK warning if a real core was unavailable on this page. */
+  core?: string;
+  /** True when the frame came from MockCore (its test pattern, not the ROM). */
+  isMock?: boolean;
+  /** How many emulator frames were advanced before sampling. */
+  frames?: number;
+  /** What is actually on screen (only when `ok`). */
+  screen?: FrameSummary;
+  /** A clean, model-readable error (only when not `ok`). */
+  error?: string;
+}
+
+/**
  * The full capability surface the agent loop dispatches against. All three
- * groups are present (each backed by its page's persisted state) so the agent
- * can author code + graphics + music from any single page.
+ * authoring groups are present (each backed by its page's persisted state) so
+ * the agent can drive code + graphics + music from any single page, and `emu`
+ * gives it the eyes to watch the result.
  */
 export interface AgentControllers {
   asm: AsmController;
   gfx: GfxController;
   track: TrackController;
+  emu: EmuProbeController;
 }
 
 /** A tool's outcome, as returned by `dispatchTool` and surfaced to the UI. */

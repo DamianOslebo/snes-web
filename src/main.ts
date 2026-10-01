@@ -17,22 +17,28 @@ import { mountAgentChat } from './ui/agent-chat';
 import { makeAsmController } from './ui/assembler';
 import { makeGfxController } from './ui/graphics';
 import { makeTrackController } from './ui/track';
+import { makeEmuController } from './agent/emu';
 import type { AgentControllers } from './agent/types';
 import { ASM_ROM_KEY, base64ToBytes } from './asm/rom';
 import { mountDebug } from './debug/debugger';
 import workletSource from './runtime/worklet.js?raw';
 
 /**
- * The controllers the 🤖 agent panel drives. All three are always available —
- * each reads/writes its page's persisted (localStorage) state, so the agent
- * can edit any page from any of the three, re-rendering a page only when it
- * happens to be on screen.
+ * The controllers the 🤖 agent panel drives. All three authoring controllers
+ * are always available — each reads/writes its page's persisted (localStorage)
+ * state, so the agent can edit any page from any of the three, re-rendering a
+ * page only when it happens to be on screen. `emu` is the agent's EYES: it
+ * builds the current ROM and renders it in a headless core so the agent can
+ * SEE (and self-diagnose) what it built — the pages are core-free and `run()`
+ * navigates away, so without this the agent is structurally blind.
  */
 function agentControllers(): AgentControllers {
+  const asm = makeAsmController();
   return {
-    asm: makeAsmController(),
+    asm,
     gfx: makeGfxController(),
     track: makeTrackController(),
+    emu: makeEmuController(asm),
   };
 }
 
