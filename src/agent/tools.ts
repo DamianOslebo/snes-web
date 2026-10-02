@@ -1,7 +1,7 @@
 /**
  * `tools` — the agent's tool catalog and dispatcher.
  *
- * The 35 `asm_*` / `gfx_*` / `trk_*` tools are the model's only way to touch
+ * The 36 `asm_*` / `gfx_*` / `trk_*` tools are the model's only way to touch
  * the three pages: each maps to one or two `AgentControllers` methods. Three
  * of them are cross-page bridges — `gfx_export_vram`, `gfx_export_oam`, and `trk_export_spc` build
  * a binary on one page and register it on the asm page as an `.incbin` data
@@ -21,6 +21,7 @@
 
 import { NOTE_MAX, NOTE_MIN, parseNoteName } from '../track/model';
 import type { OamSize } from '../gfx/oam';
+import { bgScrollGlue, nmiGlue, scrollStepsFromSource } from '../gfx/scroll';
 import { LZ_GLUE_EXTRA, LZ_ROUTINE_BYTES, lzssCompress, lzssGlue } from '../asm/lzss';
 import type { AgentControllers, ToolResult, ToolSpec } from './types';
 import type { FrameSummary } from './frame';
@@ -50,10 +51,17 @@ export const MAX_MANUAL_DATA_BYTES = 64 * 1024;
 // (e.g. after painting more tiles) REPLACES the old block instead of duplicating
 // it — a duplicate `vram_load:` label would otherwise fail assembly. Markers are
 // `;`-prefixed, so the assembler treats them as plain comments.
-const GLUE_MARKERS: Record<'gfx' | 'spc' | 'oam' | 'lz', { start: string; end: string }> = {
+const GLUE_MARKERS: Record<'gfx' | 'spc' | 'oam' | 'lz' | 'scroll' | 'nmi', { start: string; end: string }> = {
   gfx: { start: ';=== GFX_VRAM_GLUE (generated) ===', end: ';=== /GFX_VRAM_GLUE ===' },
   spc: { start: ';=== SPC_GLUE (generated; EXPERIMENTAL) ===', end: ';=== /SPC_GLUE ===' },
   oam: { start: ';=== GFX_OAM_GLUE (generated) ===', end: ';=== /GFX_OAM_GLUE ===' },
+  // The BG0 scroll service (bg_scroll_init + bg_scroll) — added by gfx_set_scroll.
+  scroll: { start: ';=== GFX_SCROLL_GLUE (generated) ===', end: ';=== /GFX_SCROLL_GLUE ===' },
+  // THE single NMI handler (nmi_move). A ROM has one NMI vector, so every
+  // once-per-frame service (scroll + sprite tick) dispatches from this ONE
+  // block; it is recomputed from the source after each export that adds a
+  // service, so re-exporting never leaves a stale dispatcher behind.
+  nmi: { start: ';=== NMI_DISPATCHER_GLUE (generated) ===', end: ';=== /NMI_DISPATCHER_GLUE ===' },
   // The shared LZSS decompressor. BOTH gfx and spc export it (via `lzssGlue()`),
   // and it carries its own `lz_decode` label, so it must upsert into ONE shared
   // block — never once per asset (a duplicate `lz_decode:` label would fail assembly).
@@ -74,7 +82,7 @@ const GLUE_MARKERS: Record<'gfx' | 'spc' | 'oam' | 'lz', { start: string; end: s
  * (and, worse, emit a second `lz_decode`), so a self-delimited block is used
  * verbatim.
  */
-function upsertGlue(c: AgentControllers, kind: 'gfx' | 'spc' | 'oam' | 'lz', block: string): void {
+function upsertGlue(c: AgentControllers, kind: 'gfx' | 'spc' | 'oam' | 'lz' | 'scroll' | 'nmi', block: string): void {
   const { start, end } = GLUE_MARKERS[kind];
   const selfDelimited = block.startsWith(start) && block.trimEnd().endsWith(end);
   const body = selfDelimited ? block : `${start}\n${block}\n${end}`;
@@ -89,6 +97,22 @@ function upsertGlue(c: AgentControllers, kind: 'gfx' | 'spc' | 'oam' | 'lz', blo
   }
   // Not present — append with a single blank-line separator.
   c.asm.appendSource(`\n${body}`);
+}
+
+/**
+ * Recompute + upsert the shared NMI dispatcher from the current source. A ROM
+ * has ONE NMI vector (baked at `nmi_move`), so every once-per-frame service —
+ * the BG0 scroll tick and the d-pad sprite tick — must dispatch from that single
+ * handler. After ANY export that adds or changes a per-frame service
+ * (`gfx_export_oam`, `gfx_set_scroll`), re-derive the dispatcher from the
+ * labels present in the source and rewrite the `nmi` block. Pure + idempotent:
+ * whichever services are active are all covered, in a fixed order, in one NMI.
+ * No-op when no service is present (nothing to dispatch).
+ */
+function upsertNmi(c: AgentControllers): void {
+  const steps = scrollStepsFromSource(c.asm.getSource());
+  if (steps.length === 0) return;
+  upsertGlue(c, 'nmi', nmiGlue(steps));
 }
 
 /**
@@ -866,9 +890,56 @@ const DEFS: ToolDef[] = [
         c.asm.addDataFile(dn.v, bytes);
         // Idempotent: replaces any previous oam glue block (no duplicate `oam_load` label).
         upsertGlue(c, 'oam', c.gfx.oamGlue(dn.v, size));
+        // Re-derive the shared NMI dispatcher: the sprite tick (spr_move) is now
+        // present, so fold it into the single nmi_move handler alongside the
+        // scroll tick (if a scrolling background was set). Order-independent.
+        upsertNmi(c);
         return ok({ bytes: bytes.length, dataFile: dn.v, glueAppended: true, size });
       }
       return ok({ bytes: bytes.length, glue: c.gfx.oamGlue(undefined, size), size });
+    },
+  },
+  {
+    name: 'gfx_set_scroll',
+    description:
+      'Make the BG0 background SCROLL: each frame it slides by (dx, dy) pixels, wrapping at 256. ' +
+      'Positive dx = right, negative = left; positive dy = down, negative = up. A scrolling background ' +
+      'is a COMPLETE, shippable deliverable (no sprite required). This registers the per-frame scroll ' +
+      'service and re-arms the SHARED once-per-vblank NMI — so a scrolling background and a d-pad sprite ' +
+      'MOVE TOGETHER in one NMI (a ROM has only one NMI vector). The generated glue emits `bg_scroll_init` ' +
+      '(park at origin + arm NMI) and `bg_scroll` (the per-frame tick). In your reset program call ' +
+      '`JSR bg_scroll_init` ONCE (after `JSR vram_load`) and then `idle: bra idle` — the background ' +
+      'scrolls itself each frame. It uses the separate $210D/$210E offset registers (written absolute, ' +
+      'never read), so it does not disturb the bring-up SCBase. dx/dy are integers, typically 1–4 ' +
+      '(pixels per frame); 0 for an axis = no motion on that axis.',
+    parameters: {
+      type: 'object',
+      properties: {
+        dx: { type: 'integer', minimum: -128, maximum: 127, description: 'Horizontal pixels/frame. + = right, - = left. 0 = no horizontal scroll.' },
+        dy: { type: 'integer', minimum: -128, maximum: 127, description: 'Vertical pixels/frame. + = down, - = up. 0 = no vertical scroll.' },
+      },
+      required: ['dx', 'dy'],
+    },
+    run: (a, c) => {
+      const dx = intF(a, 'dx', -128, 127);
+      if (dx.e) return fail(dx.e);
+      const dy = intF(a, 'dy', -128, 127);
+      if (dy.e) return fail(dy.e);
+      c.gfx.setScroll(dx.v!, dy.v!);
+      // Land the scroll service (bg_scroll_init + bg_scroll), then recompute the
+      // shared NMI dispatcher so it covers scroll + (if present) the sprite tick.
+      upsertGlue(c, 'scroll', bgScrollGlue({ dx: dx.v!, dy: dy.v! }));
+      upsertNmi(c);
+      const steps = scrollStepsFromSource(c.asm.getSource());
+      return ok({
+        dx: dx.v,
+        dy: dy.v,
+        nmi: steps,
+        note:
+          'Scroll armed. In your reset program call `JSR bg_scroll_init` once (after `JSR vram_load`) ' +
+          'and then `idle: bra idle` — the background scrolls itself each frame. NMI now dispatches: ' +
+          steps.join(' → ') + '.',
+      });
     },
   },
 

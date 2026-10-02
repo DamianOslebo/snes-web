@@ -98,7 +98,8 @@ function mockControllers() {
       b.fill(0xab);
       return b;
     },
-    oamGlue: (n, size) => `; oam glue for ${n ?? 'oam.bin'} (${size ?? '16x16'})`,
+    oamGlue: (n, size) =>
+      `; oam glue for ${n ?? 'oam.bin'} (${size ?? '16x16'})\noam_load:\n  rts\nspr_init:\n  rts\nspr_move:\n  rts`,
     buildVram: () => new Uint8Array([0, 1, 2, 3]),
     buildVramCompact: () => ({
       blob: blobs.vram,
@@ -108,6 +109,13 @@ function mockControllers() {
     }),
     vramGlue: (n) => `; vram glue for ${n ?? 'vram.bin'}`,
     vramGlueLz: (n) => `; vram glue lz for ${n ?? 'vram.bin'}`,
+    setScroll: (dx, dy) => {
+      call('setScroll', [dx, dy]);
+    },
+    getScroll: () => {
+      call('getScroll', []);
+      return null;
+    },
   };
 
   const track: TrackController = {
@@ -202,8 +210,8 @@ describe('base64ToBytes', () => {
 // --- catalog shape -----------------------------------------------------------
 
 describe('TOOL_SPECS', () => {
-  it('has the 35 well-formed function specs', () => {
-    expect(TOOL_SPECS).toHaveLength(35);
+  it('has the 36 well-formed function specs', () => {
+    expect(TOOL_SPECS).toHaveLength(36);
     for (const s of TOOL_SPECS) {
       expect(s.type).toBe('function');
       expect(s.function.name).toMatch(/^(asm|gfx|trk|emu)_[a-z_]+$/);
@@ -220,7 +228,7 @@ describe('TOOL_SPECS', () => {
       'gfx_get_state', 'gfx_set_palette_color', 'gfx_set_tile_pixel', 'gfx_fill_rect',
       'gfx_add_tile', 'gfx_set_map_entry', 'gfx_fill_map', 'gfx_set_map_grid',
       'gfx_set_alt_map_entry', 'gfx_fill_alt_map', 'gfx_set_alt_map_grid',
-      'gfx_set_oam_entry', 'gfx_clear_oam', 'gfx_export_vram', 'gfx_export_oam',
+      'gfx_set_oam_entry', 'gfx_clear_oam', 'gfx_export_vram', 'gfx_export_oam', 'gfx_set_scroll',
       'trk_get_song', 'trk_set_cell', 'trk_set_pattern', 'trk_set_tempo', 'trk_set_orders',
       'trk_add_pattern', 'trk_add_instrument', 'trk_preview', 'trk_stop', 'trk_export_spc',
       'emu_probe',
@@ -239,7 +247,7 @@ describe('dispatch contract', () => {
     expect(r.ok).toBe(false);
     const body = JSON.parse(r.content) as { error: string; tools: string[] };
     expect(body.error).toContain('unknown tool');
-    expect(body.tools).toHaveLength(35);
+    expect(body.tools).toHaveLength(36);
     // The sprite (OAM) toolchain is present in the catalog.
     for (const t of ['gfx_set_oam_entry', 'gfx_clear_oam', 'gfx_export_oam']) {
       expect(body.tools).toContain(t);
@@ -594,6 +602,58 @@ describe('gfx tools', () => {
     expect(m.sources.src).not.toContain('oam glue for oam.bin (8x8)');
     expect(m.sources.src.match(/GFX_OAM_GLUE \(generated\)/g)!.length).toBe(1);
     expect(dispatch(m, 'gfx_export_oam', { destName: 5 }).ok).toBe(false);
+  });
+
+  it('gfx_set_scroll lands the scroll service + arms the shared NMI; idempotent on re-export', () => {
+    const m = mockControllers();
+    const r = dispatch(m, 'gfx_set_scroll', { dx: 2, dy: 1 });
+    expect(r.ok).toBe(true);
+    // The controller recorded the per-frame delta.
+    expect(m.rec.some((c) => c.fn === 'setScroll' && c.args[0] === 2 && c.args[1] === 1)).toBe(true);
+    // The scroll service (bg_scroll_init + bg_scroll) was appended under its marker.
+    expect(m.sources.src).toContain('GFX_SCROLL_GLUE');
+    expect(m.sources.src).toMatch(/bg_scroll_init:/);
+    expect(m.sources.src).toMatch(/bg_scroll:/);
+    // And the SHARED NMI handler now dispatches the scroll tick.
+    expect(m.sources.src).toContain('NMI_DISPATCHER_GLUE');
+    const body = JSON.parse(r.content) as Record<string, unknown>;
+    expect(body).toMatchObject({ dx: 2, dy: 1, nmi: ['bg_scroll'] });
+
+    // Re-export with the same delta is idempotent: the blocks are replaced, not duplicated.
+    const before = m.sources.src;
+    dispatch(m, 'gfx_set_scroll', { dx: 2, dy: 1 });
+    expect(m.sources.src).toBe(before);
+    expect(m.sources.src.match(/GFX_SCROLL_GLUE \(generated\)/g)!.length).toBe(1);
+    expect(m.sources.src.match(/nmi_move:/g)!.length).toBe(1);
+
+    // Changing the delta rewrites the block in place (still one block).
+    dispatch(m, 'gfx_set_scroll', { dx: -3, dy: 2 });
+    expect(m.sources.src.match(/GFX_SCROLL_GLUE \(generated\)/g)!.length).toBe(1);
+    expect(m.sources.src).toMatch(/sbc #\$03/); // dx=-3 → H decrements (true immediate)
+  });
+
+  it('gfx_set_scroll validates dx/dy (integers, -128..127, both required)', () => {
+    const m = mockControllers();
+    expect(dispatch(m, 'gfx_set_scroll', { dx: 'x', dy: 1 }).ok).toBe(false); // not an integer
+    expect(dispatch(m, 'gfx_set_scroll', { dx: 2, dy: 1.5 }).ok).toBe(false); // not an integer
+    expect(dispatch(m, 'gfx_set_scroll', { dx: 500, dy: 1 }).ok).toBe(false); // out of range
+    expect(dispatch(m, 'gfx_set_scroll', { dx: 2 }).ok).toBe(false); // dy missing
+  });
+
+  it('a scrolling background and a d-pad sprite share ONE NMI handler (both ticks dispatched)', () => {
+    const m = mockControllers();
+    // Sprite first: the NMI handler dispatches only spr_move.
+    dispatch(m, 'gfx_export_oam', { destName: 'oam.bin', size: '16x16' });
+    let handler = m.sources.src.slice(m.sources.src.indexOf('nmi_move:'));
+    expect(handler).toMatch(/jsr spr_move/);
+    expect(handler).not.toMatch(/jsr bg_scroll/);
+
+    // Then the scroll: the SAME handler now dispatches BOTH, in order — no
+    // second handler (a ROM has exactly one NMI vector).
+    dispatch(m, 'gfx_set_scroll', { dx: 2, dy: 1 });
+    handler = m.sources.src.slice(m.sources.src.indexOf('nmi_move:'));
+    expect(handler).toMatch(/nmi_move:\s*jsr bg_scroll\s*\n\s*jsr spr_move\s*\n\s*rti/);
+    expect(m.sources.src.match(/nmi_move:/g)!.length).toBe(1);
   });
 });
 

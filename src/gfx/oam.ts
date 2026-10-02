@@ -233,13 +233,14 @@ oam_d:
 ; --- d-pad sprite service (generated) ----------------------------------------
 ; The MOVABLE sprite is OAM slot 0. The program calls (after oam_load):
 ;   JSR spr_init   once — it parks the sprite at the screen centre AND arms
-;                  the movement tick: the NMI handler nmi_move runs once per
-;                  frame, at vblank, doing one spr_move for you.
-; The NMI vector itself is BAKED into the ROM by the build (rom.ts) pointing
-; at nmi_move — at CPU $FFEA/$FFEB on this snes9x fork ($FFFE/$FFFF on a real
-; SNES) — so spr_init only parks the sprite and arms NMITIMEN; it does NOT
-; write the vector (the ROM region is read-only, and $FFFE is the WRONG slot
-; on this fork anyway).
+;                  the movement tick: the NMI handler runs once per frame, at
+;                  vblank, doing one spr_move for you.
+; The NMI handler itself (nmi_move) lives in the SHARED NMI-dispatcher glue
+; block (emitted by the export tools alongside this one) — a ROM has exactly
+; ONE NMI vector, so the scroll tick and the sprite tick share that one
+; handler. The build (rom.ts) bakes the NMI vector at nmi_move; spr_init only
+; parks the sprite and arms NMITIMEN, it does NOT write the vector (the ROM
+; region is read-only).
 ; After that the program just idles:   idle: bra idle
 ; (Never call spr_move from a tight loop — the CPU runs thousands of times
 ;  per frame, so the tick must be paced by the once-per-vblank NMI.)
@@ -252,9 +253,6 @@ spr_init:
   lda #$80                   ; NMITIMEN bit7: fire the NMI once per vblank
   sta $4200                  ; (the vector -> nmi_move is baked by the build)
   rts
-nmi_move:
-  jsr spr_move               ; one d-pad tick per frame (UP/DOWN/LEFT/RIGHT,
-  rti                        ; 2px per held direction, diagonals included)
 spr_move:
   lda #0
   sta $2102                  ; OAMADDR -> slot 0 (oam_load left it after 128

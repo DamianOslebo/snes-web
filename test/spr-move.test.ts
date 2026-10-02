@@ -40,6 +40,7 @@ import { buildVramCompact, vramGlue } from '../src/gfx/vram';
 import type { Rgb15 } from '../src/gfx/palette';
 import type { TilemapEntry } from '../src/gfx/tilemap';
 import { OAM_ENTRIES, encodeOam, oamGlue, type OamEntry } from '../src/gfx/oam';
+import { nmiGlue, scrollStepsFromSource } from '../src/gfx/scroll';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '..');
@@ -88,7 +89,14 @@ function moveRom(): Uint8Array {
     vramGlue(compact.mapBase, compact.bgmode, compact.blocks, 'vram.bin', compact.altMapBase) +
     '\n' +
     oamGlue('oam.bin', '16x16');
-  const r = assemble(program + '\n' + glue, 0x008000, { 'vram.bin': compact.blob, 'oam.bin': oam });
+  // The NMI handler (nmi_move) is the SHARED dispatcher the build bakes the NMI
+  // vector at. In the real agent flow it is its own generated block (nmiGlue),
+  // re-derived from the once-per-frame services present in the source — a
+  // sprite-only ROM dispatches exactly spr_move. oamGlue no longer carries
+  // nmi_move (it is the shared block), so this ROM must add it to match what
+  // the agent actually ships.
+  const nmi = nmiGlue(scrollStepsFromSource(glue));
+  const r = assemble(program + '\n' + glue + (nmi ? '\n' + nmi : ''), 0x008000, { 'vram.bin': compact.blob, 'oam.bin': oam });
   if (!r.ok) throw new Error('assemble failed: ' + r.errors.map((e) => `${e.line}: ${e.message}`).join('; '));
   return buildRomFromResult(r, { title: 'SPRMOVE' });
 }

@@ -230,7 +230,11 @@ describe('oamGlue — the d-pad sprite service (spr_init / spr_move)', () => {
     expect(g).not.toMatch(/sta \$fffe/i); // no runtime vector write (write-protected ROM)
     expect(g).not.toMatch(/sta \$ffff/i);
     expect(g).toMatch(/lda #\$80[\s\S]*?sta \$4200/); // NMITIMEN bit7: NMI at vblank
-    expect(g).toMatch(/nmi_move:[\s\S]*?jsr spr_move[\s\S]*?rti/); // handler = one tick + rti (the build's vector target)
+    // The NMI HANDLER itself (nmi_move) no longer lives in oamGlue: a ROM has
+    // ONE NMI vector and it may dispatch BOTH a scroll tick and a sprite tick,
+    // so the handler is emitted by the SHARED NMI-dispatcher glue (nmiGlue in
+    // src/gfx/scroll.ts) — asserted in test/scroll.test.ts, not here.
+    expect(g).not.toMatch(/nmi_move:/); // oamGlue no longer owns the handler
     expect(g).not.toMatch(/bra\s+mv\b/i); // no "call spr_move in a tight loop" recipe remains
   });
 

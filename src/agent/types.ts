@@ -189,6 +189,21 @@ export interface GfxController {
    */
   oamGlue(dataName?: string, size?: OamSize): string;
 
+  // --- scroll (per-frame BG0 scroll-offset service) --------------------------
+  //
+  // A SCROLLING background is driven by the SNES scroll-offset registers
+  // ($210D HOffset, $210E VOffset), written fresh every frame by the NMI.
+  // `setScroll` stores the per-frame delta the agent wants; `getScroll` reads
+  // it back. The generated glue (`src/gfx/scroll.ts`) parks the scroll at the
+  // origin, arms the once-per-vblank NMI, and slides the background by
+  // (dx, dy) pixels each frame (8-bit wrap). The program calls
+  // `JSR bg_scroll_init` once (after `vram_load`) and then idles.
+
+  /** Set the per-frame BG0 scroll delta. dx = px/frame right(+) / left(-); dy = down(+) / up(-). 0 = none on that axis. */
+  setScroll(dx: number, dy: number): void;
+  /** The current per-frame scroll delta, or null if none has been set. */
+  getScroll(): { dx: number; dy: number } | null;
+
   /** Compile the editor to a 64 KB VRAM image. */
   buildVram(): Uint8Array;
   /**

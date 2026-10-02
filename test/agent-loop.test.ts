@@ -53,6 +53,8 @@ function miniControllers() {
     buildVramCompact: () => ({ blob: new Uint8Array(4), blocks: [{ dest: 0, len: 2 }], mapBase: 0x1000, bgmode: 0 }),
     vramGlue: () => ';vram glue',
     vramGlueLz: () => ';vram glue lz',
+    setScroll: () => {},
+    getScroll: () => null,
   };
   const track: TrackController = {
     getSong: () => '{"v":1,"name":"S","tempo":8,"orders":[0],"patterns":[],"instruments":[]}',

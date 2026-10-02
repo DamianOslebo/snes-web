@@ -1521,6 +1521,29 @@ function clamp5(v: number): number {
  * `buildVram()` compiles the current tiles + palette + map — the bytes the
  * agent feeds to `asm_add_data_file("vram.bin")`.
  */
+// --- per-frame BG0 scroll setting ------------------------------------------
+// The agent's `gfx_set_scroll` stores the per-frame delta here. It is kept
+// OUT of the versioned artwork store (`GfxStore`) on purpose: scroll is a
+// runtime-service choice, and the generated glue (bg_scroll/bg_scroll_init) is
+// produced in `tools.ts` from this value — so the controller only holds the
+// delta for read-back (getScroll) and reload persistence. Guarded so a
+// storage-blocked context (private window) still works from memory.
+const GFX_SCROLL_KEY = 'snes-web:gfx-scroll:v1';
+let gfxScroll: { dx: number; dy: number } | null = null;
+function loadGfxScroll(): void {
+  if (gfxScroll !== null) return;
+  try {
+    const raw = localStorage.getItem(GFX_SCROLL_KEY);
+    if (!raw) return;
+    const v = JSON.parse(raw) as { dx?: unknown; dy?: unknown };
+    if (typeof v.dx === 'number' && typeof v.dy === 'number') {
+      gfxScroll = { dx: v.dx, dy: v.dy };
+    }
+  } catch {
+    gfxScroll = null;
+  }
+}
+
 export function makeGfxController(): GfxController {
   /** Grow `ed.tiles` to reach `tile` (page cap: 256). */
   function ensureTile(tile: number): number[][] | null {
@@ -1733,6 +1756,20 @@ export function makeGfxController(): GfxController {
 
     oamGlue(dataName, size) {
       return oamGlue(dataName, size);
+    },
+
+    setScroll(dx, dy) {
+      gfxScroll = { dx: Math.round(dx), dy: Math.round(dy) };
+      try {
+        localStorage.setItem(GFX_SCROLL_KEY, JSON.stringify(gfxScroll));
+      } catch {
+        /* storage blocked — the in-memory value is still valid for this run */
+      }
+    },
+
+    getScroll() {
+      loadGfxScroll();
+      return gfxScroll ? { dx: gfxScroll.dx, dy: gfxScroll.dy } : null;
     },
 
     buildVram() {
