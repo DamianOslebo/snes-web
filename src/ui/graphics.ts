@@ -1544,6 +1544,102 @@ function loadGfxScroll(): void {
   }
 }
 
+// --- per-frame sprite char-swap setting -------------------------------------
+// The agent's `gfx_sprite_anim` stores the char-cycling config here (kept OUT
+// of the versioned artwork store, like scroll — it is a runtime-service choice,
+// and the generated glue (anim_init/anim_tick) is produced in `tools.ts` from
+// this value). `set*` writes it, `get*` reads it back for persistence.
+interface SpriteAnimState {
+  tiles: number[];
+  slot?: number;
+  skip?: number;
+  priority?: number;
+  flipH?: boolean;
+  flipV?: boolean;
+}
+const GFX_SPRITE_ANIM_KEY = 'snes-web:gfx-sprite-anim:v1';
+let gfxSpriteAnim: SpriteAnimState | null = null;
+function loadGfxSpriteAnim(): void {
+  if (gfxSpriteAnim !== null) return;
+  try {
+    const raw = localStorage.getItem(GFX_SPRITE_ANIM_KEY);
+    if (!raw) return;
+    const v = JSON.parse(raw) as Partial<SpriteAnimState>;
+    if (Array.isArray(v.tiles) && v.tiles.length >= 2 && v.tiles.every((t) => Number.isInteger(t))) {
+      gfxSpriteAnim = {
+        tiles: v.tiles.map((t) => t as number),
+        slot: typeof v.slot === 'number' ? v.slot : undefined,
+        skip: typeof v.skip === 'number' ? v.skip : undefined,
+        priority: typeof v.priority === 'number' ? v.priority : undefined,
+        flipH: typeof v.flipH === 'boolean' ? v.flipH : undefined,
+        flipV: typeof v.flipV === 'boolean' ? v.flipV : undefined,
+      };
+    }
+  } catch {
+    gfxSpriteAnim = null;
+  }
+}
+
+// --- per-frame Mode 7 (BG1 affine) background setting ----------------------
+// The agent's `gfx_bg_mode7` stores the zoom/rotate config here (kept OUT of
+// the versioned artwork store, like scroll/sprite-anim — it is a runtime-service
+// choice, and the generated glue (mode7_init/mode7_tick + the field blob) is
+// produced in `tools.ts` from this value). `set*` writes it, `get*` reads it
+// back for persistence.
+interface Mode7State {
+  kind: 'zoom' | 'rotate';
+  dir: 'in' | 'out' | 'cw' | 'ccw';
+  speed?: number;
+}
+const GFX_MODE7_KEY = 'snes-web:gfx-mode7:v1';
+let gfxMode7: Mode7State | null = null;
+function loadGfxMode7(): void {
+  if (gfxMode7 !== null) return;
+  try {
+    const raw = localStorage.getItem(GFX_MODE7_KEY);
+    if (!raw) return;
+    const v = JSON.parse(raw) as Partial<Mode7State>;
+    const kind = v.kind === 'zoom' || v.kind === 'rotate' ? v.kind : null;
+    const dir = v.dir === 'in' || v.dir === 'out' || v.dir === 'cw' || v.dir === 'ccw' ? v.dir : null;
+    if (kind && dir) {
+      gfxMode7 = { kind, dir, speed: typeof v.speed === 'number' ? v.speed : undefined };
+    }
+  } catch {
+    gfxMode7 = null;
+  }
+}
+
+// --- per-frame BG tile water/fire colour animation setting -----------------
+// The agent's `gfx_bg_tile_anim` stores the shimmer config here (kept OUT of
+// the versioned artwork store, like scroll/sprite-anim/mode7 — it is a
+// runtime-service choice, and the generated glue (bgtile_init/bgtile_tick +
+// the colour tables) is produced in `tools.ts` from this value). `set*` writes
+// it, `get*` reads it back for persistence.
+interface BgTileState {
+  frames: number[];
+  cgramSlot?: number;
+  speed?: number;
+}
+const GFX_BGTILE_KEY = 'snes-web:gfx-bgtile:v1';
+let gfxBgTileAnim: BgTileState | null = null;
+function loadGfxBgTileAnim(): void {
+  if (gfxBgTileAnim !== null) return;
+  try {
+    const raw = localStorage.getItem(GFX_BGTILE_KEY);
+    if (!raw) return;
+    const v = JSON.parse(raw) as Partial<BgTileState>;
+    if (Array.isArray(v.frames) && v.frames.length >= 2) {
+      gfxBgTileAnim = {
+        frames: v.frames.filter((f) => Number.isInteger(f) && f >= 0 && f <= 0x7fff),
+        cgramSlot: typeof v.cgramSlot === 'number' ? v.cgramSlot : undefined,
+        speed: typeof v.speed === 'number' ? v.speed : undefined,
+      };
+    }
+  } catch {
+    gfxBgTileAnim = null;
+  }
+}
+
 export function makeGfxController(): GfxController {
   /** Grow `ed.tiles` to reach `tile` (page cap: 256). */
   function ensureTile(tile: number): number[][] | null {
@@ -1770,6 +1866,73 @@ export function makeGfxController(): GfxController {
     getScroll() {
       loadGfxScroll();
       return gfxScroll ? { dx: gfxScroll.dx, dy: gfxScroll.dy } : null;
+    },
+
+    setSpriteAnim(cfg) {
+      gfxSpriteAnim = {
+        tiles: cfg.tiles.map((t) => Math.round(t) & 0x1ff),
+        slot: cfg.slot,
+        skip: cfg.skip,
+        priority: cfg.priority,
+        flipH: cfg.flipH,
+        flipV: cfg.flipV,
+      };
+      try {
+        localStorage.setItem(GFX_SPRITE_ANIM_KEY, JSON.stringify(gfxSpriteAnim));
+      } catch {
+        /* storage blocked — the in-memory value is still valid for this run */
+      }
+    },
+
+    getSpriteAnim() {
+      loadGfxSpriteAnim();
+      return gfxSpriteAnim
+        ? {
+            tiles: gfxSpriteAnim.tiles.slice(),
+            slot: gfxSpriteAnim.slot,
+            skip: gfxSpriteAnim.skip,
+            priority: gfxSpriteAnim.priority,
+            flipH: gfxSpriteAnim.flipH,
+            flipV: gfxSpriteAnim.flipV,
+          }
+        : null;
+    },
+
+    setMode7(cfg) {
+      const kind = cfg.kind === 'zoom' || cfg.kind === 'rotate' ? cfg.kind : 'zoom';
+      const dir = cfg.dir === 'in' || cfg.dir === 'out' || cfg.dir === 'cw' || cfg.dir === 'ccw' ? cfg.dir : 'in';
+      gfxMode7 = { kind, dir, speed: typeof cfg.speed === 'number' && cfg.speed > 0 ? Math.round(cfg.speed) : undefined };
+      try {
+        localStorage.setItem(GFX_MODE7_KEY, JSON.stringify(gfxMode7));
+      } catch {
+        /* storage blocked — the in-memory value is still valid for this run */
+      }
+    },
+
+    getMode7() {
+      loadGfxMode7();
+      return gfxMode7 ? { kind: gfxMode7.kind, dir: gfxMode7.dir, speed: gfxMode7.speed } : null;
+    },
+
+    setBgTileAnim(cfg) {
+      const frames = (Array.isArray(cfg.frames) ? cfg.frames : []).filter(
+        (f) => Number.isInteger(f) && f >= 0 && f <= 0x7fff,
+      );
+      gfxBgTileAnim = {
+        frames,
+        cgramSlot: typeof cfg.cgramSlot === 'number' && Number.isInteger(cfg.cgramSlot) && cfg.cgramSlot >= 1 && cfg.cgramSlot <= 31 ? cfg.cgramSlot : undefined,
+        speed: typeof cfg.speed === 'number' && cfg.speed > 0 ? Math.round(cfg.speed) : undefined,
+      };
+      try {
+        localStorage.setItem(GFX_BGTILE_KEY, JSON.stringify(gfxBgTileAnim));
+      } catch {
+        /* storage blocked — the in-memory value is still valid for this run */
+      }
+    },
+
+    getBgTileAnim() {
+      loadGfxBgTileAnim();
+      return gfxBgTileAnim ? { frames: gfxBgTileAnim.frames.slice(), cgramSlot: gfxBgTileAnim.cgramSlot, speed: gfxBgTileAnim.speed } : null;
     },
 
     buildVram() {

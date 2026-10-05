@@ -73,6 +73,13 @@ function mockControllers() {
       files.delete(n);
       call('removeDataFile', [n]);
     },
+    setHighBank: (b) => {
+      call('setHighBank', [b ? b.length : null]);
+    },
+    getHighBank: () => {
+      call('getHighBank', []);
+      return null;
+    },
     assemble: () => results.assemble,
     buildRom: () => results.buildRom,
     buildRomBytes: () => results.buildRomBytes,
@@ -114,6 +121,27 @@ function mockControllers() {
     },
     getScroll: () => {
       call('getScroll', []);
+      return null;
+    },
+    setSpriteAnim: (cfg) => {
+      call('setSpriteAnim', [cfg]);
+    },
+    getSpriteAnim: () => {
+      call('getSpriteAnim', []);
+      return null;
+    },
+    setMode7: (cfg) => {
+      call('setMode7', [cfg]);
+    },
+    getMode7: () => {
+      call('getMode7', []);
+      return null;
+    },
+    setBgTileAnim: (cfg) => {
+      call('setBgTileAnim', [cfg]);
+    },
+    getBgTileAnim: () => {
+      call('getBgTileAnim', []);
       return null;
     },
   };
@@ -210,11 +238,11 @@ describe('base64ToBytes', () => {
 // --- catalog shape -----------------------------------------------------------
 
 describe('TOOL_SPECS', () => {
-  it('has the 36 well-formed function specs', () => {
-    expect(TOOL_SPECS).toHaveLength(36);
+  it('has the 39 well-formed function specs', () => {
+    expect(TOOL_SPECS).toHaveLength(39);
     for (const s of TOOL_SPECS) {
       expect(s.type).toBe('function');
-      expect(s.function.name).toMatch(/^(asm|gfx|trk|emu)_[a-z_]+$/);
+      expect(s.function.name).toMatch(/^(asm|gfx|trk|emu)_[a-z0-9_]+$/);
       expect(s.function.description.length).toBeGreaterThan(10);
       expect(s.function.parameters).toMatchObject({ type: 'object' });
     }
@@ -229,6 +257,7 @@ describe('TOOL_SPECS', () => {
       'gfx_add_tile', 'gfx_set_map_entry', 'gfx_fill_map', 'gfx_set_map_grid',
       'gfx_set_alt_map_entry', 'gfx_fill_alt_map', 'gfx_set_alt_map_grid',
       'gfx_set_oam_entry', 'gfx_clear_oam', 'gfx_export_vram', 'gfx_export_oam', 'gfx_set_scroll',
+      'gfx_sprite_anim', 'gfx_bg_mode7', 'gfx_bg_tile_anim',
       'trk_get_song', 'trk_set_cell', 'trk_set_pattern', 'trk_set_tempo', 'trk_set_orders',
       'trk_add_pattern', 'trk_add_instrument', 'trk_preview', 'trk_stop', 'trk_export_spc',
       'emu_probe',
@@ -247,9 +276,13 @@ describe('dispatch contract', () => {
     expect(r.ok).toBe(false);
     const body = JSON.parse(r.content) as { error: string; tools: string[] };
     expect(body.error).toContain('unknown tool');
-    expect(body.tools).toHaveLength(36);
+    expect(body.tools).toHaveLength(39);
     // The sprite (OAM) toolchain is present in the catalog.
     for (const t of ['gfx_set_oam_entry', 'gfx_clear_oam', 'gfx_export_oam']) {
+      expect(body.tools).toContain(t);
+    }
+    // The per-frame animation toolchain (char-swap, Mode 7, water/fire) is present.
+    for (const t of ['gfx_sprite_anim', 'gfx_bg_mode7', 'gfx_bg_tile_anim']) {
       expect(body.tools).toContain(t);
     }
   });

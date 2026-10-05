@@ -1,7 +1,7 @@
 /**
  * `tools` — the agent's tool catalog and dispatcher.
  *
- * The 36 `asm_*` / `gfx_*` / `trk_*` tools are the model's only way to touch
+ * The 37 `asm_*` / `gfx_*` / `trk_*` tools are the model's only way to touch
  * the three pages: each maps to one or two `AgentControllers` methods. Three
  * of them are cross-page bridges — `gfx_export_vram`, `gfx_export_oam`, and `trk_export_spc` build
  * a binary on one page and register it on the asm page as an `.incbin` data
@@ -21,6 +21,9 @@
 
 import { NOTE_MAX, NOTE_MIN, parseNoteName } from '../track/model';
 import type { OamSize } from '../gfx/oam';
+import { spriteAnimGlue } from '../gfx/anim';
+import { mode7FieldBytes, mode7Glue, type Mode7Config } from '../gfx/mode7';
+import { bgTileAnimGlue, type BgTileAnimConfig } from '../gfx/bgtile';
 import { bgScrollGlue, nmiGlue, scrollStepsFromSource } from '../gfx/scroll';
 import { LZ_GLUE_EXTRA, LZ_ROUTINE_BYTES, lzssCompress, lzssGlue } from '../asm/lzss';
 import type { AgentControllers, ToolResult, ToolSpec } from './types';
@@ -51,12 +54,18 @@ export const MAX_MANUAL_DATA_BYTES = 64 * 1024;
 // (e.g. after painting more tiles) REPLACES the old block instead of duplicating
 // it — a duplicate `vram_load:` label would otherwise fail assembly. Markers are
 // `;`-prefixed, so the assembler treats them as plain comments.
-const GLUE_MARKERS: Record<'gfx' | 'spc' | 'oam' | 'lz' | 'scroll' | 'nmi', { start: string; end: string }> = {
+const GLUE_MARKERS: Record<'gfx' | 'spc' | 'oam' | 'lz' | 'scroll' | 'anim' | 'mode7' | 'bgtile' | 'nmi', { start: string; end: string }> = {
   gfx: { start: ';=== GFX_VRAM_GLUE (generated) ===', end: ';=== /GFX_VRAM_GLUE ===' },
   spc: { start: ';=== SPC_GLUE (generated; EXPERIMENTAL) ===', end: ';=== /SPC_GLUE ===' },
   oam: { start: ';=== GFX_OAM_GLUE (generated) ===', end: ';=== /GFX_OAM_GLUE ===' },
   // The BG0 scroll service (bg_scroll_init + bg_scroll) — added by gfx_set_scroll.
   scroll: { start: ';=== GFX_SCROLL_GLUE (generated) ===', end: ';=== /GFX_SCROLL_GLUE ===' },
+  // The sprite char-swap service (anim_init + anim_tick) — added by gfx_sprite_anim.
+  anim: { start: ';=== GFX_SPRITE_ANIM_GLUE (generated) ===', end: ';=== /GFX_SPRITE_ANIM_GLUE ===' },
+  // The Mode 7 (BG1 affine) background service (mode7_init + mode7_tick) — added by gfx_bg_mode7.
+  mode7: { start: ';=== GFX_MODE7_GLUE (generated) ===', end: ';=== /GFX_MODE7_GLUE ===' },
+  // The BG tile water/fire colour service (bgtile_init + bgtile_tick) — added by gfx_bg_tile_anim.
+  bgtile: { start: ';=== GFX_BGTILE_GLUE (generated) ===', end: ';=== /GFX_BGTILE_GLUE ===' },
   // THE single NMI handler (nmi_move). A ROM has one NMI vector, so every
   // once-per-frame service (scroll + sprite tick) dispatches from this ONE
   // block; it is recomputed from the source after each export that adds a
@@ -82,7 +91,7 @@ const GLUE_MARKERS: Record<'gfx' | 'spc' | 'oam' | 'lz' | 'scroll' | 'nmi', { st
  * (and, worse, emit a second `lz_decode`), so a self-delimited block is used
  * verbatim.
  */
-function upsertGlue(c: AgentControllers, kind: 'gfx' | 'spc' | 'oam' | 'lz' | 'scroll' | 'nmi', block: string): void {
+function upsertGlue(c: AgentControllers, kind: 'gfx' | 'spc' | 'oam' | 'lz' | 'scroll' | 'anim' | 'mode7' | 'bgtile' | 'nmi', block: string): void {
   const { start, end } = GLUE_MARKERS[kind];
   const selfDelimited = block.startsWith(start) && block.trimEnd().endsWith(end);
   const body = selfDelimited ? block : `${start}\n${block}\n${end}`;
@@ -253,6 +262,24 @@ function optBoolF(a: Args, key: string): Field<boolean> {
   const v = a[key];
   if (typeof v !== 'boolean') return { e: `"${key}" must be true or false` };
   return { v };
+}
+
+/**
+ * A non-empty list of integers, each in [min, max]. Used for sprite char
+ * sequences (`frames`). Returns the cleaned list in `v`, or an error in `e`.
+ */
+function intListF(a: Args, key: string, min: number, max: number, minLen: number, maxLen: number): Field<number[]> {
+  const v = a[key];
+  if (!Array.isArray(v) || v.length === 0) return { e: `"${key}" must be a non-empty array` };
+  if (v.length < minLen || v.length > maxLen) return { e: `"${key}" must have ${minLen}–${maxLen} entries (got ${v.length})` };
+  const out: number[] = [];
+  for (const x of v) {
+    if (typeof x !== 'number' || !Number.isInteger(x) || x < min || x > max) {
+      return { e: `each entry of "${key}" must be an integer ${min}–${max}` };
+    }
+    out.push(x);
+  }
+  return { v: out };
 }
 
 /** A note: number 0–119 (24 = C, 81 = A4), a name ("A4", "C#5"), or a rest. */
@@ -939,6 +966,201 @@ const DEFS: ToolDef[] = [
           'Scroll armed. In your reset program call `JSR bg_scroll_init` once (after `JSR vram_load`) ' +
           'and then `idle: bra idle` — the background scrolls itself each frame. NMI now dispatches: ' +
           steps.join(' → ') + '.',
+      });
+    },
+  },
+  {
+    name: 'gfx_sprite_anim',
+    description:
+      'Make a sprite slot CYCLE a short sequence of char images — a WALK or a FLAP. Each frame the ' +
+      'sprite holds a char for `framesPerChar` frames, then steps to the next (wrapping), so the ' +
+      'picture changes over time on its own. This is the char-swap companion to a d-pad sprite: ' +
+      '`gfx_export_oam` places + moves the slot (OAM word0, position), and THIS changes its picture ' +
+      '(OAM word1, Name + attr) — the two write DIFFERENT OAM words, so a slot can move AND animate ' +
+      'at once, both dispatched from the one shared NMI. `frames` are the 8×8 char indices (0–511) to ' +
+      'cycle, in order, 2–8 of them (e.g. [a walk: char0, char1, char2, char3]). The sprite MUST use ' +
+      '8×8 sprites (`gfx_export_oam` `size:"8x8"`) for a clean char-swap — at 16×16 a char is a 2×2 ' +
+      'block, so swap in 4s. `slot` defaults to 0 (the same slot the d-pad moves). Register it and it ' +
+      'arms the shared NMI; in your reset program call `JSR vram_load`, then `JSR oam_load`, then ' +
+      '`JSR anim_init` ONCE, and then `idle: bra idle` — the sprite animates itself each frame. Never ' +
+      'call `JSR anim_tick` yourself (from a loop it would run thousands of times a frame).',
+    parameters: {
+      type: 'object',
+      properties: {
+        frames: { type: 'array', items: { type: 'integer', minimum: 0, maximum: 511 }, description: 'The 2–8 8×8 char indices (0–511) to cycle, in order' },
+        slot: { type: 'integer', minimum: 0, maximum: 127, description: 'OAM slot to animate (default 0 — the same slot the d-pad moves)' },
+        framesPerChar: { type: 'integer', minimum: 1, maximum: 60, description: 'Frames (NMI ticks) to hold each char; lower = faster (default 4)' },
+        priority: { type: 'integer', minimum: 0, maximum: 3, description: '0–3, constant across frames (default 0; 2-3 draw OVER the background)' },
+        flipH: { type: 'boolean', description: 'Mirror horizontally, constant across frames (default false)' },
+        flipV: { type: 'boolean', description: 'Mirror vertically, constant across frames (default false)' },
+      },
+      required: ['frames'],
+    },
+    run: (a, c) => {
+      const frames = intListF(a, 'frames', 0, 511, 2, 8);
+      if (frames.e) return fail(frames.e);
+      const slot = optIntF(a, 'slot', 0, 127);
+      if (slot.e) return fail(slot.e);
+      const fpc = optIntF(a, 'framesPerChar', 1, 60);
+      if (fpc.e) return fail(fpc.e);
+      const prio = optIntF(a, 'priority', 0, 3);
+      if (prio.e) return fail(prio.e);
+      const flipH = optBoolF(a, 'flipH');
+      if (flipH.e) return fail(flipH.e);
+      const flipV = optBoolF(a, 'flipV');
+      if (flipV.e) return fail(flipV.e);
+      const cfg = {
+        tiles: frames.v as number[],
+        slot: slot.v ?? 0,
+        skip: fpc.v ?? 4,
+        priority: prio.v ?? 0,
+        flipH: flipH.v ?? false,
+        flipV: flipV.v ?? false,
+      };
+      c.gfx.setSpriteAnim(cfg);
+      // Land the sprite-anim service (anim_init + anim_tick), then recompute the
+      // shared NMI dispatcher so it covers the char-swap tick alongside scroll
+      // and the d-pad sprite tick (whichever are present).
+      upsertGlue(c, 'anim', spriteAnimGlue(cfg));
+      upsertNmi(c);
+      const steps = scrollStepsFromSource(c.asm.getSource());
+      return ok({
+        slot: cfg.slot,
+        frames: cfg.tiles,
+        framesPerChar: cfg.skip,
+        nmi: steps,
+        note:
+          'Sprite char-swap armed. In your reset program call `JSR oam_load` then `JSR anim_init` once ' +
+          '(after `JSR vram_load`), and then `idle: bra idle` — the sprite cycles its chars each frame. ' +
+          'NMI now dispatches: ' + steps.join(' → ') + '.',
+      });
+    },
+  },
+  {
+    name: 'gfx_bg_mode7',
+    description:
+      'Make a MODE 7 (affine) BACKGROUND — a full-screen checkerboard field that ZOOMS or ROTATES every ' +
+      'frame. This is a DIFFERENT per-frame background than `gfx_set_scroll`: instead of sliding a tilemap, ' +
+      'it scales/spins a 128×128 field on BG1 (BGMODE 7) — the classic SNES starfield / zoom / spin. ' +
+      'kind:"zoom" + dir:"in" = the field GROWS each frame (zoom in); kind:"zoom" + dir:"out" = it SHRINKS; ' +
+      'kind:"rotate" + dir:"cw"|"ccw" = it SPINS (one full turn over `speed` frames). The field is a ' +
+      'high-contrast white-on-black checkerboard whose motion is unmistakable to the eye and to emu_probe. ' +
+      'It COMPOSES with a scrolling BG0 background, a d-pad sprite, and a sprite char-swap — all four ' +
+      'dispatch from the ONE shared NMI handler. Register it and it arms that NMI; in your reset program ' +
+      'call `JSR vram_load`, then `JSR mode7_init` ONCE, then `idle: bra idle` — the background animates ' +
+      'itself each frame. Never call `JSR mode7_tick` yourself (from a loop it would run thousands of times ' +
+      'a frame). NOTE: it takes a moment to come up (a 32 KB field is streamed from the ROM high bank ' +
+      'into VRAM), so emu_probe it after the first second or so, not immediately.',
+    parameters: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['zoom', 'rotate'], description: '"zoom" (scale in/out) or "rotate" (spin cw/ccw)' },
+        dir: { type: 'string', enum: ['in', 'out', 'cw', 'ccw'], description: 'zoom: "in" (grow) / "out" (shrink); rotate: "cw" / "ccw"' },
+        speed: { type: 'integer', minimum: 2, maximum: 64, description: 'Frames per full cycle (a zoom pass, or one 360° turn). 2–64, default 60 (lower = faster)' },
+      },
+      required: ['kind', 'dir'],
+    },
+    run: (a, c) => {
+      const kind = strF(a, 'kind');
+      if (kind.e || (kind.v !== 'zoom' && kind.v !== 'rotate'))
+        return fail('`kind` must be "zoom" or "rotate"');
+      const dir = strF(a, 'dir');
+      if (dir.e) return fail(dir.e);
+      const validDirs = kind.v === 'zoom' ? ['in', 'out'] : ['cw', 'ccw'];
+      if (!validDirs.includes(dir.v as string))
+        return fail(`for kind "${kind.v}", dir must be one of ${validDirs.join(' | ')}`);
+      const speed = optIntF(a, 'speed', 2, 64);
+      if (speed.e) return fail(speed.e);
+      const cfg: Mode7Config = {
+        kind: kind.v as 'zoom' | 'rotate',
+        dir: dir.v as 'in' | 'out' | 'cw' | 'ccw',
+        speed: speed.v,
+      };
+      c.gfx.setMode7(cfg);
+      // Land the Mode 7 service (mode7_init + mode7_tick) and place the 32 KB
+      // field in the ROM's HIGH BANK (file $8000, CPU bank $01) — it is too big
+      // for the low-bank entry region and for WRAM, so `mode7_init` streams it
+      // to VRAM with the 0xBF `lda $01:8000,X` sweep rather than decompressing
+      // it. Then recompute the shared NMI dispatcher so mode7_tick runs
+      // alongside whatever other per-frame services are present.
+      c.asm.setHighBank(mode7FieldBytes());
+      upsertGlue(c, 'mode7', mode7Glue(cfg));
+      upsertNmi(c);
+      const steps = scrollStepsFromSource(c.asm.getSource());
+      return ok({
+        kind: cfg.kind,
+        dir: cfg.dir,
+        speed: cfg.speed ?? 60,
+        fieldBytes: 32768,
+        nmi: steps,
+        note:
+          'Mode 7 armed. In your reset program call `JSR vram_load` then `JSR mode7_init` once, ' +
+          'and then `idle: bra idle` — the background zooms/rotates itself each frame. It takes a ' +
+          'moment to come up (a 32 KB field streams from the ROM high bank into VRAM). NMI now ' +
+          'dispatches: ' + steps.join(' → ') + '.',
+      });
+    },
+  },
+  {
+    name: 'gfx_bg_tile_anim',
+    description:
+      'Make a BACKGROUND TILE SHIMMER / ANIMATE its colour over time — a WAVE of water, FICKERING fire, ' +
+      'a pulsing lava lamp, a rainbow tile. This is the classic SNES "water/fire" trick and a THIRD, ' +
+      'independent per-frame background (different from `gfx_set_scroll` sliding a tilemap, and different ' +
+      'from `gfx_bg_mode7` zooming a field): the NMI rewrites ONE CGRAM palette slot every few frames to ' +
+      'the next colour in your `frames` sequence, and every background pixel whose colour index points at ' +
+      'that slot takes the new colour. The tile\'s own bitmap and the tilemap are NEVER touched — only the ' +
+      'one palette slot it reads. To use it: author ONE 8×8 tile whose "hot" pixels all carry the SAME ' +
+      'sub-palette index N (e.g. the water/embers you want to move), set that tile\'s palette so that ' +
+      'index N points at CGRAM slot `cgramSlot` (default 1), pass the K colours to cycle in `frames` ' +
+      '(15-bit 0x0000–0x7fff, e.g. [0x2100 deep blue, 0x4180 mid blue, 0x6200 light blue, 0x7380 foam] ' +
+      'cycled in order), and `speed` = NMI ticks to hold each colour (default 4 ≈ one colour every 1/15 s). ' +
+      'It COMPOSES with a scrolling BG0, a d-pad sprite, a sprite char-swap, and a Mode 7 field — all five ' +
+      'dispatch from the ONE shared NMI handler. Register it and it arms that NMI; in your reset program ' +
+      'call `JSR vram_load`, then `JSR bgtile_init` ONCE, then `idle: bra idle` — the tile animates ' +
+      'itself each frame. Never call `JSR bgtile_tick` yourself (from a loop it would run thousands of ' +
+      'times a frame).',
+    parameters: {
+      type: 'object',
+      properties: {
+        frames: { type: 'array', items: { type: 'integer', minimum: 0, maximum: 32767 }, description: 'The 2–16 15-bit colours (0x0000–0x7fff) to cycle, in order — one per animation frame' },
+        cgramSlot: { type: 'integer', minimum: 1, maximum: 31, description: 'CGRAM palette slot (default 1) the animated tile\'s hot pixels point at; the tile\'s sub-palette index must equal this' },
+        speed: { type: 'integer', minimum: 1, maximum: 60, description: 'NMI ticks to hold each colour; lower = faster shimmer (default 4)' },
+      },
+      required: ['frames'],
+    },
+    run: (a, c) => {
+      const frames = intListF(a, 'frames', 0, 0x7fff, 2, 16);
+      if (frames.e) return fail(frames.e);
+      const slot = optIntF(a, 'cgramSlot', 1, 31);
+      if (slot.e) return fail(slot.e);
+      const speed = optIntF(a, 'speed', 1, 60);
+      if (speed.e) return fail(speed.e);
+      const cfg: BgTileAnimConfig = {
+        frames: frames.v as number[],
+        cgramSlot: slot.v ?? 1,
+        speed: speed.v ?? 4,
+      };
+      c.gfx.setBgTileAnim(cfg);
+      // Land the BG tile water/fire service (bgtile_init + bgtile_tick + the
+      // colour tables), then recompute the shared NMI dispatcher so
+      // bgtile_tick runs alongside whatever other per-frame services are
+      // present (scroll, the d-pad sprite, the sprite char-swap, Mode 7).
+      // No high-bank field needed: the whole thing is a handful of palette
+      // writes to an existing CGRAM slot, so the ROM stays in the low bank.
+      upsertGlue(c, 'bgtile', bgTileAnimGlue(cfg));
+      upsertNmi(c);
+      const steps = scrollStepsFromSource(c.asm.getSource());
+      return ok({
+        frames: cfg.frames,
+        cgramSlot: cfg.cgramSlot ?? 1,
+        speed: cfg.speed ?? 4,
+        nmi: steps,
+        note:
+          'BG tile water/fire armed. In your reset program call `JSR vram_load` then `JSR bgtile_init` ' +
+          'once, and then `idle: bra idle` — the tile shimmers itself each frame. Make sure the tile\'s ' +
+          'hot pixels all carry sub-palette index ' + (cfg.cgramSlot ?? 1) + ' so they read the animated slot. ' +
+          'NMI now dispatches: ' + steps.join(' → ') + '.',
       });
     },
   },

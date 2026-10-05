@@ -29,11 +29,16 @@ import { loadState, saveState } from '../agent/state-store';
 
 const ASM_STORE_KEY = 'snes-web:asm:v1';
 
-/** The shape persisted under ASM_STORE_KEY (data files: name → base64). */
+/**
+ * The shape persisted under ASM_STORE_KEY. `files` = `.incbin` data files
+ * (name → base64); `highBank` (optional) = the 32 KB ROM high-bank blob as
+ * base64 (the Mode 7 field — see `AsmController.setHighBank`).
+ */
 interface AsmStore {
   v: 1;
   source: string;
   files: Record<string, string>;
+  highBank?: string;
 }
 
 const isAsmStore = (v: unknown): v is AsmStore => {
@@ -42,6 +47,7 @@ const isAsmStore = (v: unknown): v is AsmStore => {
     !!p &&
     p.v === 1 &&
     typeof p.source === 'string' &&
+    (!!p.highBank ? typeof p.highBank === 'string' : true) &&
     !!p.files &&
     typeof p.files === 'object' &&
     Object.values(p.files as Record<string, unknown>).every((f) => typeof f === 'string')
@@ -51,6 +57,13 @@ const isAsmStore = (v: unknown): v is AsmStore => {
 let asmLoaded = false;
 let asmSource = '';
 let asmIncludes: Record<string, Uint8Array> = {};
+/**
+ * The 32 KB ROM high-bank blob (file $8000, CPU bank $01), or `null` when none
+ * is set. This is what a Mode 7 ROM needs: its 128×128 field is too big for
+ * the low-bank entry region and for WRAM, so it lives here and the glue reads
+ * it at runtime with `lda $01:8000,X` (0xBF). Threaded into every `buildRom*`.
+ */
+let asmHighBank: Uint8Array | null = null;
 let asmMounted = false;
 let asmRefresh: (() => void) | null = null;
 let asmSaveTimer = 0;
@@ -74,19 +87,30 @@ function initAsmState(): void {
       // Skip a corrupt entry — the assembler reports the missing `.incbin`.
     }
   }
+  asmHighBank = stored.highBank ? base64ToBytes(stored.highBank) : null;
 }
 
 /** Write the current state back to the store (never throws). */
 function asmPersist(): void {
   const files: Record<string, string> = {};
   for (const [name, bytes] of Object.entries(asmIncludes)) files[name] = bytesToBase64(bytes);
-  saveState(localStorage, ASM_STORE_KEY, { v: 1, source: asmSource, files });
+  const highBank = asmHighBank ? bytesToBase64(asmHighBank) : undefined;
+  saveState(localStorage, ASM_STORE_KEY, { v: 1, source: asmSource, files, highBank });
 }
 
 /** Debounced save for high-frequency edits (typing in the editor). */
 function scheduleAsmPersist(): void {
   window.clearTimeout(asmSaveTimer);
   asmSaveTimer = window.setTimeout(asmPersist, 300);
+}
+
+/**
+ * Build the 256 KB ROM from an assemble result, threading in the high-bank
+ * field (file $8000) when one is set — so a Mode 7 ROM actually carries its
+ * 32 KB name-table field, which the glue reads at runtime via `lda $01:8000,X`.
+ */
+function buildRomWithHighBank(r: { bytes: Uint8Array; labels?: Array<{ name: string; address: number }> }): Uint8Array {
+  return buildRomFromResult(r, { highBank: asmHighBank ?? undefined });
 }
 
 export function mountAssembler(container: HTMLElement): void {
@@ -249,7 +273,7 @@ export function mountAssembler(container: HTMLElement): void {
     if (!last || !last.ok) return;
     let rom: Uint8Array;
     try {
-      rom = buildRomFromResult(last);
+      rom = buildRomWithHighBank(last);
     } catch (err) {
       setStat(`build failed: ${(err as Error).message}`, 'err');
       return;
@@ -271,7 +295,7 @@ export function mountAssembler(container: HTMLElement): void {
     if (!last || !last.ok) return;
     let rom: Uint8Array;
     try {
-      rom = buildRomFromResult(last);
+      rom = buildRomWithHighBank(last);
     } catch (err) {
       setStat(`build failed: ${(err as Error).message}`, 'err');
       return;
@@ -432,6 +456,16 @@ export function makeAsmController(): AsmController {
       asmPersist();
       refreshIfMounted();
     },
+    setHighBank(bytes: Uint8Array | null): void {
+      initAsmState();
+      asmHighBank = bytes ?? null;
+      asmPersist();
+      refreshIfMounted();
+    },
+    getHighBank(): Uint8Array | null {
+      initAsmState();
+      return asmHighBank;
+    },
     assemble(): { ok: boolean; byteCount: number; errors: { line: number; message: string }[] } {
       initAsmState();
       const r = assemble(asmSource, ROM_ENTRY, asmIncludes);
@@ -442,7 +476,7 @@ export function makeAsmController(): AsmController {
       const r = assemble(asmSource, ROM_ENTRY, asmIncludes);
       if (!r.ok) return { ok: false, error: errorsText(r.errors) };
       try {
-        return { ok: true, bytes: buildRomFromResult(r).length };
+        return { ok: true, bytes: buildRomWithHighBank(r).length };
       } catch (err) {
         return { ok: false, error: (err as Error).message };
       }
@@ -452,7 +486,7 @@ export function makeAsmController(): AsmController {
       const r = assemble(asmSource, ROM_ENTRY, asmIncludes);
       if (!r.ok) return { ok: false, error: errorsText(r.errors) };
       try {
-        return { ok: true, bytes: buildRomFromResult(r) };
+        return { ok: true, bytes: buildRomWithHighBank(r) };
       } catch (err) {
         return { ok: false, error: (err as Error).message };
       }
@@ -463,7 +497,7 @@ export function makeAsmController(): AsmController {
       if (!r.ok) return { ok: false, error: errorsText(r.errors) };
       let rom: Uint8Array;
       try {
-        rom = buildRomFromResult(r);
+        rom = buildRomWithHighBank(r);
       } catch (err) {
         return { ok: false, error: (err as Error).message };
       }

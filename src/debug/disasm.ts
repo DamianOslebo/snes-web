@@ -69,6 +69,10 @@ function formatOperand(mode: AddrMode, pc: number, r: MemReader): string {
       return `$${abs(pc + 1)},Y`;
     case 'long':
       return `$${lng(pc + 1)}`;
+    case 'longx':
+      // Absolute long,X (0xBF): same 3 operand bytes as `long` (lo, hi, bank),
+      // plus a runtime add of the full 16-bit X. The Mode 7 field-upload form.
+      return `$${lng(pc + 1)},X`;
     case 'rel': {
       // 8-bit conditional branch: target = PC-after-branch + sign-extended 8-bit offset.
       const off = r.byte(pc + 1) & 0xff;

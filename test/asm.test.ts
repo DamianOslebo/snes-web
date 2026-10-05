@@ -146,7 +146,7 @@ describe('65C816 assembler', () => {
 
   it('accepts a 16-bit immediate only in 16-bit mode', () => {
     expect(hexBytes(expectOk('REP #$1\nLDA #$100'))).toBe('c2 01 a9 00 01');
-    expectFail('LDA #$100', /needs 16-bit mode/);
+    expectFail('LDA #$100', /needs 16-bit A mode/);
   });
 
   it('emits BRK with its 1-byte dummy operand, never widened', () => {
@@ -252,7 +252,7 @@ describe('65C816 assembler', () => {
   });
 
   it('pins the error to the offending line', () => {
-    expectFail(['NOP', 'LDA #$100', 'NOP'].join('\n'), /needs 16-bit mode/, 2);
+    expectFail(['NOP', 'LDA #$100', 'NOP'].join('\n'), /needs 16-bit A mode/, 2);
   });
 
   it('rejects duplicate labels', () => {

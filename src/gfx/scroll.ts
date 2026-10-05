@@ -113,14 +113,20 @@ ${body}
 
 /**
  * Which once-per-frame services are present in the current asm source, in
- * dispatch order. A service is present when its defining label exists — i.e.
- * the glue that emits it was exported (`gfx_set_scroll` → `bg_scroll`,
- * `gfx_export_oam` → `spr_move`). Line-anchored (label at the start of a line)
- * so a `jsr <label>` or a comment never counts as a definition.
+ * dispatch order. (Named after the first feature added here; it is really "the
+ * NMI steps" — every once-per-frame service a ROM wants to run.) A service is
+ * present when its defining label exists — i.e. the glue that emits it was
+ * exported (`gfx_set_scroll` → `bg_scroll`, `gfx_export_oam` → `spr_move`,
+ * `gfx_sprite_anim` → `anim_tick`, `gfx_bg_mode7` → `mode7_tick`,
+ * `gfx_bg_tile_anim` → `bgtile_tick`). Line-anchored (label at the start of a
+ * line) so a `jsr <label>` or a comment never counts as a definition.
  */
 export function scrollStepsFromSource(src: string): string[] {
   const steps: string[] = [];
   if (/^\s*bg_scroll\s*:/m.test(src)) steps.push('bg_scroll');
   if (/^\s*spr_move\s*:/m.test(src)) steps.push('spr_move');
+  if (/^\s*anim_tick\s*:/m.test(src)) steps.push('anim_tick');
+  if (/^\s*mode7_tick\s*:/m.test(src)) steps.push('mode7_tick');
+  if (/^\s*bgtile_tick\s*:/m.test(src)) steps.push('bgtile_tick');
   return steps;
 }

@@ -100,7 +100,7 @@ const modesFor = (mnem: string): Set<AddrMode> => MODES.get(mnem) ?? new Set();
 
 // A parsed operand. `kind` drives both sizing and byte emission.
 interface Operand {
-  kind: 'imp' | 'imm' | 'addr' | 'long' | 'branch';
+  kind: 'imp' | 'imm' | 'addr' | 'long' | 'longx' | 'branch';
   mode?: AddrMode;              // resolved for addr/long; imp/imm/branch derived at encode
   value?: number;               // imm value, or the 16-bit addr for addr-modes
   bank?: number;                // long
@@ -327,14 +327,21 @@ function parseOperand(num: number, mnem: string, s: string): Operand {
     throw new AsmFail(num, `${mnem} takes a label, a $bank:addr target, or a signed offset`);
   }
 
-  // Long (banked): $bank:addr
+  // Long (banked): $bank:addr — and $bank:addr,x for a 24-bit long,X load
+  // (`lda $01:0000,x` reads base + full 16-bit X; the Mode 7 field-upload form).
   if (t.includes(':')) {
-    requireMode(num, mnem, 'long');
-    const [bankS, addrS] = t.split(':');
+    const isLongx = t.endsWith(',x') || t.endsWith(',X');
+    const base = isLongx ? t.slice(0, -2).trim() : t;
+    const [bankS, addrS] = base.split(':');
     const bank = parseHexPart(num, bankS, 'bank');
     const addr = parseHexPart(num, addrS, 'address');
     if (bank > 0xff) throw new AsmFail(num, `bank $${hex(bank, 2)} does not fit in a byte`);
     if (addr > 0xffff) throw new AsmFail(num, `address $${hex(addr, 4)} exceeds 16 bits`);
+    if (isLongx) {
+      requireMode(num, mnem, 'longx');
+      return { kind: 'longx', value: addr & 0xffff, bank: bank & 0xff };
+    }
+    requireMode(num, mnem, 'long');
     return { kind: 'long', value: addr & 0xffff, bank: bank & 0xff };
   }
 
@@ -404,7 +411,8 @@ function describeMode(mode: AddrMode): string {
            zpy: 'zero-page,Y', abs: 'absolute', absx: 'absolute,X', absy: 'absolute,Y',
            ind: 'indirect', indx: 'indexed-indirect', indy: 'indexed-indirect,Y',
            sr: 'stack-relative (S)', rel: 'relative branch',
-           rel16: '16-bit branch', long: 'long (banked)' }[mode];
+           rel16: '16-bit branch', long: 'long (banked)',
+           longx: 'long,X (banked)' }[mode];
 }
 
 // --- P-register state -------------------------------------------------------
@@ -435,6 +443,26 @@ function markPState(lines: Line[]): void {
   }
 }
 
+/**
+ * Whether an immediate operand is 16-bit at the line's P state. The width is a
+ * function of the REGISTER the immediate loads, not the whole P register:
+ * `LDX #imm` reads 16 bits when X is 16-bit (P bit $02), `LDY #imm` when Y is
+ * 16-bit (P bit $04), and every other immediate form (LDA + the ALU/BIT `#imm`
+ * ops) reads 16 bits when A is 16-bit (P bit $01). An immediate that loads the
+ * wrong register's width would mis-assemble `ldx #$0000` (the Mode 7
+ * field-upload loop needs it) — so size each by its own bit.
+ */
+function imm16(mnem: string, p: { a16: boolean; x16: boolean; y16: boolean } | undefined): boolean {
+  if (mnem === 'LDX') return p?.x16 ?? false;
+  if (mnem === 'LDY') return p?.y16 ?? false;
+  return p?.a16 ?? false;
+}
+
+/** The register name for an immediate-width error message (A/X/Y). */
+function immReg(mnem: string): string {
+  return mnem === 'LDX' ? 'X' : mnem === 'LDY' ? 'Y' : 'A';
+}
+
 // --- layout & encoding ------------------------------------------------------
 
 /** True byte size of one line, given the current label→offset map. */
@@ -446,10 +474,12 @@ function sizeOfLine(ln: Line, origin: number, labelOffset: Map<string, number>):
     case 'imp':
       return 1;
     case 'imm':
-      // MASK_OPS (REP/SEP/BRK) are always 1 operand byte; otherwise the P
-      // register at this line decides 8- vs 16-bit immediate.
-      return MASK_OPS.has(ln.mnem) ? 2 : (ln.pState?.a16 ? 3 : 2);
+      // MASK_OPS (REP/SEP/BRK) are always 1 operand byte; otherwise the width
+      // follows the REGISTER the immediate loads (see `imm16`) — LDX by X's bit,
+      // LDY by Y's, every other immediate by A's.
+      return MASK_OPS.has(ln.mnem) ? 2 : (imm16(ln.mnem, ln.pState) ? 3 : 2);
     case 'long':
+    case 'longx':
       return 4;
     case 'branch':
       return op.mode === 'rel' ? 2 : 3;
@@ -542,6 +572,7 @@ function encodeLine(ln: Line, origin: number, labelOffset: Map<string, number>, 
   if (op.kind === 'imp') mode = 'imp';
   else if (op.kind === 'imm') mode = 'imm';
   else if (op.kind === 'long') mode = 'long';
+  else if (op.kind === 'longx') mode = 'longx';
   else if (op.kind === 'branch') mode = op.mode!;
   else { // addr
     if (op.label !== undefined) {
@@ -572,11 +603,12 @@ function encodeLine(ln: Line, origin: number, labelOffset: Map<string, number>, 
       break;
     case 'imm': {
       const v = op.value ?? 0;
-      // Width follows the P register (A bit is the 8/16 selector for immediates).
-      if (ln.pState?.a16) {
+      // Width follows the REGISTER the immediate loads: LDX by X's P bit,
+      // LDY by Y's, the ALU/BIT/LDA immediates by A's (see `imm16`).
+      if (imm16(mnem, ln.pState)) {
         out.push(v & 0xff, (v >> 8) & 0xff);
       } else {
-        if (v > 0xff) throw new AsmFail(ln.num, `immediate $${hex(v, 4)} needs 16-bit mode (SEP #$1 first)`);
+        if (v > 0xff) throw new AsmFail(ln.num, `immediate $${hex(v, 4)} needs 16-bit ${immReg(mnem)} mode (REP first)`);
         out.push(v & 0xff);
       }
       break;
@@ -596,7 +628,9 @@ function encodeLine(ln: Line, origin: number, labelOffset: Map<string, number>, 
       out.push(addr & 0xff, (addr >> 8) & 0xff);
       break;
     case 'long':
-      // lo, hi, bank
+    case 'longx':
+      // lo, hi, bank (longx reads base + X at execute time; the encoded
+      // operand bytes are identical to non-indexed long)
       out.push((op.value ?? 0) & 0xff, ((op.value ?? 0) >> 8) & 0xff, (op.bank ?? 0) & 0xff);
       break;
     case 'rel':

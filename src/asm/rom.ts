@@ -137,6 +137,14 @@ export interface BuildRomOptions {
    * sprite glue is present.
    */
   nmi?: number;
+  /**
+   * Optional 32 KB high-bank blob (file $8000–$ffff, CPU bank $01 offset
+   * $8000–$ffff). Used for the Mode 7 32 KB name-table field, which is too big
+   * for the low-bank entry region (MAX_CODE) and can't be held in WRAM (only
+   * 8 KB in the system view). The glue reads it at runtime with
+   * `lda $01:8000,X` (0xBF) and streams it to VRAM. Must be ≤ 0x8000 bytes.
+   */
+  highBank?: Uint8Array;
 }
 
 /**
@@ -155,6 +163,12 @@ export function buildRom(code: Uint8Array, opts: BuildRomOptions = {}): Uint8Arr
     throw new Error(
       `buildRom: program is ${code.length} bytes but the entry region is ` +
       `$${CODE_OFFSET.toString(16).padStart(4, '0')}–$${MAX_CODE.toString(16).padStart(4, '0')} (max ${MAX_CODE} bytes)`,
+    );
+  }
+
+  if (opts.highBank && opts.highBank.length > 0x8000) {
+    throw new Error(
+      `buildRom: highBank is ${opts.highBank.length} bytes but the high bank is $8000 (32768 bytes)`,
     );
   }
 
@@ -192,6 +206,12 @@ export function buildRom(code: Uint8Array, opts: BuildRomOptions = {}): Uint8Arr
 
   // --- entry code (file $0000 == CPU $008000 under LoROM) -----------------
   rom.set(code, CODE_OFFSET);
+
+  // --- high bank (file $8000 == CPU $018000 under LoROM) ------------------
+  // The Mode 7 32 KB field (or any other blob too big for the low bank) lives
+  // here. The glue reads it at runtime with `lda $01:8000,X` (0xBF) and
+  // streams it to VRAM.
+  if (opts.highBank) rom.set(opts.highBank, 0x8000);
 
   // --- 16-bit checksums, written last once the rest of the image is final -
   writeChecksums(rom);

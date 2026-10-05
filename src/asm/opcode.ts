@@ -39,7 +39,8 @@ export type AddrMode =
   | 'sr'      // (S) stack-relative — 1-byte offset
   | 'rel'     // 8-bit relative branch — 1 byte
   | 'rel16'   // 16-bit relative branch — 2 bytes
-  | 'long';   // 24-bit banked absolute — 3 bytes
+  | 'long'    // 24-bit banked absolute — 3 bytes
+  | 'longx';  // 24-bit banked absolute,X — 3 bytes (LDA long,X = 0xBF)
 
 export interface Op {
   mnem: string;
@@ -67,6 +68,7 @@ export function operandSize(mode: AddrMode): number {
     case 'rel16':
       return 2;
     case 'long':
+    case 'longx':
       return 3;
   }
 }
@@ -136,6 +138,14 @@ const SPECIALS: [number, string, AddrMode][] = [
   [0x62, 'PER', 'rel16'], // Program-counter Execute Relative — 16-bit PC-relative jump
   [0xd4, 'PEI', 'zp'],    // Push Effective Indirect — zp holds a pointer
   [0xf4, 'PEA', 'abs'],   // Push Effective Address — 16-bit absolute onto the stack
+
+  // --- 24-bit long data read (LDA absolute-long,X) ------------------------
+  // 0xBF = LDA $xxxxxx,X: reads the 24-bit base PLUS the FULL 16-bit X register
+  // (cpuaddr.h AbsoluteLongIndexedX_R adds Registers.X.W). The Mode 7 field
+  // upload uses this to stream the 32 KB bank-1 field straight to VRAM with no
+  // WRAM scratch buffer — the field is too big for the code region and for WRAM,
+  // so it must be read from its own ROM bank by absolute-long,X addressing.
+  [0xbf, 'LDA', 'longx'],
 
   // --- flag / status ------------------------------------------------------
   [0x08, 'PHP', 'imp'],

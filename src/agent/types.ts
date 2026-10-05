@@ -110,6 +110,15 @@ export interface AsmController {
   addDataFile(name: string, bytes: Uint8Array): void;
   /** Remove a data file (no-op if absent). */
   removeDataFile(name: string): void;
+  /**
+   * Set (or clear) the 32 KB high-bank blob (file $8000, CPU bank $01). The
+   * Mode 7 field is too big for the low-bank entry region and for WRAM, so it
+   * is placed here and read by the glue at runtime with `lda $01:8000,X`
+   * (0xBF, Absolute-Long-Indexed-X). Pass `null` to clear.
+   */
+  setHighBank(bytes: Uint8Array | null): void;
+  /** The current high-bank blob, or `null` when none is set. */
+  getHighBank(): Uint8Array | null;
   /** Assemble the current source (with its data files). */
   assemble(): { ok: boolean; byteCount: number; errors: { line: number; message: string }[] };
   /** Build the 256 KB SFC from the last successful assemble. */
@@ -203,6 +212,60 @@ export interface GfxController {
   setScroll(dx: number, dy: number): void;
   /** The current per-frame scroll delta, or null if none has been set. */
   getScroll(): { dx: number; dy: number } | null;
+
+  // --- sprite char-swap animation (per-frame OAM word1 service) -------------
+  //
+  // A sprite that CHANGES PICTURE over time (a walk / a flap): the NMI steps a
+  // baked K-char table and re-writes ONE slot's OAM word1 (Name + attr) each
+  // char-period. It is the char-swap sibling of the d-pad `spr_move` (word0),
+  // so a slot can move AND animate at once — both dispatch from the one shared
+  // NMI handler (`nmiGlue`). The generated glue is `src/gfx/anim.ts`; `set*`
+  // stores the config the agent wants and `get*` reads it back (both held OUT
+  // of the versioned artwork store, like `setScroll`).
+
+  /**
+   * Store the sprite char-swap config the agent wants: the chars to cycle
+   * (`tiles`, 2–8 8×8 char indices), the slot, the frames-per-char, and the
+   * constant priority/flip bits. `getSpriteAnim` reads it back.
+   */
+  setSpriteAnim(cfg: { tiles: number[]; slot?: number; skip?: number; priority?: number; flipH?: boolean; flipV?: boolean }): void;
+  /** The current sprite char-swap config, or null if none has been set. */
+  getSpriteAnim(): { tiles: number[]; slot?: number; skip?: number; priority?: number; flipH?: boolean; flipV?: boolean } | null;
+
+  // --- Mode 7 (BG1 affine) background (per-frame matrix service) -----------
+  //
+  // A background that ZOOMS or ROTATES over time: the NMI steps a baked
+  // precomputed matrix table (A/B/C/D as 8.24 words, all the math done in TS
+  // at export time) and re-writes the four Mode 7 matrix regs ($211B–$211E)
+  // once per frame. The 128×128 field itself is uploaded to VRAM once by
+  // `mode7_init`. It is the affine sibling of the BG0 `bg_scroll` service —
+  // all per-frame services dispatch from the one shared NMI handler
+  // (`nmiGlue`). Generated glue is `src/gfx/mode7.ts`; `set*` stores the
+  // config the agent wants and `get*` reads it back (both held OUT of the
+  // versioned artwork store, like `setScroll`).
+
+  /** Set the Mode 7 background the agent wants: `kind` (zoom/rotate), `dir` (in/out for zoom, cw/ccw for rotate), `speed` (frames per full cycle, 2–64). */
+  setMode7(cfg: { kind: 'zoom' | 'rotate'; dir: 'in' | 'out' | 'cw' | 'ccw'; speed?: number }): void;
+  /** The current Mode 7 config, or null if none has been set. */
+  getMode7(): { kind: 'zoom' | 'rotate'; dir: 'in' | 'out' | 'cw' | 'ccw'; speed?: number } | null;
+
+  // --- BG0 tile water/fire colour animation (per-frame CGRAM service) ------
+  //
+  // A background tile that SHIMMERS over time: the NMI steps a baked
+  // K-colour table (all the palette work done in TS at export time) and
+  // re-writes ONE CGRAM palette slot ($2121/$2122) once per frame. A tile
+  // whose hot pixels all point at that slot renders as whatever colour the
+  // slot holds right now — water/fire/lava, with the tilemap and the tile's
+  // own bitmap never touched. It is the background sibling of the Mode 7 and
+  // `bg_scroll` services — all per-frame services dispatch from the one
+  // shared NMI handler (`nmiGlue`). Generated glue is `src/gfx/bgtile.ts`;
+  // `set*` stores the config the agent wants and `get*` reads it back (both
+  // held OUT of the versioned artwork store, like `setScroll`).
+
+  /** Set the BG tile water/fire animation the agent wants: `frames` (2–16 15-bit colours to cycle, in order), `cgramSlot` (1–31, the slot the animated tile's hot pixels point at), `speed` (NMI ticks between colour changes, default 4). */
+  setBgTileAnim(cfg: { frames: readonly number[]; cgramSlot?: number; speed?: number }): void;
+  /** The current BG tile water/fire animation config, or null if none has been set. */
+  getBgTileAnim(): { frames: readonly number[]; cgramSlot?: number; speed?: number } | null;
 
   /** Compile the editor to a 64 KB VRAM image. */
   buildVram(): Uint8Array;

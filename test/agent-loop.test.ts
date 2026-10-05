@@ -28,6 +28,10 @@ function miniControllers() {
     removeDataFile: (n) => {
       log.push(`removeDataFile:${n}`);
     },
+    setHighBank: (b) => {
+      log.push(`setHighBank:${b ? b.length : null}`);
+    },
+    getHighBank: () => null,
     assemble: () => ({ ok: true, byteCount: 12, errors: [] }),
     buildRom: () => ({ ok: true, bytes: 262144 }),
     buildRomBytes: () => ({ ok: true, bytes: new Uint8Array(256) }),
@@ -55,6 +59,12 @@ function miniControllers() {
     vramGlueLz: () => ';vram glue lz',
     setScroll: () => {},
     getScroll: () => null,
+    setSpriteAnim: () => {},
+    getSpriteAnim: () => null,
+    setMode7: () => {},
+    getMode7: () => null,
+    setBgTileAnim: () => {},
+    getBgTileAnim: () => null,
   };
   const track: TrackController = {
     getSong: () => '{"v":1,"name":"S","tempo":8,"orders":[0],"patterns":[],"instruments":[]}',
